@@ -83,7 +83,6 @@ class JoernConfig:
     server_url: str
     script_path: str
     timeout_seconds: int
-    fallback_to_regex: bool
 
 
 @dataclass(slots=True)
@@ -243,11 +242,18 @@ def _get_optional_str_list(section: dict[str, Any], key: str, default: list[str]
     return result if result else list(default)
 
 
-def _require_true(section: dict[str, Any], key: str, *, default: bool, reason: str) -> bool:
-    value = _get_optional_bool(section, key, default)
+def _require_true(section: dict[str, Any], key: str, *, reason: str) -> bool:
+    value = _get_bool(section, key)
     if not value:
         raise ConfigError(reason)
     return True
+
+
+def _reject_unknown_keys(section_name: str, section: dict[str, Any], allowed: set[str]) -> None:
+    unknown = sorted(k for k in section.keys() if k not in allowed)
+    if unknown:
+        joined = ", ".join(unknown)
+        raise ConfigError(f"unknown keys in [{section_name}]: {joined}")
 
 
 def load_config(path: str | Path) -> PadvConfig:
@@ -266,72 +272,125 @@ def load_config(path: str | Path) -> PadvConfig:
     store = _require_section(data, "store")
     auth = _require_section(data, "auth")
     joern = _require_section(data, "joern")
-    llm = data.get("llm", {})
-    agent = data.get("agent", {})
-    scip = data.get("scip", {})
-    web = data.get("web", {})
-    differential = data.get("differential", {})
-    if not isinstance(llm, dict):
-        raise ConfigError("invalid section: llm")
-    if not isinstance(agent, dict):
-        raise ConfigError("invalid section: agent")
-    if not isinstance(scip, dict):
-        raise ConfigError("invalid section: scip")
-    if not isinstance(web, dict):
-        raise ConfigError("invalid section: web")
-    if not isinstance(differential, dict):
-        raise ConfigError("invalid section: differential")
+    llm = _require_section(data, "llm")
+    agent = _require_section(data, "agent")
+    scip = _require_section(data, "scip")
+    web = _require_section(data, "web")
+    differential = _require_section(data, "differential")
+
+    _reject_unknown_keys("target", target, {"base_url", "request_timeout_seconds"})
+    _reject_unknown_keys(
+        "oracle",
+        oracle,
+        {
+            "request_key_header",
+            "request_intercept_header",
+            "request_correlation_header",
+            "response_result_header",
+            "response_status_header",
+            "response_call_count_header",
+            "response_overflow_header",
+            "response_arg_truncated_header",
+            "response_result_truncated_header",
+            "response_correlation_header",
+            "result_encoding",
+            "max_result_b64_len",
+            "api_key",
+        },
+    )
+    _reject_unknown_keys("canary", canary, {"parameter_name", "allow_casefold", "allow_url_decode"})
+    _reject_unknown_keys(
+        "budgets",
+        budgets,
+        {"max_candidates", "max_requests", "max_seconds_per_candidate", "max_run_seconds"},
+    )
+    _reject_unknown_keys("sandbox", sandbox, {"deploy_cmd", "reset_cmd", "status_cmd", "logs_cmd"})
+    _reject_unknown_keys("store", store, {"root", "store_raw_reports"})
+    _reject_unknown_keys("auth", auth, {"enabled", "login_url", "username", "password", "profile_path"})
+    _reject_unknown_keys(
+        "joern",
+        joern,
+        {
+            "enabled",
+            "query_profile",
+            "command",
+            "parse_command",
+            "parse_language",
+            "use_http_api",
+            "server_url",
+            "script_path",
+            "timeout_seconds",
+        },
+    )
+    _reject_unknown_keys(
+        "llm",
+        llm,
+        {"provider", "model", "api_key_env", "temperature", "max_tokens", "timeout_seconds"},
+    )
+    _reject_unknown_keys(
+        "agent",
+        agent,
+        {
+            "use_deepagents",
+            "hard_fail",
+            "require_langgraph",
+            "max_iterations",
+            "improvement_patience",
+            "skeptic_rounds",
+            "thread_prefix",
+        },
+    )
+    _reject_unknown_keys(
+        "scip",
+        scip,
+        {"enabled", "command", "print_command", "artifact_dir", "timeout_seconds", "hard_fail"},
+    )
+    _reject_unknown_keys(
+        "web",
+        web,
+        {"enabled", "use_browser_use", "headless", "max_pages", "max_actions", "request_timeout_seconds"},
+    )
+    _reject_unknown_keys("differential", differential, {"enabled", "auth_levels", "body_length_tolerance"})
 
     # Strict cutover: these switches are always-on and cannot be disabled.
     agent_use_deepagents = _require_true(
         agent,
         "use_deepagents",
-        default=True,
         reason="agent.use_deepagents must be true",
     )
     agent_require_langgraph = _require_true(
         agent,
         "require_langgraph",
-        default=True,
         reason="agent.require_langgraph must be true",
     )
     web_enabled = _require_true(
         web,
         "enabled",
-        default=True,
         reason="web.enabled must be true",
     )
     web_use_browser_use = _require_true(
         web,
         "use_browser_use",
-        default=True,
         reason="web.use_browser_use must be true",
     )
     agent_hard_fail = _require_true(
         agent,
         "hard_fail",
-        default=True,
         reason="agent.hard_fail must be true",
     )
     joern_enabled = _require_true(
         joern,
         "enabled",
-        default=True,
         reason="joern.enabled must be true",
     )
-    joern_no_regex_fallback = not _get_optional_bool(joern, "fallback_to_regex", False)
-    if not joern_no_regex_fallback:
-        raise ConfigError("joern.fallback_to_regex must be false")
     scip_enabled = _require_true(
         scip,
         "enabled",
-        default=True,
         reason="scip.enabled must be true",
     )
     scip_hard_fail = _require_true(
         scip,
         "hard_fail",
-        default=True,
         reason="scip.hard_fail must be true",
     )
 
@@ -386,52 +445,51 @@ def load_config(path: str | Path) -> PadvConfig:
         joern=JoernConfig(
             enabled=joern_enabled,
             query_profile=_get_str(joern, "query_profile"),
-            command=_get_optional_str(joern, "command", "joern"),
-            parse_command=_get_optional_str(joern, "parse_command", "joern-parse"),
-            parse_language=_get_optional_str(joern, "parse_language", "PHP"),
-            use_http_api=_get_bool(joern, "use_http_api") if "use_http_api" in joern else False,
-            server_url=_get_optional_str(joern, "server_url", "http://127.0.0.1:8080"),
+            command=_get_str(joern, "command"),
+            parse_command=_get_optional_str(joern, "parse_command"),
+            parse_language=_get_str(joern, "parse_language"),
+            use_http_api=_get_bool(joern, "use_http_api"),
+            server_url=_get_str(joern, "server_url"),
             script_path=_get_optional_str(joern, "script_path", ""),
-            timeout_seconds=_get_int(joern, "timeout_seconds", min_value=1) if "timeout_seconds" in joern else 600,
-            fallback_to_regex=False,
+            timeout_seconds=_get_int(joern, "timeout_seconds", min_value=1),
         ),
         llm=LLMConfig(
-            provider=_get_optional_str(llm, "provider", "anthropic"),
-            model=_get_optional_str(llm, "model", "claude-sonnet-4-5-20250929"),
-            api_key_env=_get_optional_str(llm, "api_key_env", "ANTHROPIC_API_KEY"),
-            temperature=_get_optional_float(llm, "temperature", 0.0, min_value=0.0),
-            max_tokens=_get_optional_int(llm, "max_tokens", 4096, min_value=1),
-            timeout_seconds=_get_optional_int(llm, "timeout_seconds", 120, min_value=1),
+            provider=_get_str(llm, "provider"),
+            model=_get_str(llm, "model"),
+            api_key_env=_get_str(llm, "api_key_env"),
+            temperature=_get_float(llm, "temperature", min_value=0.0),
+            max_tokens=_get_int(llm, "max_tokens", min_value=1),
+            timeout_seconds=_get_int(llm, "timeout_seconds", min_value=1),
         ),
         agent=AgentConfig(
             use_deepagents=agent_use_deepagents,
             hard_fail=agent_hard_fail,
             require_langgraph=agent_require_langgraph,
-            max_iterations=_get_optional_int(agent, "max_iterations", 3, min_value=1),
-            improvement_patience=_get_optional_int(agent, "improvement_patience", 1, min_value=0),
-            skeptic_rounds=_get_optional_int(agent, "skeptic_rounds", 1, min_value=0),
-            thread_prefix=_get_optional_str(agent, "thread_prefix", "padv"),
+            max_iterations=_get_int(agent, "max_iterations", min_value=1),
+            improvement_patience=_get_int(agent, "improvement_patience", min_value=0),
+            skeptic_rounds=_get_int(agent, "skeptic_rounds", min_value=0),
+            thread_prefix=_get_str(agent, "thread_prefix"),
         ),
         scip=ScipConfig(
             enabled=scip_enabled,
-            command=_get_optional_str(scip, "command", "scip-php"),
-            print_command=_get_optional_str(scip, "print_command", "scip print"),
-            artifact_dir=_get_optional_str(scip, "artifact_dir", ".padv/scip"),
-            timeout_seconds=_get_optional_int(scip, "timeout_seconds", 300, min_value=1),
+            command=_get_str(scip, "command"),
+            print_command=_get_str(scip, "print_command"),
+            artifact_dir=_get_str(scip, "artifact_dir"),
+            timeout_seconds=_get_int(scip, "timeout_seconds", min_value=1),
             hard_fail=scip_hard_fail,
         ),
         web=WebConfig(
             enabled=web_enabled,
             use_browser_use=web_use_browser_use,
-            headless=_get_optional_bool(web, "headless", True),
-            max_pages=_get_optional_int(web, "max_pages", 8, min_value=1),
-            max_actions=_get_optional_int(web, "max_actions", 30, min_value=1),
-            request_timeout_seconds=_get_optional_int(web, "request_timeout_seconds", 15, min_value=1),
+            headless=_get_bool(web, "headless"),
+            max_pages=_get_int(web, "max_pages", min_value=1),
+            max_actions=_get_int(web, "max_actions", min_value=1),
+            request_timeout_seconds=_get_int(web, "request_timeout_seconds", min_value=1),
         ),
         differential=DifferentialConfig(
-            enabled=_get_optional_bool(differential, "enabled", True),
+            enabled=_get_bool(differential, "enabled"),
             auth_levels=_get_optional_str_list(differential, "auth_levels", ["anonymous"]),
-            body_length_tolerance=_get_optional_float(differential, "body_length_tolerance", 0.10, min_value=0.0),
+            body_length_tolerance=_get_float(differential, "body_length_tolerance", min_value=0.0),
         ),
     )
 

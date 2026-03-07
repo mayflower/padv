@@ -29,6 +29,15 @@ class ScipSymbolHit:
     vuln_class: str
 
 
+@dataclass(frozen=True, slots=True)
+class ScipDiscoveryMeta:
+    raw_scip_hits: int
+    mapped_scip_sinks: int
+    app_scoped_sinks: int
+    dropped_non_app_sinks: int
+    candidate_count: int
+
+
 _SPEC_BY_CLASS = {spec.vuln_class: spec for spec in VULN_CLASS_SPECS}
 
 
@@ -100,7 +109,11 @@ def _run_scip_generate(repo_root: Path, config: PadvConfig, artifact_dir: Path) 
 def _run_scip_print(scip_file: Path, config: PadvConfig, repo_root: Path) -> str:
     if not config.scip.print_command.strip():
         return ""
-    print_cmd = f"{config.scip.print_command} {shlex.quote(str(scip_file))}"
+    cmd_parts = shlex.split(config.scip.print_command)
+    if "--json" not in cmd_parts:
+        cmd_parts.append("--json")
+    cmd_parts.append(str(scip_file))
+    print_cmd = " ".join(shlex.quote(part) for part in cmd_parts)
     proc = _run_command(print_cmd, repo_root, config.scip.timeout_seconds)
     if proc.returncode != 0:
         stderr = (proc.stderr or "").strip()
@@ -162,8 +175,14 @@ def _iter_documents(payload: object) -> list[tuple[str, list[dict[str, object]]]
     for doc in docs:
         if not isinstance(doc, dict):
             continue
-        path = str(doc.get("relative_path", "")).strip() or str(doc.get("path", "")).strip()
+        path = (
+            str(doc.get("relative_path", "")).strip()
+            or str(doc.get("relativePath", "")).strip()
+            or str(doc.get("path", "")).strip()
+        )
         occurrences = doc.get("occurrences")
+        if occurrences is None:
+            occurrences = doc.get("Occurrences")
         if not path or not isinstance(occurrences, list):
             continue
         filtered: list[dict[str, object]] = [o for o in occurrences if isinstance(o, dict)]
@@ -171,7 +190,7 @@ def _iter_documents(payload: object) -> list[tuple[str, list[dict[str, object]]]
     return out
 
 
-def _extract_hits(print_stdout: str) -> list[ScipSymbolHit]:
+def _extract_hits_with_meta(print_stdout: str) -> tuple[list[ScipSymbolHit], ScipDiscoveryMeta]:
     if isinstance(print_stdout, tuple) and len(print_stdout) == 1 and isinstance(print_stdout[0], str):
         print_stdout = print_stdout[0]
     payload: object
@@ -191,12 +210,17 @@ def _extract_hits(print_stdout: str) -> list[ScipSymbolHit]:
 
     hits: list[ScipSymbolHit] = []
     seen: set[tuple[str, int, str, str]] = set()
+    raw_hits = 0
+    mapped_hits = 0
     for file_path, occurrences in _iter_documents(payload):
         for occ in occurrences:
             symbol = str(occ.get("symbol", "")).strip()
+            if symbol:
+                raw_hits += 1
             vuln_class = _match_vuln_class(symbol)
             if not vuln_class:
                 continue
+            mapped_hits += 1
 
             line_no = 1
             range_value = occ.get("range")
@@ -217,15 +241,27 @@ def _extract_hits(print_stdout: str) -> list[ScipSymbolHit]:
                     vuln_class=vuln_class,
                 )
             )
+    meta = ScipDiscoveryMeta(
+        raw_scip_hits=raw_hits,
+        mapped_scip_sinks=mapped_hits,
+        app_scoped_sinks=0,
+        dropped_non_app_sinks=0,
+        candidate_count=0,
+    )
+    return hits, meta
+
+
+def _extract_hits(print_stdout: str) -> list[ScipSymbolHit]:
+    hits, _meta = _extract_hits_with_meta(print_stdout)
     return hits
 
 
-def discover_scip_candidates(
+def discover_scip_candidates_with_meta(
     repo_root: str,
     config: PadvConfig,
-) -> tuple[list[Candidate], list[StaticEvidence], list[str]]:
+) -> tuple[list[Candidate], list[StaticEvidence], list[str], ScipDiscoveryMeta]:
     if not config.scip.enabled:
-        return [], [], []
+        return [], [], [], ScipDiscoveryMeta(0, 0, 0, 0, 0)
 
     root = Path(repo_root)
     if not root.exists():
@@ -241,18 +277,22 @@ def discover_scip_candidates(
     artifact_refs.append(str(scip_file))
 
     print_stdout = _run_scip_print(scip_file, config, root)
-    hits = _extract_hits(print_stdout)
+    hits, hit_meta = _extract_hits_with_meta(print_stdout)
 
     candidates: list[Candidate] = []
     evidence: list[StaticEvidence] = []
+    app_scoped_sinks = 0
+    dropped_non_app_sinks = 0
     for idx, hit in enumerate(hits, start=1):
-        if len(candidates) >= config.budgets.max_candidates:
-            break
         spec = _SPEC_BY_CLASS.get(hit.vuln_class)
         if spec is None:
             continue
         rel_path = normalize_repo_path(hit.file_path, repo_root=root)
         if not rel_path or not is_app_candidate_path(rel_path):
+            dropped_non_app_sinks += 1
+            continue
+        app_scoped_sinks += 1
+        if len(candidates) >= config.budgets.max_candidates:
             continue
 
         candidate_id = f"scip-{idx:05d}"
@@ -289,15 +329,38 @@ def discover_scip_candidates(
             )
         )
 
-    return candidates, evidence, artifact_refs
+    meta = ScipDiscoveryMeta(
+        raw_scip_hits=hit_meta.raw_scip_hits,
+        mapped_scip_sinks=hit_meta.mapped_scip_sinks,
+        app_scoped_sinks=app_scoped_sinks,
+        dropped_non_app_sinks=dropped_non_app_sinks,
+        candidate_count=len(candidates),
+    )
+    return candidates, evidence, artifact_refs, meta
+
+
+def discover_scip_candidates(
+    repo_root: str,
+    config: PadvConfig,
+) -> tuple[list[Candidate], list[StaticEvidence], list[str]]:
+    candidates, evidence, refs, _meta = discover_scip_candidates_with_meta(repo_root, config)
+    return candidates, evidence, refs
+
+
+def discover_scip_candidates_safe_with_meta(
+    repo_root: str,
+    config: PadvConfig,
+) -> tuple[list[Candidate], list[StaticEvidence], list[str], ScipDiscoveryMeta, str | None]:
+    try:
+        candidates, evidence, refs, meta = discover_scip_candidates_with_meta(repo_root, config)
+        return candidates, evidence, refs, meta, None
+    except Exception as exc:
+        raise ScipExecutionError(str(exc)) from exc
 
 
 def discover_scip_candidates_safe(
     repo_root: str,
     config: PadvConfig,
 ) -> tuple[list[Candidate], list[StaticEvidence], list[str], str | None]:
-    try:
-        candidates, evidence, refs = discover_scip_candidates(repo_root, config)
-        return candidates, evidence, refs, None
-    except Exception as exc:
-        raise ScipExecutionError(str(exc)) from exc
+    candidates, evidence, refs, _meta, err = discover_scip_candidates_safe_with_meta(repo_root, config)
+    return candidates, evidence, refs, err

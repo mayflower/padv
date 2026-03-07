@@ -42,9 +42,9 @@ def test_gate_xss_runtime_signal_validates() -> None:
         config=config,
         static_evidence=_static(),
         positive_runs=[
-            _runtime_with_flags("p1", "xss_raw_canary"),
-            _runtime_with_flags("p2", "xss_raw_canary"),
-            _runtime_with_flags("p3", "xss_raw_canary"),
+            _runtime_with_flags("p1", "xss_dom_witness"),
+            _runtime_with_flags("p2", "xss_dom_witness"),
+            _runtime_with_flags("p3", "xss_dom_witness"),
         ],
         negative_runs=[_runtime_with_flags("n1")],
         intercepts=[],
@@ -62,11 +62,11 @@ def test_gate_xss_negative_control_fails_when_signal_repeats() -> None:
         config=config,
         static_evidence=_static(),
         positive_runs=[
-            _runtime_with_flags("p1", "xss_raw_canary"),
-            _runtime_with_flags("p2", "xss_raw_canary"),
-            _runtime_with_flags("p3", "xss_raw_canary"),
+            _runtime_with_flags("p1", "xss_dom_witness"),
+            _runtime_with_flags("p2", "xss_dom_witness"),
+            _runtime_with_flags("p3", "xss_dom_witness"),
         ],
-        negative_runs=[_runtime_with_flags("n1", "xss_raw_canary")],
+        negative_runs=[_runtime_with_flags("n1", "xss_dom_witness")],
         intercepts=[],
         canary="padv-canary",
         preconditions=[],
@@ -77,7 +77,7 @@ def test_gate_xss_negative_control_fails_when_signal_repeats() -> None:
     assert result.failed_gate == "V4"
 
 
-def test_gate_access_control_uses_http_signal_without_negative_clean_requirement() -> None:
+def test_gate_access_control_requires_negative_control_cleanliness() -> None:
     config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
     result = evaluate_candidate(
         config=config,
@@ -94,7 +94,8 @@ def test_gate_access_control_uses_http_signal_without_negative_clean_requirement
         evidence_signals=["source", "web"],
         vuln_class="broken_access_control",
     )
-    assert result.decision == "VALIDATED"
+    assert result.decision == "DROPPED"
+    assert result.failed_gate == "V4"
 
 
 def test_gate_access_control_requires_pair_observation() -> None:

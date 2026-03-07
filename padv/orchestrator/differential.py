@@ -53,14 +53,6 @@ def resolve_auth_state_for_level(auth_state: dict[str, Any] | None, level: str) 
             merged["auth_context"] = normalized_level
             return merged
 
-    # Legacy fallback for a single lower-privilege snapshot.
-    lower = auth_state.get("lower_privilege")
-    if isinstance(lower, dict):
-        merged = dict(auth_state)
-        merged["lower_privilege"] = lower
-        merged["auth_context"] = normalized_level
-        return merged
-
     return None
 
 

@@ -23,7 +23,7 @@ allow_casefold = false
 allow_url_decode = true
 
 [budgets]
-max_candidates = 200
+max_candidates = 40
 max_requests = 300
 max_seconds_per_candidate = 90
 max_run_seconds = 3600
@@ -55,7 +55,6 @@ use_http_api = true
 server_url = "http://joern:8080"
 script_path = ""
 timeout_seconds = 600
-fallback_to_regex = false
 
 [llm]
 provider = "anthropic"
@@ -63,7 +62,7 @@ model = "claude-sonnet-4-5-20250929"
 api_key_env = "ANTHROPIC_API_KEY"
 temperature = 0.0
 max_tokens = 4096
-timeout_seconds = 120
+timeout_seconds = 240
 
 [agent]
 use_deepagents = true

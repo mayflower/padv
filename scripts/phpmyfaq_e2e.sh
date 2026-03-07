@@ -226,6 +226,7 @@ Usage: scripts/phpmyfaq_e2e.sh <command>
 Commands:
   setup   Clone/update phpMyFAQ, sync Morcilla, start stack, bootstrap install, validate instrumentation
   test    Run strict padv analyze+run against phpMyFAQ (runs setup first when needed)
+  assess  Run phased integration assessment (A/B) and persist matrix + gap priorities
 USAGE
 }
 
@@ -237,6 +238,9 @@ main() {
       ;;
     test)
       cmd_test
+      ;;
+    assess)
+      python3 "${ROOT_DIR}/scripts/phpmyfaq_integration_assess.py" --phase full
       ;;
     *)
       usage

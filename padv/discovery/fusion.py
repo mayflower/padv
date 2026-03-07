@@ -1,9 +1,21 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from dataclasses import replace
 
 from padv.config.schema import PadvConfig
 from padv.models import Candidate, StaticEvidence
+
+_SEMANTIC_SIGNALS = frozenset({"joern", "scip"})
+
+
+@dataclass(slots=True)
+class FusionMeta:
+    input_candidates: int
+    fused_candidates: int
+    dual_signal_candidates: int
+    dropped_nonsemantic_candidates: int
+    evidence_graph: dict[str, dict[str, object]]
 
 
 def _merge_lists(a: list[str], b: list[str]) -> list[str]:
@@ -17,48 +29,88 @@ def _merge_lists(a: list[str], b: list[str]) -> list[str]:
     return out
 
 
-def fuse_candidates(
+def _semantic_signals(candidate: Candidate) -> set[str]:
+    return {
+        signal
+        for signal in candidate.provenance
+        if isinstance(signal, str) and signal.strip().lower() in _SEMANTIC_SIGNALS
+    }
+
+
+def _semantic_score(candidate: Candidate) -> int:
+    return len(_semantic_signals(candidate))
+
+
+def _merge_candidate_fields(target: Candidate, incoming: Candidate) -> None:
+    target.provenance = _merge_lists(target.provenance, incoming.provenance)
+    target.evidence_refs = _merge_lists(target.evidence_refs, incoming.evidence_refs)
+    target.expected_intercepts = _merge_lists(target.expected_intercepts, incoming.expected_intercepts)
+    target.preconditions = _merge_lists(target.preconditions, incoming.preconditions)
+    target.auth_requirements = _merge_lists(target.auth_requirements, incoming.auth_requirements)
+    target.web_path_hints = _merge_lists(target.web_path_hints, incoming.web_path_hints)
+
+    # Prefer the stronger semantic signal candidate as primary sink/position anchor.
+    target_score = (_semantic_score(target), target.confidence)
+    incoming_score = (_semantic_score(incoming), incoming.confidence)
+    if incoming_score > target_score and incoming.sink:
+        target.sink = incoming.sink
+        target.line = incoming.line
+
+    if incoming.confidence > target.confidence:
+        target.confidence = incoming.confidence
+    if not target.entrypoint_hint and incoming.entrypoint_hint:
+        target.entrypoint_hint = incoming.entrypoint_hint
+    if incoming.notes and incoming.notes not in target.notes:
+        target.notes = f"{target.notes}; {incoming.notes}".strip("; ")
+
+
+def fuse_candidates_with_meta(
     candidates: list[Candidate],
     static_evidence: list[StaticEvidence],
     config: PadvConfig,
-) -> tuple[list[Candidate], list[StaticEvidence]]:
+) -> tuple[list[Candidate], list[StaticEvidence], FusionMeta]:
     if not candidates:
-        return [], []
+        return [], [], FusionMeta(0, 0, 0, 0, {})
 
-    key_by_old_id: dict[str, tuple[str, str, int, str]] = {}
-    merged: dict[tuple[str, str, int, str], Candidate] = {}
+    key_by_old_id: dict[str, tuple[str, str, int]] = {}
+    merged: dict[tuple[str, str, int], Candidate] = {}
+    dropped_nonsemantic = 0
     for cand in candidates:
-        key = (cand.vuln_class, cand.file_path, cand.line, cand.sink)
+        key = (cand.vuln_class, cand.file_path, cand.line)
         key_by_old_id[cand.candidate_id] = key
+        if _semantic_score(cand) == 0:
+            dropped_nonsemantic += 1
+            continue
         current = merged.get(key)
         if current is None:
             merged[key] = replace(cand)
             continue
-        current.provenance = _merge_lists(current.provenance, cand.provenance)
-        current.evidence_refs = _merge_lists(current.evidence_refs, cand.evidence_refs)
-        current.expected_intercepts = _merge_lists(current.expected_intercepts, cand.expected_intercepts)
-        current.preconditions = _merge_lists(current.preconditions, cand.preconditions)
-        current.auth_requirements = _merge_lists(current.auth_requirements, cand.auth_requirements)
-        current.web_path_hints = _merge_lists(current.web_path_hints, cand.web_path_hints)
-        if cand.confidence > current.confidence:
-            current.confidence = cand.confidence
-        if not current.entrypoint_hint and cand.entrypoint_hint:
-            current.entrypoint_hint = cand.entrypoint_hint
-        if cand.notes and cand.notes not in current.notes:
-            current.notes = f"{current.notes}; {cand.notes}".strip("; ")
+        _merge_candidate_fields(current, cand)
 
     merged_list = sorted(
         merged.items(),
-        key=lambda item: (-item[1].confidence, item[1].file_path, item[1].line, item[1].vuln_class),
+        key=lambda item: (
+            -_semantic_score(item[1]),
+            -item[1].confidence,
+            item[1].file_path,
+            item[1].line,
+            item[1].vuln_class,
+        ),
     )
     merged_list = merged_list[: config.budgets.max_candidates]
 
     new_candidates: list[Candidate] = []
-    remap: dict[tuple[str, str, int, str], str] = {}
+    remap: dict[tuple[str, str, int], str] = {}
+    dual_signal_candidates = 0
     for idx, (key, cand) in enumerate(merged_list, start=1):
         new_id = f"cand-{idx:05d}"
         remap[key] = new_id
         cand.candidate_id = new_id
+        if _semantic_score(cand) >= 2:
+            dual_signal_candidates += 1
+            cand.confidence = min(1.0, cand.confidence + 0.1)
+            if "multi-signal-semantic" not in cand.notes:
+                cand.notes = f"{cand.notes}; multi-signal-semantic".strip("; ")
         new_candidates.append(cand)
 
     new_static: list[StaticEvidence] = []
@@ -86,4 +138,36 @@ def fuse_candidates(
             )
         )
 
-    return new_candidates, new_static
+    static_refs: dict[str, list[str]] = {}
+    for item in new_static:
+        static_refs.setdefault(item.candidate_id, []).append(item.query_id)
+
+    evidence_graph: dict[str, dict[str, object]] = {}
+    for cand in new_candidates:
+        semantic = sorted(_semantic_signals(cand))
+        evidence_graph[cand.candidate_id] = {
+            "semantic_signals": semantic,
+            "semantic_signal_count": len(semantic),
+            "provenance": list(cand.provenance),
+            "evidence_refs": list(cand.evidence_refs),
+            "static_query_ids": sorted(static_refs.get(cand.candidate_id, [])),
+            "has_dual_signal": len(semantic) >= 2,
+        }
+
+    meta = FusionMeta(
+        input_candidates=len(candidates),
+        fused_candidates=len(new_candidates),
+        dual_signal_candidates=dual_signal_candidates,
+        dropped_nonsemantic_candidates=dropped_nonsemantic,
+        evidence_graph=evidence_graph,
+    )
+    return new_candidates, new_static, meta
+
+
+def fuse_candidates(
+    candidates: list[Candidate],
+    static_evidence: list[StaticEvidence],
+    config: PadvConfig,
+) -> tuple[list[Candidate], list[StaticEvidence]]:
+    merged_candidates, merged_static, _meta = fuse_candidates_with_meta(candidates, static_evidence, config)
+    return merged_candidates, merged_static

@@ -41,6 +41,26 @@ _AUTHZ_PROBE_CLASSES = {
 
 _ERROR_MARKERS = ("warning:", "notice:", "fatal error", "stack trace", "uncaught exception")
 _LOGIN_MARKERS = ("login", "sign in", "signin", "anmelden", "auth", "passwort", "password")
+_SQL_ERROR_MARKERS = ("sql syntax", "mysql", "mysqli", "pdoexception", "syntax error near", "postgresql", "sqlite", "ora-")
+
+_CLASS_ORACLE_WITNESS_FLAGS: dict[str, str] = {
+    "sql_injection_boundary": "sql_sink_oracle_witness",
+    "command_injection_boundary": "command_sink_oracle_witness",
+    "code_injection_boundary": "code_sink_oracle_witness",
+    "ldap_injection_boundary": "ldap_sink_oracle_witness",
+    "xpath_injection_boundary": "xpath_sink_oracle_witness",
+    "file_boundary_influence": "file_sink_oracle_witness",
+    "file_upload_influence": "upload_sink_oracle_witness",
+    "outbound_request_influence": "ssrf_sink_oracle_witness",
+    "ssrf": "ssrf_sink_oracle_witness",
+    "xxe_influence": "xxe_sink_oracle_witness",
+    "deserialization_influence": "deserialization_sink_oracle_witness",
+    "php_object_gadget_surface": "gadget_sink_oracle_witness",
+    "header_injection_boundary": "header_sink_oracle_witness",
+    "regex_dos_boundary": "regex_sink_oracle_witness",
+    "xml_dos_boundary": "xml_sink_oracle_witness",
+    "security_misconfiguration": "misconfiguration_sink_oracle_witness",
+}
 
 
 def new_run_id(prefix: str = "run") -> str:
@@ -107,11 +127,42 @@ def _looks_like_login(response: Any) -> bool:
     return any(marker in body for marker in _LOGIN_MARKERS)
 
 
+def _contains_canary(arg: str, canary: str, config: PadvConfig) -> bool:
+    candidates = [arg]
+    if config.canary.allow_url_decode:
+        candidates.append(urllib.parse.unquote(arg))
+    if config.canary.allow_casefold:
+        folded = canary.casefold()
+        return any(folded in value.casefold() for value in candidates)
+    return any(canary in value for value in candidates)
+
+
+def _has_class_oracle_witness(
+    runtime: RuntimeEvidence,
+    candidate: Candidate,
+    plan: ValidationPlan,
+    config: PadvConfig,
+) -> bool:
+    witness_flag = _CLASS_ORACLE_WITNESS_FLAGS.get(candidate.vuln_class)
+    if not witness_flag:
+        return False
+    intercepts = {x.strip().casefold() for x in plan.intercepts if isinstance(x, str) and x.strip()}
+    for call in runtime.calls:
+        function = str(call.function or "").strip().casefold()
+        if intercepts and function not in intercepts:
+            continue
+        for arg in call.args:
+            if _contains_canary(str(arg), plan.canary, config):
+                return True
+    return False
+
+
 def _annotate_runtime_evidence(
     runtime: RuntimeEvidence,
     response: Any,
     candidate: Candidate,
     plan: ValidationPlan,
+    config: PadvConfig,
     request_spec: dict[str, Any],
     cookie_jar: dict[str, str],
     anonymous_probe: Any | None = None,
@@ -133,6 +184,8 @@ def _annotate_runtime_evidence(
         flags.add("body_canary")
     if has_raw_canary and not has_escaped_canary:
         flags.add("xss_raw_canary")
+        if "<script" in body_lower or "onerror=" in body_lower or "onload=" in body_lower:
+            flags.add("xss_dom_witness")
 
     if ("phpinfo()" in body_lower) or ("<title>phpinfo()" in body_lower) or ("php version" in body_lower):
         flags.add("phpinfo_marker")
@@ -141,10 +194,16 @@ def _annotate_runtime_evidence(
         if has_raw_canary:
             flags.add("verbose_error_leak")
         flags.add("debug_leak")
+    if any(marker in body_lower for marker in _SQL_ERROR_MARKERS):
+        flags.add("sql_error_witness")
 
     header_keys = {k.casefold() for k in response.headers.keys()}
     if "x-powered-by" in header_keys or "server" in header_keys:
         flags.add("info_disclosure_header")
+
+    witness_flag = _CLASS_ORACLE_WITNESS_FLAGS.get(candidate.vuln_class)
+    if witness_flag and _has_class_oracle_witness(runtime, candidate, plan, config):
+        flags.add(witness_flag)
 
     if candidate.vuln_class in _AUTHZ_PROBE_CLASSES and anonymous_probe is not None:
         flags.add("authz_pair_observed")
@@ -193,6 +252,77 @@ def _annotate_runtime_evidence(
     return runtime
 
 
+def _candidate_hypotheses(planner_trace: dict[str, Any], candidate_id: str) -> list[dict[str, Any]]:
+    proposer = planner_trace.get("proposer")
+    if not isinstance(proposer, dict):
+        return []
+    hypotheses = proposer.get("hypotheses")
+    if not isinstance(hypotheses, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in hypotheses:
+        if not isinstance(item, dict):
+            continue
+        cid = str(item.get("candidate_id", "")).strip()
+        if cid != candidate_id:
+            continue
+        out.append(
+            {
+                "candidate_id": cid,
+                "rationale": str(item.get("rationale", "")).strip(),
+            }
+        )
+    return out
+
+
+def _request_summary(request_spec: dict[str, Any]) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "method": str(request_spec.get("method", "GET")).upper(),
+        "path": str(request_spec.get("path", "")),
+    }
+    query = request_spec.get("query")
+    if isinstance(query, dict):
+        summary["query_keys"] = sorted(str(k) for k in query.keys())
+    body = request_spec.get("body")
+    if isinstance(body, dict):
+        summary["body_keys"] = sorted(str(k) for k in body.keys())
+    return summary
+
+
+def _record_attempt(
+    attempts: list[dict[str, Any]],
+    seen_flags: set[str],
+    *,
+    phase: str,
+    idx: int,
+    request_spec: dict[str, Any],
+    runtime: RuntimeEvidence,
+    elapsed_ms: int,
+) -> None:
+    current_flags = {x for x in runtime.analysis_flags if isinstance(x, str) and x.strip()}
+    new_flags = sorted(current_flags - seen_flags)
+    seen_flags.update(current_flags)
+    attempts.append(
+        {
+            "phase": phase,
+            "index": idx,
+            "request_id": runtime.request_id,
+            "request": _request_summary(request_spec),
+            "runtime_status": runtime.status,
+            "http_status": runtime.http_status,
+            "call_count": runtime.call_count,
+            "analysis_flags": sorted(current_flags),
+            "new_flags": new_flags,
+            "elapsed_ms": elapsed_ms,
+            "auth_context": (
+                str(runtime.aux.get("auth_context", ""))
+                if isinstance(runtime.aux, dict)
+                else ""
+            ),
+        }
+    )
+
+
 def validate_candidates_runtime(
     config: PadvConfig,
     store: EvidenceStore,
@@ -238,8 +368,11 @@ def validate_candidates_runtime(
             raise RuntimeError(f"missing agent-generated validation plan for candidate: {candidate.candidate_id}")
         positive_runs = []
         negative_runs = []
+        attempts: list[dict[str, Any]] = []
+        seen_flags: set[str] = set()
         differential_pairs: list[DifferentialPair] = []
         repro_ids: list[str] = []
+        candidate_hypotheses = _candidate_hypotheses(planner_trace, candidate.candidate_id)
         candidate_deadline = min(
             run_deadline,
             monotonic() + float(config.budgets.max_seconds_per_candidate),
@@ -252,6 +385,7 @@ def validate_candidates_runtime(
                 break
             req_id = new_request_id(candidate.candidate_id, "pos", idx)
             headers = _validation_headers(config, plan.intercepts, req_id)
+            req_started = monotonic()
             try:
                 response = send_request(
                     url=_target_url(config.target.base_url, request),
@@ -288,6 +422,7 @@ def validate_candidates_runtime(
                     response=response,
                     candidate=candidate,
                     plan=plan,
+                    config=config,
                     request_spec=request,
                     cookie_jar=cookie_jar,
                     anonymous_probe=anonymous_probe,
@@ -307,7 +442,17 @@ def validate_candidates_runtime(
                     raw_headers={"error": str(exc)},
                     aux={"auth_context": "authenticated" if cookie_jar else "anonymous"},
                 )
+            elapsed_ms = int((monotonic() - req_started) * 1000)
             positive_runs.append(runtime)
+            _record_attempt(
+                attempts,
+                seen_flags,
+                phase="positive",
+                idx=idx,
+                request_spec=request,
+                runtime=runtime,
+                elapsed_ms=elapsed_ms,
+            )
             repro_ids.append(req_id)
             request_budget_remaining -= 1
             if config.sandbox.reset_cmd:
@@ -320,6 +465,7 @@ def validate_candidates_runtime(
                 break
             req_id = new_request_id(candidate.candidate_id, "neg", idx)
             headers = _validation_headers(config, plan.intercepts, req_id)
+            req_started = monotonic()
             try:
                 response = send_request(
                     url=_target_url(config.target.base_url, request),
@@ -336,6 +482,7 @@ def validate_candidates_runtime(
                     response=response,
                     candidate=candidate,
                     plan=plan,
+                    config=config,
                     request_spec=request,
                     cookie_jar=cookie_jar,
                     anonymous_probe=None,
@@ -352,7 +499,17 @@ def validate_candidates_runtime(
                     calls=[],
                     raw_headers={"error": str(exc)},
                 )
+            elapsed_ms = int((monotonic() - req_started) * 1000)
             negative_runs.append(runtime)
+            _record_attempt(
+                attempts,
+                seen_flags,
+                phase="negative",
+                idx=idx,
+                request_spec=request,
+                runtime=runtime,
+                elapsed_ms=elapsed_ms,
+            )
             request_budget_remaining -= 1
 
         if (
@@ -385,6 +542,7 @@ def validate_candidates_runtime(
                 if isinstance(request_cookies, dict):
                     unpriv_cookie_jar = {str(k): str(v) for k, v in request_cookies.items() if str(k).strip()}
                 try:
+                    req_started = monotonic()
                     response = send_request(
                         url=_target_url(config.target.base_url, unpriv_request),
                         method=unpriv_request.get("method", "GET"),
@@ -400,6 +558,7 @@ def validate_candidates_runtime(
                         response=response,
                         candidate=candidate,
                         plan=plan,
+                        config=config,
                         request_spec=unpriv_request,
                         cookie_jar=unpriv_cookie_jar,
                         anonymous_probe=None,
@@ -409,6 +568,16 @@ def validate_candidates_runtime(
                     if not context:
                         context = "anonymous" if not unpriv_cookie_jar else "unprivileged"
                     unpriv_runtime.aux["auth_context"] = context
+                    elapsed_ms = int((monotonic() - req_started) * 1000)
+                    _record_attempt(
+                        attempts,
+                        seen_flags,
+                        phase="differential",
+                        idx=diff_idx,
+                        request_spec=unpriv_request,
+                        runtime=unpriv_runtime,
+                        elapsed_ms=elapsed_ms,
+                    )
                     differential_pairs.append(compare_responses(positive_runs[0], unpriv_runtime, config))
                 except RequestError:
                     pass
@@ -463,6 +632,20 @@ def validate_candidates_runtime(
                 for pair in differential_pairs
             ]
 
+        candidate_planner_trace = {
+            "hypotheses": candidate_hypotheses,
+            "validation_plan": {
+                "candidate_id": plan.candidate_id,
+                "intercepts": list(plan.intercepts),
+                "strategy": plan.strategy,
+                "negative_control_strategy": plan.negative_control_strategy,
+                "positive_request_count": len(plan.positive_requests),
+                "negative_request_count": len(plan.negative_requests),
+                "plan_notes": list(plan.plan_notes),
+            },
+            "attempts": attempts,
+        }
+
         bundle = EvidenceBundle(
             bundle_id=f"bundle-{run_id}-{candidate.candidate_id}",
             created_at=utc_now_iso(),
@@ -476,7 +659,7 @@ def validate_candidates_runtime(
             differential_pairs=differential_export,
             artifact_refs=artifact_refs,
             discovery_trace=discovery_trace,
-            planner_trace=planner_trace.get(candidate.candidate_id, {}),
+            planner_trace=candidate_planner_trace,
         )
         store.save_bundle(bundle)
         bundles.append(bundle)

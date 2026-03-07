@@ -10,23 +10,22 @@ from urllib.parse import urlsplit, urlunsplit
 from padv.analytics.failure_patterns import analyze_failures
 from padv.agents.deepagents_harness import (
     ensure_agent_session,
-    make_validation_plan_with_deepagents,
+    make_validation_plans_with_deepagents,
     rank_candidates_with_deepagents,
     schedule_actions_with_deepagents,
     skeptic_refine_with_deepagents,
 )
 from padv.config.schema import PadvConfig
 from padv.discovery import (
-    discover_scip_candidates_safe,
-    discover_source_candidates,
+    discover_scip_candidates_safe_with_meta,
     discover_web_hints,
     establish_auth_state,
-    fuse_candidates,
+    fuse_candidates_with_meta,
 )
 from padv.dynamic.sandbox import adapter as sandbox_adapter
 from padv.models import Candidate, FailureAnalysis, RunSummary, StaticEvidence
 from padv.orchestrator.runtime import new_run_id, validate_candidates_runtime
-from padv.static.joern.adapter import discover_candidates
+from padv.static.joern.adapter import discover_candidates_with_meta
 from padv.store.evidence_store import EvidenceStore
 
 
@@ -49,6 +48,8 @@ class GraphState(TypedDict, total=False):
     plans_by_candidate: dict[str, Any]
     artifact_refs: list[str]
     bundles: list[Any]
+    all_bundles: list[Any]
+    iteration_bundles: list[Any]
     decisions: dict[str, int]
     skip_discovery: bool
     frontier_state: dict[str, Any]
@@ -106,6 +107,8 @@ def _assert_stage_invariants(state: GraphState, stage: str) -> None:
         _expect_list("candidates")
         _expect_list("static_evidence")
         _expect_list("artifact_refs")
+        _expect_list("all_bundles")
+        _expect_list("iteration_bundles")
         _expect_dict("decisions")
         _expect_dict("auth_state")
         analysis = state.get("failure_analysis")
@@ -202,11 +205,14 @@ def _stage_snapshot_payload(state: GraphState, stage: str) -> dict[str, Any]:
             "selected_candidates": len(state.get("selected_candidates", [])),
             "selected_static": len(state.get("selected_static", [])),
             "bundles": len(state.get("bundles", [])),
+            "all_bundles": len(state.get("all_bundles", [])),
+            "iteration_bundles": len(state.get("iteration_bundles", [])),
             "artifact_refs": len(state.get("artifact_refs", [])),
         },
         "frontier": {
             "iteration": frontier.get("iteration") if isinstance(frontier, dict) else None,
             "stagnation_rounds": frontier.get("stagnation_rounds") if isinstance(frontier, dict) else None,
+            "attempt_history": len(frontier.get("attempt_history", [])) if isinstance(frontier, dict) else 0,
             "coverage_counts": {
                 "files": len(coverage.get("files", [])) if isinstance(coverage, dict) else 0,
                 "classes": len(coverage.get("classes", [])) if isinstance(coverage, dict) else 0,
@@ -263,6 +269,11 @@ def _default_frontier_state() -> dict[str, Any]:
             "web_paths": [],
         },
         "history": [],
+        "attempt_history": [],
+        "runtime_coverage": {
+            "flags": [],
+            "classes": [],
+        },
     }
 
 
@@ -304,6 +315,48 @@ def _coverage_delta(old: dict[str, list[str]], new: dict[str, list[str]]) -> dic
     for key in ("files", "classes", "signals", "sinks", "web_paths"):
         out[f"new_{key}"] = sorted(set(new.get(key, [])) - set(old.get(key, [])))
     return out
+
+
+def _runtime_feedback_from_bundles(bundles: list[Any], iteration: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    attempts: list[dict[str, Any]] = []
+    flags: set[str] = set()
+    classes: set[str] = set()
+    decisions: dict[str, int] = {}
+    for bundle in bundles:
+        candidate = getattr(bundle, "candidate", None)
+        candidate_id = getattr(candidate, "candidate_id", "")
+        vuln_class = getattr(candidate, "vuln_class", "")
+        if isinstance(vuln_class, str) and vuln_class.strip():
+            classes.add(vuln_class.strip())
+        gate = getattr(bundle, "gate_result", None)
+        decision = getattr(gate, "decision", "")
+        if isinstance(decision, str) and decision:
+            decisions[decision] = decisions.get(decision, 0) + 1
+
+        trace = getattr(bundle, "planner_trace", {})
+        trace_attempts = trace.get("attempts", []) if isinstance(trace, dict) else []
+        if not isinstance(trace_attempts, list):
+            continue
+        for item in trace_attempts:
+            if not isinstance(item, dict):
+                continue
+            copied = dict(item)
+            copied["candidate_id"] = str(candidate_id)
+            copied["vuln_class"] = str(vuln_class)
+            copied["iteration"] = iteration
+            attempts.append(copied)
+            analysis_flags = item.get("analysis_flags", [])
+            if isinstance(analysis_flags, list):
+                for flag in analysis_flags:
+                    if isinstance(flag, str) and flag.strip():
+                        flags.add(flag.strip())
+    summary = {
+        "attempt_count": len(attempts),
+        "flags": sorted(flags),
+        "classes": sorted(classes),
+        "decisions": decisions,
+    }
+    return attempts, summary
 
 
 def _normalize_seed_url(raw: str, base_url: str) -> str | None:
@@ -357,6 +410,28 @@ def _persist_web_artifact(state: GraphState, seed_urls: list[str], hints: dict[s
     artifact_refs.append(str(Path(artifact_path)))
 
 
+def _persist_semantic_discovery_artifact(state: GraphState, payload: dict[str, Any]) -> None:
+    store = state["store"]
+    store.ensure()
+    artifact_dir = store.root / "artifacts"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    artifact_path = artifact_dir / f"semantic-discovery-{new_run_id('disc')}.json"
+    full_payload = {"generated_at": _now_iso(), **payload}
+    artifact_path.write_text(json.dumps(full_payload, indent=2, ensure_ascii=True))
+    state.setdefault("artifact_refs", []).append(str(Path(artifact_path)))
+
+
+def _persist_fusion_artifact(state: GraphState, meta: dict[str, Any]) -> None:
+    store = state["store"]
+    store.ensure()
+    artifact_dir = store.root / "artifacts"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    artifact_path = artifact_dir / f"semantic-fusion-{new_run_id('disc')}.json"
+    payload = {"generated_at": _now_iso(), **meta}
+    artifact_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True))
+    state.setdefault("artifact_refs", []).append(str(Path(artifact_path)))
+
+
 def _persist_auth_artifact(state: GraphState, auth_state: dict[str, Any]) -> None:
     store = state["store"]
     store.ensure()
@@ -408,6 +483,8 @@ def _node_init(state: GraphState) -> GraphState:
     state["web_hints"] = {}
     state["web_error"] = None
     state["bundles"] = []
+    state["all_bundles"] = []
+    state["iteration_bundles"] = []
     state["objective_scores"] = {}
     state["loop_continue"] = False
     state["decisions"] = {"VALIDATED": 0, "DROPPED": 0, "NEEDS_HUMAN_SETUP": 0}
@@ -441,6 +518,8 @@ def _node_init(state: GraphState) -> GraphState:
     persisted.setdefault("failed_paths", [])
     persisted.setdefault("iteration", 0)
     persisted.setdefault("stagnation_rounds", 0)
+    persisted.setdefault("attempt_history", [])
+    persisted.setdefault("runtime_coverage", {"flags": [], "classes": []})
     state["frontier_state"] = persisted
     analysis = analyze_failures(state["store"])
     state["failure_analysis"] = analysis
@@ -469,23 +548,55 @@ def _node_static_discovery(state: GraphState) -> GraphState:
     config = state["config"]
     repo_root = state["repo_root"]
 
-    source_candidates, source_evidence = discover_source_candidates(repo_root, config)
-    joern_candidates, joern_evidence = discover_candidates(repo_root=repo_root, config=config)
-    scip_candidates, scip_evidence, scip_refs, scip_error = discover_scip_candidates_safe(repo_root, config)
+    scip_candidates, scip_evidence, scip_refs, scip_meta, scip_error = discover_scip_candidates_safe_with_meta(
+        repo_root, config
+    )
+    joern_candidates, joern_evidence, joern_meta = discover_candidates_with_meta(repo_root=repo_root, config=config)
+    joern_semantic_ids = {c.candidate_id for c in joern_candidates if "joern" in c.provenance}
+    joern_semantic_candidates = [c for c in joern_candidates if c.candidate_id in joern_semantic_ids]
+    joern_semantic_evidence = [e for e in joern_evidence if e.candidate_id in joern_semantic_ids]
+    dropped_nonsemantic = max(0, len(joern_candidates) - len(joern_semantic_candidates))
+
+    semantic_candidates = scip_candidates + joern_semantic_candidates
+    semantic_evidence = scip_evidence + joern_semantic_evidence
+    if not semantic_candidates:
+        raise RuntimeError("semantic discovery produced zero candidates (joern+scip)")
 
     state["artifact_refs"].extend(scip_refs)
-    state["candidates"] = source_candidates + joern_candidates + scip_candidates
-    state["static_evidence"] = source_evidence + joern_evidence + scip_evidence
+    _persist_semantic_discovery_artifact(
+        state,
+        {
+            "raw_scip_hits": scip_meta.raw_scip_hits,
+            "mapped_scip_sinks": scip_meta.mapped_scip_sinks,
+            "scip_app_scoped_sinks": scip_meta.app_scoped_sinks,
+            "scip_dropped_non_app_sinks": scip_meta.dropped_non_app_sinks,
+            "scip_candidates": len(scip_candidates),
+            "joern_findings": joern_meta.joern_findings,
+            "joern_app_findings": joern_meta.joern_app_findings,
+            "joern_candidates": len(joern_semantic_candidates),
+            "manifest_candidates": joern_meta.manifest_candidates,
+            "joern_dropped_nonsemantic": dropped_nonsemantic,
+            "semantic_candidates": len(semantic_candidates),
+        },
+    )
+    state["candidates"] = semantic_candidates
+    state["static_evidence"] = semantic_evidence
     state["discovery_trace"] = {
-        "source_count": len(source_candidates),
-        "joern_count": len(joern_candidates),
+        "source_count": 0,
+        "raw_scip_hits": scip_meta.raw_scip_hits,
+        "mapped_scip_sinks": scip_meta.mapped_scip_sinks,
+        "joern_count": len(joern_semantic_candidates),
+        "joern_findings": joern_meta.joern_findings,
+        "joern_dropped_nonsemantic": dropped_nonsemantic,
         "scip_count": len(scip_candidates),
+        "semantic_count": len(semantic_candidates),
+        "fused_candidates": len(semantic_candidates),
         "scip_error": scip_error,
     }
     return _finalize_stage(
         state,
         "static_discovery",
-        f"source={len(source_candidates)} joern={len(joern_candidates)} scip={len(scip_candidates)}",
+        f"semantic={len(semantic_candidates)} joern={len(joern_semantic_candidates)} scip={len(scip_candidates)}",
     )
 
 
@@ -561,7 +672,7 @@ def _node_candidate_synthesis(state: GraphState) -> GraphState:
         state["planner_trace"]["proposer"] = proposer_trace
         return _finalize_stage(state, "candidate_synthesis", f"ranked={len(ranked)} (validate-only)")
 
-    candidates, static_evidence = fuse_candidates(
+    candidates, static_evidence, fusion_meta = fuse_candidates_with_meta(
         candidates=[_safe_copy_candidate(c) for c in state.get("candidates", [])],
         static_evidence=state.get("static_evidence", []),
         config=config,
@@ -577,6 +688,19 @@ def _node_candidate_synthesis(state: GraphState) -> GraphState:
     state["candidates"] = ranked[: config.budgets.max_candidates]
     state["static_evidence"] = static_evidence
     state["discovery_trace"]["fusion_count"] = len(candidates)
+    state["discovery_trace"]["fused_candidates"] = len(candidates)
+    state["discovery_trace"]["fusion_dual_signal"] = fusion_meta.dual_signal_candidates
+    state["discovery_trace"]["fusion_dropped_nonsemantic"] = fusion_meta.dropped_nonsemantic_candidates
+    _persist_fusion_artifact(
+        state,
+        {
+            "input_candidates": fusion_meta.input_candidates,
+            "fused_candidates": fusion_meta.fused_candidates,
+            "dual_signal_candidates": fusion_meta.dual_signal_candidates,
+            "dropped_nonsemantic_candidates": fusion_meta.dropped_nonsemantic_candidates,
+            "evidence_graph": fusion_meta.evidence_graph,
+        },
+    )
     state["planner_trace"]["proposer"] = proposer_trace
     return _finalize_stage(state, "candidate_synthesis", f"fused={len(candidates)} selected={len(state['candidates'])}")
 
@@ -671,6 +795,7 @@ def _node_frontier_update(state: GraphState) -> GraphState:
         return _finalize_stage(state, "frontier_update", "skipped (validate-only)")
 
     frontier = state.get("frontier_state") or _default_frontier_state()
+    iteration = int(frontier.get("iteration", 0)) + 1
     old_cov = frontier.get("coverage", _default_frontier_state()["coverage"])
     new_cov = _coverage_snapshot(state.get("candidates", []), state.get("web_hints", {}))
     delta = _coverage_delta(old_cov, new_cov)
@@ -697,7 +822,7 @@ def _node_frontier_update(state: GraphState) -> GraphState:
                     "candidate_id": cid,
                     "rationale": str(item.get("rationale", "")).strip(),
                     "score": state.get("objective_scores", {}).get(cid, 0.0),
-                    "iteration": int(frontier.get("iteration", 0)) + 1,
+                    "iteration": iteration,
                 }
             )
 
@@ -706,7 +831,7 @@ def _node_frontier_update(state: GraphState) -> GraphState:
             {
                 "path": state["config"].target.base_url,
                 "reason": str(state["web_error"]),
-                "iteration": int(frontier.get("iteration", 0)) + 1,
+                "iteration": iteration,
             }
         )
 
@@ -719,31 +844,59 @@ def _node_frontier_update(state: GraphState) -> GraphState:
                     {
                         "path": item.strip(),
                         "reason": "skeptic-refute",
-                        "iteration": int(frontier.get("iteration", 0)) + 1,
+                        "iteration": iteration,
                     }
                 )
+
+    runtime_attempts, runtime_summary = _runtime_feedback_from_bundles(
+        state.get("iteration_bundles", []),
+        iteration=iteration,
+    )
+    runtime_cov = frontier.get("runtime_coverage", {"flags": [], "classes": []})
+    old_runtime_flags = set(runtime_cov.get("flags", [])) if isinstance(runtime_cov, dict) else set()
+    old_runtime_classes = set(runtime_cov.get("classes", [])) if isinstance(runtime_cov, dict) else set()
+    new_runtime_flags = set(runtime_summary.get("flags", []))
+    new_runtime_classes = set(runtime_summary.get("classes", []))
+    runtime_delta = {
+        "new_flags": sorted(new_runtime_flags - old_runtime_flags),
+        "new_classes": sorted(new_runtime_classes - old_runtime_classes),
+        "attempt_count": int(runtime_summary.get("attempt_count", 0)),
+        "decisions": dict(runtime_summary.get("decisions", {})),
+    }
+    frontier["runtime_coverage"] = {
+        "flags": sorted(old_runtime_flags | new_runtime_flags),
+        "classes": sorted(old_runtime_classes | new_runtime_classes),
+    }
+    frontier.setdefault("attempt_history", [])
+    frontier["attempt_history"].extend(runtime_attempts)
 
     frontier["history"] = list(frontier.get("history", []))[-200:]
     frontier["history"].append(
         {
-            "iteration": int(frontier.get("iteration", 0)) + 1,
+            "iteration": iteration,
             "selected": [c.candidate_id for c in state.get("selected_candidates", [])],
             "delta": delta,
+            "runtime_delta": runtime_delta,
             "web_error": state.get("web_error"),
         }
     )
 
-    has_delta = any(delta.get(key) for key in delta)
+    has_discovery_delta = any(delta.get(key) for key in delta)
+    has_runtime_delta = bool(runtime_delta["new_flags"] or runtime_delta["new_classes"])
+    has_delta = has_discovery_delta or has_runtime_delta
     stagnation = int(frontier.get("stagnation_rounds", 0))
     frontier["stagnation_rounds"] = 0 if has_delta else stagnation + 1
-    frontier["iteration"] = int(frontier.get("iteration", 0)) + 1
+    frontier["iteration"] = iteration
     frontier["updated_at"] = _now_iso()
     frontier["hypotheses"] = list(frontier.get("hypotheses", []))[-1000:]
     frontier["failed_paths"] = list(frontier.get("failed_paths", []))[-1000:]
+    frontier["attempt_history"] = list(frontier.get("attempt_history", []))[-5000:]
 
     state["frontier_state"] = frontier
     state["discovery_trace"]["frontier_delta"] = delta
+    state["discovery_trace"]["runtime_delta"] = runtime_delta
     state["discovery_trace"]["frontier_iteration"] = frontier["iteration"]
+    state["iteration_bundles"] = []
 
     max_iterations = max(1, state["config"].agent.max_iterations)
     patience = max(0, state["config"].agent.improvement_patience)
@@ -765,17 +918,15 @@ def _node_validation_plan(state: GraphState) -> GraphState:
     if not state.get("run_validation"):
         return _finalize_stage(state, "validation_plan", "skipped (analysis-only)")
 
-    plans_by_candidate: dict[str, Any] = {}
+    selected_candidates = state.get("selected_candidates") or state.get("candidates", [])
     planner_trace: dict[str, Any] = dict(state.get("planner_trace", {}))
-    for candidate in state.get("selected_candidates") or state.get("candidates", []):
-        plan, trace = make_validation_plan_with_deepagents(
-            candidate,
-            state["config"],
-            repo_root=state.get("repo_root"),
-            session=state.get("agent_session"),
-        )
-        plans_by_candidate[candidate.candidate_id] = plan
-        planner_trace[candidate.candidate_id] = trace
+    plans_by_candidate, validation_trace = make_validation_plans_with_deepagents(
+        selected_candidates,
+        state["config"],
+        repo_root=state.get("repo_root"),
+        session=state.get("agent_session"),
+    )
+    planner_trace["validation_plan"] = validation_trace
     state["plans_by_candidate"] = plans_by_candidate
     state["planner_trace"] = planner_trace
     return _finalize_stage(state, "validation_plan", f"planned={len(plans_by_candidate)}")
@@ -799,9 +950,17 @@ def _node_runtime_validate(state: GraphState) -> GraphState:
         artifact_refs=state.get("artifact_refs", []),
         auth_state=state.get("auth_state"),
     )
-    state["bundles"] = bundles
+    state["iteration_bundles"] = list(bundles)
+    all_bundles = list(state.get("all_bundles", []))
+    all_bundles.extend(bundles)
+    state["all_bundles"] = all_bundles
+    state["bundles"] = all_bundles
     state["decisions"] = decisions
-    return _finalize_stage(state, "runtime_validate", f"bundles={len(bundles)}")
+    return _finalize_stage(
+        state,
+        "runtime_validate",
+        f"iteration_bundles={len(bundles)} total_bundles={len(all_bundles)}",
+    )
 
 
 def _node_deterministic_gates(state: GraphState) -> GraphState:
@@ -811,6 +970,8 @@ def _node_deterministic_gates(state: GraphState) -> GraphState:
 
 def _node_dedup_topk(state: GraphState) -> GraphState:
     _emit_progress(state, "dedup_topk", "start")
+    if state.get("all_bundles"):
+        state["bundles"] = list(state.get("all_bundles", []))
     bundles = state.get("bundles", [])
     if not bundles:
         return _finalize_stage(state, "dedup_topk", "no bundles")
@@ -856,14 +1017,16 @@ def _run_nodes(state: GraphState, include_validation: bool) -> GraphState:
         state = _node_candidate_synthesis(state)
         state = _node_skeptic_refine(state)
         state = _node_objective_schedule(state)
+        if include_validation:
+            state = _node_validation_plan(state)
+            state = _node_runtime_validate(state)
+            state = _node_deterministic_gates(state)
         state = _node_frontier_update(state)
         if state.get("skip_discovery") or not state.get("loop_continue"):
             break
 
     if include_validation:
-        state = _node_validation_plan(state)
-        state = _node_runtime_validate(state)
-        state = _node_deterministic_gates(state)
+        state["bundles"] = list(state.get("all_bundles", []))
         state = _node_dedup_topk(state)
     state = _node_persist(state)
     _emit_progress(state, "run", "done", "node runner complete")
@@ -903,21 +1066,24 @@ def _run_langgraph(state: GraphState, include_validation: bool) -> GraphState:
     builder.add_edge("auth_setup", "candidate_synthesis")
     builder.add_edge("candidate_synthesis", "skeptic_refine")
     builder.add_edge("skeptic_refine", "objective_schedule")
-    builder.add_edge("objective_schedule", "frontier_update")
+    if include_validation:
+        builder.add_edge("objective_schedule", "validation_plan")
+        builder.add_edge("validation_plan", "runtime_validate")
+        builder.add_edge("runtime_validate", "deterministic_gates")
+        builder.add_edge("deterministic_gates", "frontier_update")
+    else:
+        builder.add_edge("objective_schedule", "frontier_update")
 
     builder.add_conditional_edges(
         "frontier_update",
         _after_frontier_route,
         {
             "again": "static_discovery",
-            "done": "validation_plan" if include_validation else "persist",
+            "done": "dedup_topk" if include_validation else "persist",
         },
     )
 
     if include_validation:
-        builder.add_edge("validation_plan", "runtime_validate")
-        builder.add_edge("runtime_validate", "deterministic_gates")
-        builder.add_edge("deterministic_gates", "dedup_topk")
         builder.add_edge("dedup_topk", "persist")
     builder.add_edge("persist", END)
 

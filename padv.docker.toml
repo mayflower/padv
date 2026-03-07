@@ -55,7 +55,6 @@ use_http_api = true
 server_url = "http://joern:8080"
 script_path = ""
 timeout_seconds = 600
-fallback_to_regex = false
 
 [llm]
 provider = "anthropic"

@@ -30,6 +30,14 @@ class JoernFinding:
     snippet: str
 
 
+@dataclass(slots=True)
+class JoernDiscoveryMeta:
+    joern_findings: int = 0
+    joern_app_findings: int = 0
+    joern_candidate_count: int = 0
+    manifest_candidates: int = 0
+
+
 _SPEC_BY_CLASS = {spec.vuln_class: spec for spec in VULN_CLASS_SPECS}
 _ANSI_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 _RESULT_MARKER = re.compile(r"<padv_result>\s*(\[.*\])\s*</padv_result>", re.DOTALL)
@@ -38,22 +46,6 @@ _RESULT_MARKER = re.compile(r"<padv_result>\s*(\[.*\])\s*</padv_result>", re.DOT
 def _hash_for(file_path: str, line: int, text: str) -> str:
     payload = f"{file_path}:{line}:{text}".encode("utf-8")
     return hashlib.sha256(payload).hexdigest()[:16]
-
-
-def _looks_like_php(path: Path) -> bool:
-    return path.suffix.lower() in {
-        ".php",
-        ".phtml",
-        ".inc",
-        ".php3",
-        ".php4",
-        ".php5",
-        ".php7",
-        ".php8",
-        ".module",
-        ".install",
-        ".theme",
-    }
 
 
 def _preconditions_for_spec(spec: VulnClassSpec, config: PadvConfig) -> list[str]:
@@ -87,9 +79,9 @@ def _make_candidate_and_evidence(
         entrypoint_hint=None,
         preconditions=_preconditions_for_spec(spec, config),
         notes=notes,
-        provenance=["joern" if "joern" in notes else "regex"],
+        provenance=(["manifest"] if query_id.startswith("manifest::") else ["joern"]),
         evidence_refs=[evidence_ref],
-        confidence=0.6 if "joern" in notes else 0.35,
+        confidence=(0.55 if query_id.startswith("manifest::") else 0.6),
         auth_requirements=(["login"] if config.auth.enabled else []),
         web_path_hints=[],
     )
@@ -399,7 +391,9 @@ def _run_joern_findings(repo_root: Path, config: PadvConfig) -> list[JoernFindin
     return _run_joern_findings_script(repo_root, config)
 
 
-def _discover_with_joern(repo_root: Path, config: PadvConfig) -> tuple[list[Candidate], list[StaticEvidence]]:
+def _discover_with_joern(
+    repo_root: Path, config: PadvConfig
+) -> tuple[list[Candidate], list[StaticEvidence], JoernDiscoveryMeta]:
     findings = _run_joern_findings(repo_root, config)
 
     unique_findings: list[JoernFinding] = []
@@ -411,17 +405,19 @@ def _discover_with_joern(repo_root: Path, config: PadvConfig) -> tuple[list[Cand
         seen.add(key)
         unique_findings.append(finding)
 
+    meta = JoernDiscoveryMeta(joern_findings=len(unique_findings))
     candidates: list[Candidate] = []
     evidence: list[StaticEvidence] = []
     detector_note = "joern http detector" if config.joern.use_http_api else "joern script detector"
     for finding in unique_findings:
-        if len(candidates) >= config.budgets.max_candidates:
-            break
         spec = _SPEC_BY_CLASS.get(finding.vuln_class)
         if spec is None:
             continue
         rel_path = normalize_repo_path(finding.file_path, repo_root=repo_root)
         if not rel_path or not is_app_candidate_path(rel_path):
+            continue
+        meta.joern_app_findings += 1
+        if len(candidates) >= config.budgets.max_candidates:
             continue
         candidate_id = f"cand-{len(candidates)+1:05d}"
         candidate, static = _make_candidate_and_evidence(
@@ -439,7 +435,8 @@ def _discover_with_joern(repo_root: Path, config: PadvConfig) -> tuple[list[Cand
         candidates.append(candidate)
         evidence.append(static)
 
-    return candidates, evidence
+    meta.joern_candidate_count = len(candidates)
+    return candidates, evidence, meta
 
 
 def _discover_manifest_candidates(
@@ -447,12 +444,13 @@ def _discover_manifest_candidates(
     config: PadvConfig,
     candidates: list[Candidate],
     evidence: list[StaticEvidence],
-) -> None:
+) -> int:
     spec = _SPEC_BY_CLASS.get("vulnerable_components")
     if spec is None:
-        return
+        return 0
 
     manifest_paths = [root / "composer.json", root / "composer.lock"]
+    added = 0
     for manifest in manifest_paths:
         if len(candidates) >= config.budgets.max_candidates:
             break
@@ -500,63 +498,23 @@ def _discover_manifest_candidates(
         )
         candidates.append(candidate)
         evidence.append(static)
+        added += 1
+    return added
 
 
-def _discover_with_regex(root: Path, config: PadvConfig) -> tuple[list[Candidate], list[StaticEvidence]]:
-    candidates: list[Candidate] = []
-    evidence: list[StaticEvidence] = []
-
-    for path in root.rglob("*"):
-        if len(candidates) >= config.budgets.max_candidates:
-            break
-        if not path.is_file() or not _looks_like_php(path):
-            continue
-
-        try:
-            text = path.read_text(encoding="utf-8", errors="ignore")
-        except OSError:
-            continue
-
-        lines = text.splitlines()
-        rel_path = normalize_repo_path(str(path.relative_to(root)))
-        if not is_app_candidate_path(rel_path):
-            continue
-        for line_no, line in enumerate(lines, start=1):
-            line_lower = line.lower()
-            for spec in VULN_CLASS_SPECS:
-                if len(candidates) >= config.budgets.max_candidates:
-                    break
-                if any(pattern.lower() in line_lower for pattern in spec.sink_patterns):
-                    candidate_id = f"cand-{len(candidates)+1:05d}"
-                    sink = next((p for p in spec.sink_patterns if p.lower() in line_lower), spec.sink_patterns[0])
-                    candidate, static = _make_candidate_and_evidence(
-                        candidate_id=candidate_id,
-                        spec=spec,
-                        file_path=rel_path,
-                        line=line_no,
-                        sink=sink,
-                        snippet=line.strip(),
-                        query_profile=config.joern.query_profile,
-                        query_id=f"regex::{spec.vuln_class}",
-                        notes="regex static detector",
-                        config=config,
-                    )
-                    candidates.append(candidate)
-                    evidence.append(static)
-                    break
-
-    _discover_manifest_candidates(root, config, candidates, evidence)
-    return candidates, evidence
-
-
-def discover_candidates(repo_root: str, config: PadvConfig) -> tuple[list[Candidate], list[StaticEvidence]]:
+def discover_candidates_with_meta(
+    repo_root: str, config: PadvConfig
+) -> tuple[list[Candidate], list[StaticEvidence], JoernDiscoveryMeta]:
     root = Path(repo_root)
     if not root.exists():
         raise FileNotFoundError(f"repo root does not exist: {repo_root}")
+    if not config.joern.enabled:
+        raise JoernExecutionError("joern.enabled must remain true")
+    joern_candidates, joern_evidence, meta = _discover_with_joern(root, config)
+    meta.manifest_candidates = _discover_manifest_candidates(root, config, joern_candidates, joern_evidence)
+    return joern_candidates, joern_evidence, meta
 
-    if config.joern.enabled:
-        joern_candidates, joern_evidence = _discover_with_joern(root, config)
-        _discover_manifest_candidates(root, config, joern_candidates, joern_evidence)
-        return joern_candidates, joern_evidence
 
-    return _discover_with_regex(root, config)
+def discover_candidates(repo_root: str, config: PadvConfig) -> tuple[list[Candidate], list[StaticEvidence]]:
+    candidates, evidence, _meta = discover_candidates_with_meta(repo_root, config)
+    return candidates, evidence

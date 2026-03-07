@@ -321,7 +321,6 @@ PadvConfig:
 - `agent.require_langgraph = true`
 - `agent.hard_fail = true`
 - `joern.enabled = true`
-- `joern.fallback_to_regex = false`
 - `scip.enabled = true`
 - `scip.hard_fail = true`
 - `web.enabled = true`

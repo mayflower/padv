@@ -102,7 +102,7 @@ def test_validate_runtime_forwards_auth_cookies(monkeypatch: pytest.MonkeyPatch,
         lambda **kwargs: GateResult("DROPPED", ["V0"], "V3", "test"),
     )
 
-    validate_candidates_runtime(
+    bundles, _decisions = validate_candidates_runtime(
         config=config,
         store=store,
         static_evidence=[_evidence()],
@@ -116,3 +116,76 @@ def test_validate_runtime_forwards_auth_cookies(monkeypatch: pytest.MonkeyPatch,
     )
     assert seen_cookie_jars
     assert all(jar.get("sessionid") == "abc123" for jar in seen_cookie_jars)
+    assert bundles
+    planner_trace = bundles[0].planner_trace
+    assert planner_trace["validation_plan"]["positive_request_count"] == 3
+    assert planner_trace["validation_plan"]["negative_request_count"] == 1
+    assert planner_trace["attempts"]
+    assert planner_trace["attempts"][0]["phase"] == "positive"
+
+
+def test_validate_runtime_embeds_candidate_hypotheses(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
+    store = EvidenceStore(tmp_path / ".padv")
+    candidate = _candidate()
+    candidate.preconditions = []
+    plan = ValidationPlan(
+        candidate_id=candidate.candidate_id,
+        intercepts=["mysqli_query"],
+        positive_requests=[
+            {"method": "GET", "path": "/", "query": {config.canary.parameter_name: "p1"}},
+            {"method": "GET", "path": "/", "query": {config.canary.parameter_name: "p2"}},
+            {"method": "GET", "path": "/", "query": {config.canary.parameter_name: "p3"}},
+        ],
+        negative_requests=[{"method": "GET", "path": "/", "query": {config.canary.parameter_name: "neg"}}],
+        canary="p1",
+    )
+
+    class _Resp:
+        headers: dict[str, str] = {}
+        status_code: int = 200
+        body: str = ""
+
+    monkeypatch.setattr("padv.orchestrator.runtime.send_request", lambda *args, **kwargs: _Resp())
+    monkeypatch.setattr(
+        "padv.orchestrator.runtime.parse_response_headers",
+        lambda request_id, headers, oracle: RuntimeEvidence(
+            request_id=request_id,
+            status="ok",
+            call_count=1,
+            overflow=False,
+            arg_truncated=False,
+            result_truncated=False,
+            correlation=request_id,
+            calls=[],
+            raw_headers={},
+        ),
+    )
+    monkeypatch.setattr(
+        "padv.orchestrator.runtime.evaluate_candidate",
+        lambda **kwargs: GateResult("DROPPED", ["V0"], "V3", "test"),
+    )
+
+    bundles, _decisions = validate_candidates_runtime(
+        config=config,
+        store=store,
+        static_evidence=[_evidence()],
+        candidates=[candidate],
+        run_id="run-hypotheses",
+        plans_by_candidate={candidate.candidate_id: plan},
+        planner_trace={
+            "proposer": {
+                "hypotheses": [
+                    {"candidate_id": "cand-1", "rationale": "sink reachable via GET"},
+                    {"candidate_id": "cand-2", "rationale": "other"},
+                ]
+            }
+        },
+        discovery_trace={},
+        artifact_refs=[],
+        auth_state={},
+    )
+    assert bundles
+    hypotheses = bundles[0].planner_trace["hypotheses"]
+    assert len(hypotheses) == 1
+    assert hypotheses[0]["candidate_id"] == "cand-1"

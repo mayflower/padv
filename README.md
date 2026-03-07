@@ -68,6 +68,12 @@ Run strict `padv` test pass (`analyze` + `run`) against the bootstrapped app:
 ./scripts/phpmyfaq_e2e.sh test
 ```
 
+Run phased integration assessment (Phase A stabilization + Phase B requirement matrix):
+
+```bash
+./scripts/phpmyfaq_e2e.sh assess
+```
+
 ## Joern Backend
 
 `padv` supports two Joern execution modes:
@@ -83,13 +89,11 @@ Run strict `padv` test pass (`analyze` + `run`) against the bootstrapped app:
   - `[joern].use_http_api = false` (set true to use `server_url`)
   - `[joern].server_url = "http://127.0.0.1:8080"`
   - `[joern].script_path = ""` (empty uses built-in script)
-  - `[joern].fallback_to_regex = true` to keep running if Joern is unavailable
-- If Joern is missing and fallback is enabled, discovery falls back to regex detection.
-- If `fallback_to_regex = false`, discovery fails fast on Joern execution errors.
+- Joern fallback-to-regex is not supported. Joern execution errors are hard-fail.
 
 ## New Config Sections
 
-The config remains backward compatible and now supports additive sections:
+The config requires explicit strict sections:
 
 - `[llm]` provider/model/api-key env and generation limits
 - `[agent]` DeepAgents and iteration controls

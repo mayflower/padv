@@ -39,7 +39,6 @@ def test_discover_candidates_prefers_joern(monkeypatch: pytest.MonkeyPatch, tmp_
 
     config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
     config.joern.enabled = True
-    config.joern.fallback_to_regex = False
 
     def fake_run(_repo_root: Path, _config):
         return [
@@ -61,28 +60,50 @@ def test_discover_candidates_prefers_joern(monkeypatch: pytest.MonkeyPatch, tmp_
     assert static_evidence[0].query_id == "joern::sql_boundary"
 
 
+def test_discover_candidates_with_meta_reports_joern_findings(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _write_php(tmp_path, "src/a.php", "<?php mysqli_query($db, $q); ?>")
+
+    config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
+    config.joern.enabled = True
+
+    monkeypatch.setattr(
+        adapter,
+        "_run_joern_findings",
+        lambda *_args, **_kwargs: [
+            JoernFinding(
+                vuln_class="sql_injection_boundary",
+                query_id="joern::sql_boundary",
+                file_path="src/a.php",
+                line=1,
+                sink="mysqli_query",
+                snippet="mysqli_query($db, $q)",
+            ),
+            JoernFinding(
+                vuln_class="sql_injection_boundary",
+                query_id="joern::sql_boundary",
+                file_path="tests/a.php",
+                line=1,
+                sink="mysqli_query",
+                snippet="mysqli_query($db, $q)",
+            ),
+        ],
+    )
+
+    candidates, static_evidence, meta = adapter.discover_candidates_with_meta(str(tmp_path), config)
+    assert len(candidates) == 1
+    assert len(static_evidence) == 1
+    assert meta.joern_findings == 2
+    assert meta.joern_app_findings == 1
+    assert meta.joern_candidate_count == 1
+
+
 def test_discover_candidates_does_not_fallback_to_regex(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _write_php(tmp_path, "src/a.php", "<?php exec($cmd); ?>")
 
     config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
     config.joern.enabled = True
-    config.joern.fallback_to_regex = True
-
-    def fake_run(_repo_root: Path, _config):
-        raise JoernExecutionError("joern unavailable")
-
-    monkeypatch.setattr(adapter, "_run_joern_findings", fake_run)
-
-    with pytest.raises(JoernExecutionError):
-        adapter.discover_candidates(str(tmp_path), config)
-
-
-def test_discover_candidates_raises_without_fallback(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    _write_php(tmp_path, "src/a.php", "<?php exec($cmd); ?>")
-
-    config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
-    config.joern.enabled = True
-    config.joern.fallback_to_regex = False
 
     def fake_run(_repo_root: Path, _config):
         raise JoernExecutionError("joern unavailable")
@@ -105,30 +126,17 @@ def test_parse_joern_stdout_marker_json() -> None:
     assert findings[0].line == 9
 
 
-def test_discover_candidates_detects_insecure_design_regex(tmp_path: Path) -> None:
-    _write_php(tmp_path, "src/design.php", "<?php allow_all_access($user); ?>")
-
-    config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
-    config.joern.enabled = False
-
-    candidates, static_evidence = adapter.discover_candidates(str(tmp_path), config)
-    assert any(c.vuln_class == "insecure_design" for c in candidates)
-    assert any(e.query_id == "regex::insecure_design" for e in static_evidence)
-
-
-def test_discover_candidates_regex_excludes_test_paths(tmp_path: Path) -> None:
-    _write_php(tmp_path, "tests/a.php", "<?php exec($cmd); ?>")
+def test_discover_candidates_rejects_disabled_joern(tmp_path: Path) -> None:
     _write_php(tmp_path, "src/a.php", "<?php exec($cmd); ?>")
-
     config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
     config.joern.enabled = False
-
-    candidates, _ = adapter.discover_candidates(str(tmp_path), config)
-    assert any(c.file_path == "src/a.php" for c in candidates)
-    assert all(not c.file_path.startswith("tests/") for c in candidates)
+    with pytest.raises(JoernExecutionError, match="joern.enabled must remain true"):
+        adapter.discover_candidates(str(tmp_path), config)
 
 
-def test_discover_candidates_detects_vulnerable_components_manifest(tmp_path: Path) -> None:
+def test_discover_candidates_detects_vulnerable_components_manifest(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     composer = tmp_path / "composer.json"
     composer.write_text(
         '{"require":{"symfony/http-foundation":"5.4.0","guzzlehttp/guzzle":"7.0.0"}}',
@@ -136,7 +144,8 @@ def test_discover_candidates_detects_vulnerable_components_manifest(tmp_path: Pa
     )
 
     config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
-    config.joern.enabled = False
+    config.joern.enabled = True
+    monkeypatch.setattr(adapter, "_run_joern_findings", lambda *_args, **_kwargs: [])
 
     candidates, static_evidence = adapter.discover_candidates(str(tmp_path), config)
     assert any(c.vuln_class == "vulnerable_components" for c in candidates)
