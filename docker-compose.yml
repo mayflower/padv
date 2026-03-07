@@ -1,0 +1,26 @@
+services:
+  joern:
+    image: ${JOERN_IMAGE:-ghcr.io/joernio/joern:master}
+    command: ["joern", "--server", "--server-host", "0.0.0.0", "--server-port", "8080"]
+    working_dir: /workspace
+    ports:
+      - "8080:8080"
+    volumes:
+      - ${PADV_TARGETS_DIR:-./targets}:/workspace/targets:ro
+
+  padv:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    working_dir: /workspace/haxor
+    depends_on:
+      - joern
+    environment:
+      PADV_CONFIG: /workspace/haxor/padv.docker.toml
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    shm_size: "1gb"
+    volumes:
+      - ./:/workspace/haxor
+      - ${PADV_TARGETS_DIR:-./targets}:/workspace/targets

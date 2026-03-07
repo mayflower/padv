@@ -1,0 +1,27 @@
+diff --git a/src/Composer/Composer.php b/src/Composer/Composer.php
+index 8ee5222..37a5a55 100644
+--- a/src/Composer/Composer.php
++++ b/src/Composer/Composer.php
+@@ -114,10 +114,18 @@ final class Composer
+         }
+         $this->vendorDir = self::join($projectRoot, $vendorDir);
+ 
+-        $projectAutoload = Reader::read(self::join($this->vendorDir, 'autoload.php'));
+-        $scipPhpAutoload = Reader::read(self::join($this->scipPhpVendorDir, 'autoload.php'));
+-        $autoloadDir = $projectAutoload === $scipPhpAutoload ? $this->scipPhpVendorDir : $this->vendorDir;
+-        $this->loader = require self::join($autoloadDir, 'autoload.php');
++        $projectAutoloadPath = self::join($this->vendorDir, 'autoload.php');
++        $scipPhpAutoloadPath = self::join($this->scipPhpVendorDir, 'autoload.php');
++        $projectAutoload = Reader::read($projectAutoloadPath);
++        $scipPhpAutoload = Reader::read($scipPhpAutoloadPath);
++        if ($projectAutoload === $scipPhpAutoload) {
++            $this->loader = require $scipPhpAutoloadPath;
++        } else {
++            $this->loader = require $projectAutoloadPath;
++            $scipLoader = require $scipPhpAutoloadPath;
++            $scipLoader->unregister();
++            $scipLoader->register(true);
++        }
+ 
+         $installed = require self::join($this->vendorDir, 'composer', 'installed.php');
+         $this->pkgName = $installed['root']['name'];

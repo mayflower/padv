@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "padv"
+version = "0.1.0"
+description = "PHP Agentic Discovery and Validation CLI"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "haxor" }]
+dependencies = [
+  "langgraph>=1.0.0",
+  "deepagents>=0.0.7",
+  "langchain-core>=1.0.0",
+  "langchain-anthropic>=1.0.0",
+  "langchain-openai>=1.0.0",
+  "browser-use>=0.2.0",
+  "playwright>=1.55.0",
+]
+
+[project.scripts]
+padv = "padv.cli.main:main"
+
+[tool.setuptools]
+packages = [
+  "padv",
+  "padv.cli",
+  "padv.config",
+  "padv.orchestrator",
+  "padv.agents",
+  "padv.discovery",
+  "padv.static.joern",
+  "padv.dynamic.http",
+  "padv.dynamic.sandbox",
+  "padv.oracle",
+  "padv.gates",
+  "padv.store",
+  "padv.eval",
+  "padv.logging",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]

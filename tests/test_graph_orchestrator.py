@@ -193,7 +193,7 @@ def test_analyze_with_graph_applies_configured_skeptic_rounds(
 
     calls = {"count": 0}
 
-    def _fake_skeptic(candidates, _config, frontier_state=None, repo_root=None, session=None):
+    def _fake_skeptic(candidates, _config, frontier_state=None, repo_root=None, session=None, failure_analysis=None):
         calls["count"] += 1
         return candidates, {"engine": "deepagents", "failed_paths": [f"/p/{calls['count']}"]}
 

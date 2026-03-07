@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Callable, TypedDict
 from urllib.parse import urlsplit, urlunsplit
 
+from padv.analytics.failure_patterns import analyze_failures
 from padv.agents.deepagents_harness import (
     ensure_agent_session,
     make_validation_plan_with_deepagents,
@@ -23,7 +24,7 @@ from padv.discovery import (
     fuse_candidates,
 )
 from padv.dynamic.sandbox import adapter as sandbox_adapter
-from padv.models import Candidate, RunSummary, StaticEvidence
+from padv.models import Candidate, FailureAnalysis, RunSummary, StaticEvidence
 from padv.orchestrator.runtime import new_run_id, validate_candidates_runtime
 from padv.static.joern.adapter import discover_candidates
 from padv.store.evidence_store import EvidenceStore
@@ -55,6 +56,7 @@ class GraphState(TypedDict, total=False):
     loop_continue: bool
     agent_session: Any
     auth_state: dict[str, Any]
+    failure_analysis: FailureAnalysis | None
     progress_callback: Callable[[dict[str, Any]], None]
     stage_seq: int
 
@@ -106,6 +108,9 @@ def _assert_stage_invariants(state: GraphState, stage: str) -> None:
         _expect_list("artifact_refs")
         _expect_dict("decisions")
         _expect_dict("auth_state")
+        analysis = state.get("failure_analysis")
+        if analysis is not None and not isinstance(analysis, FailureAnalysis):
+            raise _invariant_error(stage, "failure_analysis must be FailureAnalysis or None")
         return
 
     if stage == "static_discovery":
@@ -371,6 +376,17 @@ def _persist_auth_artifact(state: GraphState, auth_state: dict[str, Any]) -> Non
     state.setdefault("artifact_refs", []).append(str(Path(artifact_path)))
 
 
+def _persist_failure_analysis_artifact(state: GraphState, analysis: FailureAnalysis) -> None:
+    store = state["store"]
+    store.ensure()
+    artifact_dir = store.root / "artifacts"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    run_id = str(state.get("run_id", "run-unknown"))
+    artifact_path = artifact_dir / f"failure-analysis-{run_id}.json"
+    artifact_path.write_text(json.dumps(analysis.to_dict(), indent=2, ensure_ascii=True))
+    state.setdefault("artifact_refs", []).append(str(Path(artifact_path)))
+
+
 def _resolve_auth_preconditions(candidates: list[Candidate], auth_known: bool) -> None:
     if not auth_known:
         return
@@ -396,12 +412,17 @@ def _node_init(state: GraphState) -> GraphState:
     state["loop_continue"] = False
     state["decisions"] = {"VALIDATED": 0, "DROPPED": 0, "NEEDS_HUMAN_SETUP": 0}
     state["auth_state"] = {}
+    state["failure_analysis"] = None
     state["candidates"] = list(state.get("candidates", []))
     state["static_evidence"] = list(state.get("static_evidence", []))
     state["selected_candidates"] = list(state.get("selected_candidates", []))
     state["selected_static"] = list(state.get("selected_static", []))
 
     if state.get("skip_discovery"):
+        analysis = analyze_failures(state["store"])
+        state["failure_analysis"] = analysis
+        _persist_failure_analysis_artifact(state, analysis)
+        state["discovery_trace"]["failure_patterns"] = len(analysis.patterns)
         state["frontier_state"] = _default_frontier_state()
         state["agent_session"] = ensure_agent_session(
             state["config"],
@@ -421,6 +442,10 @@ def _node_init(state: GraphState) -> GraphState:
     persisted.setdefault("iteration", 0)
     persisted.setdefault("stagnation_rounds", 0)
     state["frontier_state"] = persisted
+    analysis = analyze_failures(state["store"])
+    state["failure_analysis"] = analysis
+    _persist_failure_analysis_artifact(state, analysis)
+    state["discovery_trace"]["failure_patterns"] = len(analysis.patterns)
     state["agent_session"] = ensure_agent_session(
         state["config"],
         frontier_state=state["frontier_state"],
@@ -568,6 +593,7 @@ def _node_skeptic_refine(state: GraphState) -> GraphState:
             frontier_state=state.get("frontier_state", {}),
             repo_root=state.get("repo_root"),
             session=state.get("agent_session"),
+            failure_analysis=state.get("failure_analysis"),
         )
         if isinstance(skeptic_trace, dict):
             skeptic_round_traces.append(skeptic_trace)

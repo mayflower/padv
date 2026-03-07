@@ -1,0 +1,14 @@
+diff --git a/src/SymbolNamer.php b/src/SymbolNamer.php
+index 08428cd..3936143 100644
+--- a/src/SymbolNamer.php
++++ b/src/SymbolNamer.php
+@@ -236,7 +236,8 @@ final readonly class SymbolNamer
+             return $this->desc("{$ns}{$class}", "#\${$n->name}.");
+         }
+ 
+-        throw new LogicException('Unexpected node type: ' . $n::class . '.');
++        // Ignore unsupported/new AST node types instead of hard-failing indexing.
++        return null;
+     }
+ 
+     private function namespaceName(Node $n): string
