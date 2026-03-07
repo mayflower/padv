@@ -111,6 +111,32 @@ def test_schedule_actions_orders_by_expected_info_gain(monkeypatch: pytest.Monke
     assert trace["engine"] == "deepagents"
 
 
+def test_schedule_actions_captures_structured_triage_fields(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
+    monkeypatch.setattr(
+        "padv.agents.deepagents_harness._invoke_deepagent_json",
+        lambda *args, **kwargs: {
+            "actions": [
+                {"candidate_id": "cand-2", "action": "validate", "expected_info_gain": 0.7, "rationale": "best next"},
+            ],
+            "skip_reasons": [
+                {
+                    "candidate_id": "cand-1",
+                    "reproducibility_gap": "missing deterministic endpoint",
+                    "legitimacy_gap": "weak sink alignment",
+                    "impact_gap": "unclear impact",
+                    "missing_witness": "no class witness path",
+                }
+            ],
+        },
+    )
+
+    _selected, _scores, trace = schedule_actions_with_deepagents([_candidate(), _candidate2()], config, max_candidates=1)
+    triage = trace["triage_by_candidate"]["cand-1"]
+    assert triage["reproducibility_gap"] == "missing deterministic endpoint"
+    assert triage["missing_witness"] == "no class witness path"
+
+
 def test_schedule_actions_prioritizes_when_actions_are_unusable(monkeypatch: pytest.MonkeyPatch) -> None:
     config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
     monkeypatch.setattr(
@@ -199,6 +225,32 @@ def test_skeptic_refine_penalizes_proposed_drops_instead_of_removing(monkeypatch
     assert by_id["cand-2"].confidence < 0.6
     assert trace["dropped"] == []
     assert sorted(trace["proposed_drops"]) == ["cand-1", "cand-2"]
+
+
+def test_skeptic_refine_captures_structured_triage(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
+    monkeypatch.setattr(
+        "padv.agents.deepagents_harness._invoke_deepagent_json",
+        lambda *args, **kwargs: {
+            "drop_ids": [],
+            "confidence_overrides": {"cand-1": 0.2},
+            "triage_by_candidate": {
+                "cand-1": {
+                    "reproducibility_gap": "non-deterministic path",
+                    "legitimacy_gap": "insufficient corroboration",
+                    "impact_gap": "impact unclear",
+                    "missing_witness": "no witness",
+                }
+            },
+            "notes": [],
+            "failed_paths": [],
+        },
+    )
+
+    _refined, trace = skeptic_refine_with_deepagents([_candidate(), _candidate2()], config)
+    triage = trace["triage_by_candidate"]["cand-1"]
+    assert triage["legitimacy_gap"] == "insufficient corroboration"
+    assert triage["missing_witness"] == "no witness"
 
 
 def test_rank_candidates_uses_provided_session_thread() -> None:

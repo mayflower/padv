@@ -16,6 +16,12 @@ from padv.models import Candidate, FailureAnalysis, ValidationPlan
 
 _JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
 _SEMANTIC_SIGNALS = frozenset({"joern", "scip"})
+_TRIAGE_FIELDS = (
+    "reproducibility_gap",
+    "legitimacy_gap",
+    "impact_gap",
+    "missing_witness",
+)
 
 
 class AgentExecutionError(RuntimeError):
@@ -92,6 +98,37 @@ def _extract_json(text: str) -> dict[str, Any] | None:
     except json.JSONDecodeError:
         return None
     return data if isinstance(data, dict) else None
+
+
+def _normalize_triage_entry(raw: Any) -> dict[str, str]:
+    if not isinstance(raw, dict):
+        return {field: "" for field in _TRIAGE_FIELDS}
+    normalized: dict[str, str] = {}
+    for field in _TRIAGE_FIELDS:
+        value = raw.get(field, "")
+        text = str(value).strip() if value is not None else ""
+        normalized[field] = text
+    return normalized
+
+
+def _normalize_triage_by_candidate(raw: Any, candidate_ids: set[str]) -> dict[str, dict[str, str]]:
+    out: dict[str, dict[str, str]] = {}
+    if isinstance(raw, dict):
+        for candidate_id, entry in raw.items():
+            cid = str(candidate_id).strip()
+            if not cid or cid not in candidate_ids:
+                continue
+            out[cid] = _normalize_triage_entry(entry)
+        return out
+    if isinstance(raw, list):
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            cid = str(entry.get("candidate_id", "")).strip()
+            if not cid or cid not in candidate_ids:
+                continue
+            out[cid] = _normalize_triage_entry(entry)
+    return out
 
 
 def _build_filesystem_tools(repo_root: str) -> list[Any]:
@@ -369,7 +406,9 @@ def skeptic_refine_with_deepagents(
     prompt = (
         "Act as a skeptic agent. Aggressively falsify weak exploit hypotheses. "
         "Drop candidates lacking corroboration, unreachable contexts, implausible exploitation paths, or historically fragile profiles. "
-        'Return JSON: {"drop_ids":[...], "confidence_overrides":{"id":0.0}, "notes":[...], "failed_paths":[...]}. '
+        'Return JSON: {"drop_ids":[...], "confidence_overrides":{"id":0.0}, '
+        '"triage_by_candidate":{"id":{"reproducibility_gap":"...","legitimacy_gap":"...",'
+        '"impact_gap":"...","missing_witness":"..."}}, "notes":[...], "failed_paths":[...]}. '
         f"Failure analysis summary: {json.dumps(analysis_summary, ensure_ascii=True)}. "
         f"Frontier state: {json.dumps(frontier_state, ensure_ascii=True)}. "
         f"Candidates: {json.dumps(payload, ensure_ascii=True)}"
@@ -383,6 +422,10 @@ def skeptic_refine_with_deepagents(
     )
 
     drop_ids = {str(x) for x in response.get("drop_ids", []) if str(x).strip()}
+    triage_by_candidate = _normalize_triage_by_candidate(
+        response.get("triage_by_candidate"),
+        {cand.candidate_id for cand in candidates},
+    )
     overrides = response.get("confidence_overrides", {})
     if not isinstance(overrides, dict):
         raise AgentExecutionError("deepagents skeptic response has invalid confidence_overrides")
@@ -407,6 +450,7 @@ def skeptic_refine_with_deepagents(
         "penalized": sorted(penalized),
         "notes": response.get("notes", []),
         "failed_paths": response.get("failed_paths", []),
+        "triage_by_candidate": triage_by_candidate,
     }
     return refined, trace
 
@@ -440,7 +484,8 @@ def schedule_actions_with_deepagents(
         "Choose the next validation actions to maximize expected information gain. "
         "You must prioritize novelty against coverage deltas and avoid repeating failed paths. "
         'Return JSON: {"actions":[{"candidate_id":"...","action":"validate","expected_info_gain":0.0,"rationale":"..."}],'
-        '"notes":[...]} '
+        '"skip_reasons":[{"candidate_id":"...","reproducibility_gap":"...","legitimacy_gap":"...",'
+        '"impact_gap":"...","missing_witness":"..."}],"notes":[...]} '
         f"Max candidates to schedule: {max_candidates}. "
         f"Frontier state: {json.dumps(frontier_state, ensure_ascii=True)}. "
         f"Candidates: {json.dumps(payload, ensure_ascii=True)}"
@@ -605,6 +650,10 @@ def schedule_actions_with_deepagents(
 
     selected = [by_id[cid] for cid in selected_ids]
     limited_ids = {c.candidate_id for c in selected}
+    triage_by_candidate = _normalize_triage_by_candidate(
+        response.get("skip_reasons"),
+        set(by_id.keys()),
+    )
     trace = {
         "engine": "deepagents",
         "selected": [c.candidate_id for c in selected],
@@ -612,6 +661,7 @@ def schedule_actions_with_deepagents(
         "agent_scores": {cid: round(selected_scores[cid], 4) for cid in limited_ids if cid in selected_scores},
         "actions": [a for a in actions if a["candidate_id"] in limited_ids],
         "notes": response.get("notes", []),
+        "triage_by_candidate": triage_by_candidate,
         "selection_strategy": "class_quota_priority",
         "agent_action_count": len(actions),
         "reason": "agent-priority" if selected_scores else "deterministic-priority",

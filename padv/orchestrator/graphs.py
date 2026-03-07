@@ -52,8 +52,11 @@ class GraphState(TypedDict, total=False):
     iteration_bundles: list[Any]
     decisions: dict[str, int]
     skip_discovery: bool
+    had_semantic_candidates: bool
     frontier_state: dict[str, Any]
     objective_scores: dict[str, float]
+    schedule_all_candidates: list[Candidate]
+    resume_filtered_candidates: list[str]
     loop_continue: bool
     agent_session: Any
     auth_state: dict[str, Any]
@@ -68,6 +71,30 @@ def _safe_copy_candidate(candidate: Candidate) -> Candidate:
 
 def _now_iso() -> str:
     return datetime.now(tz=timezone.utc).isoformat()
+
+
+def _candidate_signature(candidate: Candidate) -> str:
+    return f"{candidate.vuln_class}|{candidate.file_path}|{candidate.line}|{candidate.sink}"
+
+
+def _attempts_are_clean(attempts: list[dict[str, Any]]) -> bool:
+    if not attempts:
+        return False
+    for item in attempts:
+        status = str(item.get("runtime_status", "")).strip().lower()
+        if status in {"request_failed", "missing_intercept", "inactive"}:
+            return False
+    return True
+
+
+def _extract_bundle_attempts(bundle: Any) -> list[dict[str, Any]]:
+    trace = getattr(bundle, "planner_trace", {})
+    if not isinstance(trace, dict):
+        return []
+    attempts = trace.get("attempts", [])
+    if not isinstance(attempts, list):
+        return []
+    return [x for x in attempts if isinstance(x, dict)]
 
 
 def _emit_progress(state: GraphState, step: str, status: str, detail: str | None = None) -> None:
@@ -162,6 +189,8 @@ def _assert_stage_invariants(state: GraphState, stage: str) -> None:
             raise _invariant_error(stage, "frontier_state.coverage must be a dict")
         if not isinstance(frontier.get("history"), list):
             raise _invariant_error(stage, "frontier_state.history must be a list")
+        if not isinstance(frontier.get("candidate_resume", {}), dict):
+            raise _invariant_error(stage, "frontier_state.candidate_resume must be a dict")
         return
 
     if stage == "validation_plan":
@@ -213,6 +242,7 @@ def _stage_snapshot_payload(state: GraphState, stage: str) -> dict[str, Any]:
             "iteration": frontier.get("iteration") if isinstance(frontier, dict) else None,
             "stagnation_rounds": frontier.get("stagnation_rounds") if isinstance(frontier, dict) else None,
             "attempt_history": len(frontier.get("attempt_history", [])) if isinstance(frontier, dict) else 0,
+            "candidate_resume": len(frontier.get("candidate_resume", {})) if isinstance(frontier, dict) else 0,
             "coverage_counts": {
                 "files": len(coverage.get("files", [])) if isinstance(coverage, dict) else 0,
                 "classes": len(coverage.get("classes", [])) if isinstance(coverage, dict) else 0,
@@ -270,6 +300,7 @@ def _default_frontier_state() -> dict[str, Any]:
         },
         "history": [],
         "attempt_history": [],
+        "candidate_resume": {},
         "runtime_coverage": {
             "flags": [],
             "classes": [],
@@ -462,6 +493,76 @@ def _persist_failure_analysis_artifact(state: GraphState, analysis: FailureAnaly
     state.setdefault("artifact_refs", []).append(str(Path(artifact_path)))
 
 
+def _persist_runtime_liveness_artifact(state: GraphState, payload: dict[str, Any]) -> None:
+    store = state["store"]
+    store.ensure()
+    artifact_dir = store.root / "artifacts"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    run_id = str(state.get("run_id", "run-unknown"))
+    artifact_path = artifact_dir / f"runtime-liveness-{run_id}-{new_run_id('diag')}.json"
+    artifact_path.write_text(
+        json.dumps({"generated_at": _now_iso(), **payload}, indent=2, ensure_ascii=True)
+    )
+    state.setdefault("artifact_refs", []).append(str(Path(artifact_path)))
+
+
+def _persist_candidate_run_mapping(state: GraphState, records: list[dict[str, Any]]) -> None:
+    if not records:
+        return
+    store = state["store"]
+    store.ensure()
+    run_id = str(state.get("run_id") or "unknown-run")
+    run_dir = store.runs_dir / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    path = run_dir / "candidate_run_map.jsonl"
+    with path.open("a", encoding="utf-8") as fh:
+        for record in records:
+            fh.write(json.dumps(record, ensure_ascii=True))
+            fh.write("\n")
+
+
+def _triage_reason_for_candidate(trace: dict[str, Any], candidate_id: str) -> str:
+    triage_by_candidate = trace.get("triage_by_candidate", {})
+    if not isinstance(triage_by_candidate, dict):
+        return ""
+    raw = triage_by_candidate.get(candidate_id)
+    if not isinstance(raw, dict):
+        return ""
+    parts: list[str] = []
+    for key in ("reproducibility_gap", "legitimacy_gap", "impact_gap", "missing_witness"):
+        value = str(raw.get(key, "")).strip()
+        if value:
+            parts.append(f"{key}={value}")
+    return "; ".join(parts)
+
+
+def _update_candidate_resume_state(frontier: dict[str, Any], bundles: list[Any], iteration: int) -> None:
+    resume = frontier.get("candidate_resume", {})
+    if not isinstance(resume, dict):
+        resume = {}
+
+    for bundle in bundles:
+        candidate = getattr(bundle, "candidate", None)
+        if not isinstance(candidate, Candidate):
+            continue
+        signature = _candidate_signature(candidate)
+        attempts = _extract_bundle_attempts(bundle)
+        gate_result = getattr(bundle, "gate_result", None)
+        decision = str(getattr(gate_result, "decision", "")).strip()
+        resume[signature] = {
+            "candidate_id": candidate.candidate_id,
+            "signature": signature,
+            "completed_clean": _attempts_are_clean(attempts),
+            "last_iteration": iteration,
+            "last_decision": decision,
+            "last_bundle_id": str(getattr(bundle, "bundle_id", "")),
+            "last_attempt_count": len(attempts),
+            "updated_at": _now_iso(),
+        }
+
+    frontier["candidate_resume"] = resume
+
+
 def _resolve_auth_preconditions(candidates: list[Candidate], auth_known: bool) -> None:
     if not auth_known:
         return
@@ -486,6 +587,9 @@ def _node_init(state: GraphState) -> GraphState:
     state["all_bundles"] = []
     state["iteration_bundles"] = []
     state["objective_scores"] = {}
+    state["schedule_all_candidates"] = []
+    state["resume_filtered_candidates"] = []
+    state["had_semantic_candidates"] = False
     state["loop_continue"] = False
     state["decisions"] = {"VALIDATED": 0, "DROPPED": 0, "NEEDS_HUMAN_SETUP": 0}
     state["auth_state"] = {}
@@ -501,6 +605,7 @@ def _node_init(state: GraphState) -> GraphState:
         _persist_failure_analysis_artifact(state, analysis)
         state["discovery_trace"]["failure_patterns"] = len(analysis.patterns)
         state["frontier_state"] = _default_frontier_state()
+        state["had_semantic_candidates"] = bool(state.get("selected_candidates"))
         state["agent_session"] = ensure_agent_session(
             state["config"],
             frontier_state=state["frontier_state"],
@@ -519,6 +624,7 @@ def _node_init(state: GraphState) -> GraphState:
     persisted.setdefault("iteration", 0)
     persisted.setdefault("stagnation_rounds", 0)
     persisted.setdefault("attempt_history", [])
+    persisted.setdefault("candidate_resume", {})
     persisted.setdefault("runtime_coverage", {"flags": [], "classes": []})
     state["frontier_state"] = persisted
     analysis = analyze_failures(state["store"])
@@ -543,6 +649,7 @@ def _node_static_discovery(state: GraphState) -> GraphState:
     # Static discoveries are deterministic for a fixed repo/config. Reuse after first pass.
     if state.get("candidates") and state.get("static_evidence"):
         state["discovery_trace"]["static_reused"] = True
+        state["had_semantic_candidates"] = True
         return _finalize_stage(state, "static_discovery", "reused prior static results")
 
     config = state["config"]
@@ -581,6 +688,7 @@ def _node_static_discovery(state: GraphState) -> GraphState:
     )
     state["candidates"] = semantic_candidates
     state["static_evidence"] = semantic_evidence
+    state["had_semantic_candidates"] = True
     state["discovery_trace"] = {
         "source_count": 0,
         "raw_scip_hits": scip_meta.raw_scip_hits,
@@ -758,21 +866,56 @@ def _node_skeptic_refine(state: GraphState) -> GraphState:
 
 def _node_objective_schedule(state: GraphState) -> GraphState:
     _emit_progress(state, "objective_schedule", "start")
-    candidates = state.get("candidates", [])
+    candidates = list(state.get("candidates", []))
+    state["schedule_all_candidates"] = list(candidates)
+    state["resume_filtered_candidates"] = []
     if not candidates:
         state["selected_candidates"] = []
         state["selected_static"] = []
         state["objective_scores"] = {}
         return _finalize_stage(state, "objective_schedule", "no candidates")
 
+    scheduler_input = list(candidates)
+    frontier_state = state.get("frontier_state", {})
+    if state.get("run_validation"):
+        resume_map = frontier_state.get("candidate_resume", {}) if isinstance(frontier_state, dict) else {}
+        if isinstance(resume_map, dict):
+            filtered: list[Candidate] = []
+            filtered_ids: list[str] = []
+            for candidate in candidates:
+                entry = resume_map.get(_candidate_signature(candidate))
+                if isinstance(entry, dict) and bool(entry.get("completed_clean")):
+                    filtered_ids.append(candidate.candidate_id)
+                    continue
+                filtered.append(candidate)
+            if filtered:
+                scheduler_input = filtered
+            elif state.get("had_semantic_candidates"):
+                # Deterministic fallback: never starve runtime selection when semantic candidates exist.
+                scheduler_input = [candidates[0]]
+            else:
+                scheduler_input = []
+            state["resume_filtered_candidates"] = sorted(set(filtered_ids))
+
     selected, scores, scheduler_trace = schedule_actions_with_deepagents(
-        candidates,
+        scheduler_input,
         state["config"],
         max_candidates=state["config"].budgets.max_candidates,
-        frontier_state=state.get("frontier_state", {}),
+        frontier_state=frontier_state,
         repo_root=state.get("repo_root"),
         session=state.get("agent_session"),
     )
+    if not selected and scheduler_input and state.get("run_validation") and state.get("had_semantic_candidates"):
+        fallback = scheduler_input[0]
+        selected = [fallback]
+        scores = {fallback.candidate_id: max(0.0, float(fallback.confidence))}
+        scheduler_trace = dict(scheduler_trace) if isinstance(scheduler_trace, dict) else {"engine": "deepagents"}
+        scheduler_trace["reason"] = "deterministic-fallback-selection"
+        scheduler_trace["fallback_selected"] = [fallback.candidate_id]
+    scheduler_trace = dict(scheduler_trace) if isinstance(scheduler_trace, dict) else {"engine": "deepagents"}
+    scheduler_trace["schedule_pool_size"] = len(scheduler_input)
+    scheduler_trace["resume_filtered_candidates"] = list(state.get("resume_filtered_candidates", []))
+
     selected_ids = {c.candidate_id for c in selected}
     selected_static = [
         item for item in state.get("static_evidence", []) if item.candidate_id in selected_ids
@@ -869,6 +1012,7 @@ def _node_frontier_update(state: GraphState) -> GraphState:
     }
     frontier.setdefault("attempt_history", [])
     frontier["attempt_history"].extend(runtime_attempts)
+    _update_candidate_resume_state(frontier, state.get("iteration_bundles", []), iteration)
 
     frontier["history"] = list(frontier.get("history", []))[-200:]
     frontier["history"].append(
@@ -936,7 +1080,22 @@ def _node_runtime_validate(state: GraphState) -> GraphState:
     _emit_progress(state, "runtime_validate", "start")
     if not state.get("run_validation"):
         return _finalize_stage(state, "runtime_validate", "skipped (analysis-only)")
-    candidates = state.get("selected_candidates") or state.get("candidates", [])
+    candidates = list(state.get("selected_candidates") or state.get("candidates", []))
+    schedule_all = list(state.get("schedule_all_candidates") or candidates)
+    resume_filtered = {str(x) for x in state.get("resume_filtered_candidates", []) if str(x).strip()}
+    iteration = int((state.get("frontier_state") or {}).get("iteration", 0)) + 1
+    if state.get("had_semantic_candidates") and not candidates:
+        payload = {
+            "run_id": state.get("run_id"),
+            "iteration": iteration,
+            "reason": "no-selected-candidates",
+            "had_semantic_candidates": True,
+            "schedule_all_candidate_ids": [c.candidate_id for c in schedule_all],
+            "resume_filtered_candidates": sorted(resume_filtered),
+            "scheduler_trace": state.get("planner_trace", {}).get("scheduler", {}),
+        }
+        _persist_runtime_liveness_artifact(state, payload)
+        raise RuntimeError("runtime validation invariant failed: semantic candidates present but none selected")
     static_evidence = state.get("selected_static") or state.get("static_evidence", [])
     bundles, decisions = validate_candidates_runtime(
         config=state["config"],
@@ -950,6 +1109,69 @@ def _node_runtime_validate(state: GraphState) -> GraphState:
         artifact_refs=state.get("artifact_refs", []),
         auth_state=state.get("auth_state"),
     )
+    if candidates and not bundles:
+        payload = {
+            "run_id": state.get("run_id"),
+            "iteration": iteration,
+            "reason": "zero-bundles-for-selected-candidates",
+            "selected_candidate_ids": [c.candidate_id for c in candidates],
+            "schedule_all_candidate_ids": [c.candidate_id for c in schedule_all],
+            "resume_filtered_candidates": sorted(resume_filtered),
+            "plans_present": sorted((state.get("plans_by_candidate") or {}).keys()),
+            "scheduler_trace": state.get("planner_trace", {}).get("scheduler", {}),
+            "discovery_trace": state.get("discovery_trace", {}),
+        }
+        _persist_runtime_liveness_artifact(state, payload)
+        raise RuntimeError("runtime validation invariant failed: selected candidates produced zero bundles")
+
+    selected_ids = {c.candidate_id for c in candidates}
+    plans_by_candidate = state.get("plans_by_candidate", {})
+    scheduler_trace = state.get("planner_trace", {}).get("scheduler", {})
+    bundles_by_candidate = {
+        str(getattr(getattr(bundle, "candidate", None), "candidate_id", "")): bundle
+        for bundle in bundles
+    }
+    mapping_records: list[dict[str, Any]] = []
+    for candidate in schedule_all:
+        candidate_id = candidate.candidate_id
+        bundle = bundles_by_candidate.get(candidate_id)
+        attempts = _extract_bundle_attempts(bundle) if bundle is not None else []
+        decision = ""
+        bundle_id = ""
+        reason_if_skipped = ""
+        if bundle is not None:
+            gate_result = getattr(bundle, "gate_result", None)
+            decision = str(getattr(gate_result, "decision", "")).strip()
+            bundle_id = str(getattr(bundle, "bundle_id", "")).strip()
+        else:
+            if candidate_id in resume_filtered and candidate_id not in selected_ids:
+                reason_if_skipped = "resume-clean-completed"
+            elif candidate_id in selected_ids:
+                reason_if_skipped = "selected-not-executed"
+            else:
+                reason_if_skipped = "scheduler-not-selected"
+            triage_reason = _triage_reason_for_candidate(
+                scheduler_trace if isinstance(scheduler_trace, dict) else {},
+                candidate_id,
+            )
+            if triage_reason:
+                reason_if_skipped = f"{reason_if_skipped}; {triage_reason}"
+
+        mapping_records.append(
+            {
+                "ts": _now_iso(),
+                "iteration": iteration,
+                "candidate_id": candidate_id,
+                "candidate_signature": _candidate_signature(candidate),
+                "plan_present": bool(candidate_id in plans_by_candidate),
+                "attempt_count": len(attempts),
+                "bundle_id": bundle_id,
+                "decision": decision,
+                "reason_if_skipped": reason_if_skipped,
+            }
+        )
+    _persist_candidate_run_mapping(state, mapping_records)
+
     state["iteration_bundles"] = list(bundles)
     all_bundles = list(state.get("all_bundles", []))
     all_bundles.extend(bundles)

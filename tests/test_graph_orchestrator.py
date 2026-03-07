@@ -40,6 +40,21 @@ def _mk_evidence(candidate_id: str, query_id: str) -> StaticEvidence:
     )
 
 
+def _mk_candidate_custom(candidate_id: str, provenance: list[str], *, line: int, file_path: str = "src/a.php") -> Candidate:
+    return Candidate(
+        candidate_id=candidate_id,
+        vuln_class="sql_injection_boundary",
+        title="A03 SQL boundary influence",
+        file_path=file_path,
+        line=line,
+        sink="mysqli_query",
+        expected_intercepts=["mysqli_query"],
+        notes="test",
+        provenance=provenance,
+        confidence=0.5,
+    )
+
+
 def _force_node_runner(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(graph_mod, "_run_langgraph", lambda state, include_validation: graph_mod._run_nodes(state, include_validation))
 
@@ -680,3 +695,316 @@ def test_run_with_graph_persists_attempt_history_across_iterations(
     assert frontier["iteration"] == 2
     assert len(frontier.get("attempt_history", [])) == 2
     assert set(frontier.get("runtime_coverage", {}).get("flags", [])) == {"flag-1", "flag-2"}
+
+
+def test_run_with_graph_fails_when_selected_candidates_produce_zero_bundles(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
+    config.agent.max_iterations = 1
+    config.agent.improvement_patience = 0
+    store = EvidenceStore(tmp_path / ".padv")
+    _force_node_runner(monkeypatch)
+    monkeypatch.setattr("padv.orchestrator.graphs.ensure_agent_session", lambda *args, **kwargs: object())
+
+    candidate = _mk_candidate("cand-00001", ["joern"])
+    static = _mk_evidence("cand-00001", "joern::sql")
+    monkeypatch.setattr(
+        "padv.orchestrator.graphs.discover_candidates_with_meta",
+        lambda *_args, **_kwargs: ([candidate], [static], _mk_joern_meta(findings=1, app_findings=1, candidate_count=1)),
+    )
+    monkeypatch.setattr(
+        "padv.orchestrator.graphs.discover_scip_candidates_safe_with_meta",
+        lambda *_args, **_kwargs: ([], [], [], _mk_scip_meta(), None),
+    )
+    monkeypatch.setattr("padv.orchestrator.graphs.discover_web_hints", lambda *_args, **_kwargs: ({}, None))
+    monkeypatch.setattr(
+        "padv.orchestrator.graphs.rank_candidates_with_deepagents",
+        lambda candidates, *_args, **_kwargs: (candidates, {"engine": "deepagents", "ordered_ids": [c.candidate_id for c in candidates]}),
+    )
+    monkeypatch.setattr(
+        "padv.orchestrator.graphs.skeptic_refine_with_deepagents",
+        lambda candidates, *_args, **_kwargs: (candidates, {"engine": "deepagents", "failed_paths": []}),
+    )
+    monkeypatch.setattr(
+        "padv.orchestrator.graphs.schedule_actions_with_deepagents",
+        lambda candidates, *_args, **_kwargs: (
+            candidates,
+            {c.candidate_id: 1.0 for c in candidates},
+            {"engine": "deepagents", "selected": [c.candidate_id for c in candidates]},
+        ),
+    )
+    monkeypatch.setattr(
+        "padv.orchestrator.graphs.make_validation_plans_with_deepagents",
+        lambda candidates, config, repo_root=None, session=None: (
+            {
+                c.candidate_id: ValidationPlan(
+                    candidate_id=c.candidate_id,
+                    intercepts=["mysqli_query"],
+                    positive_requests=[{"method": "GET", "path": "/", "query": {config.canary.parameter_name: "a"}}] * 3,
+                    negative_requests=[{"method": "GET", "path": "/", "query": {config.canary.parameter_name: "b"}}],
+                    canary="a",
+                )
+                for c in candidates
+            },
+            {"engine": "deepagents"},
+        ),
+    )
+    monkeypatch.setattr(
+        "padv.orchestrator.graphs.validate_candidates_runtime",
+        lambda *args, **kwargs: ([], {"VALIDATED": 0, "DROPPED": 0, "NEEDS_HUMAN_SETUP": 0}),
+    )
+
+    with pytest.raises(RuntimeError, match="selected candidates produced zero bundles"):
+        run_with_graph(config, str(tmp_path), store, "variant")
+
+    liveness_artifacts = sorted((store.root / "artifacts").glob("runtime-liveness-*.json"))
+    assert liveness_artifacts
+    payload = json.loads(liveness_artifacts[-1].read_text(encoding="utf-8"))
+    assert payload["reason"] == "zero-bundles-for-selected-candidates"
+
+
+def test_run_with_graph_writes_candidate_run_mapping_and_resume_filter(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
+    config.agent.max_iterations = 1
+    config.agent.improvement_patience = 0
+    config.budgets.max_candidates = 2
+    store = EvidenceStore(tmp_path / ".padv")
+    _force_node_runner(monkeypatch)
+    monkeypatch.setattr("padv.orchestrator.graphs.ensure_agent_session", lambda *args, **kwargs: object())
+
+    candidate_resume = _mk_candidate_custom("cand-00001", ["joern"], line=12)
+    candidate_active = _mk_candidate_custom("cand-00002", ["joern"], line=34)
+    static_resume = _mk_evidence("cand-00001", "joern::sql::1")
+    static_active = _mk_evidence("cand-00002", "joern::sql::2")
+    signature_resume = (
+        f"{candidate_resume.vuln_class}|{candidate_resume.file_path}|"
+        f"{candidate_resume.line}|{candidate_resume.sink}"
+    )
+    store.save_frontier_state(
+        {
+            "version": 1,
+            "updated_at": "2026-03-07T00:00:00+00:00",
+            "iteration": 0,
+            "stagnation_rounds": 0,
+            "hypotheses": [],
+            "failed_paths": [],
+            "coverage": {"files": [], "classes": [], "signals": [], "sinks": [], "web_paths": []},
+            "history": [],
+            "attempt_history": [],
+            "candidate_resume": {
+                signature_resume: {
+                    "candidate_id": "old-candidate-id",
+                    "signature": signature_resume,
+                    "completed_clean": True,
+                    "last_iteration": 1,
+                }
+            },
+            "runtime_coverage": {"flags": [], "classes": []},
+        }
+    )
+
+    monkeypatch.setattr(
+        "padv.orchestrator.graphs.discover_candidates_with_meta",
+        lambda *_args, **_kwargs: (
+            [candidate_resume, candidate_active],
+            [static_resume, static_active],
+            _mk_joern_meta(findings=2, app_findings=2, candidate_count=2),
+        ),
+    )
+    monkeypatch.setattr(
+        "padv.orchestrator.graphs.discover_scip_candidates_safe_with_meta",
+        lambda *_args, **_kwargs: ([], [], [], _mk_scip_meta(), None),
+    )
+    monkeypatch.setattr("padv.orchestrator.graphs.discover_web_hints", lambda *_args, **_kwargs: ({}, None))
+    monkeypatch.setattr(
+        "padv.orchestrator.graphs.rank_candidates_with_deepagents",
+        lambda candidates, *_args, **_kwargs: (
+            candidates,
+            {"engine": "deepagents", "ordered_ids": [c.candidate_id for c in candidates]},
+        ),
+    )
+    monkeypatch.setattr(
+        "padv.orchestrator.graphs.skeptic_refine_with_deepagents",
+        lambda candidates, *_args, **_kwargs: (
+            candidates,
+            {"engine": "deepagents", "failed_paths": []},
+        ),
+    )
+
+    def _fake_schedule(candidates, *_args, **_kwargs):
+        # resume-clean candidate must not be scheduled again
+        assert [c.candidate_id for c in candidates] == ["cand-00002"]
+        return (
+            candidates,
+            {"cand-00002": 1.0},
+            {"engine": "deepagents", "selected": ["cand-00002"]},
+        )
+
+    monkeypatch.setattr("padv.orchestrator.graphs.schedule_actions_with_deepagents", _fake_schedule)
+    monkeypatch.setattr(
+        "padv.orchestrator.graphs.make_validation_plans_with_deepagents",
+        lambda candidates, config, repo_root=None, session=None: (
+            {
+                c.candidate_id: ValidationPlan(
+                    candidate_id=c.candidate_id,
+                    intercepts=["mysqli_query"],
+                    positive_requests=[{"method": "GET", "path": "/", "query": {config.canary.parameter_name: "a"}}] * 3,
+                    negative_requests=[{"method": "GET", "path": "/", "query": {config.canary.parameter_name: "b"}}],
+                    canary="a",
+                )
+                for c in candidates
+            },
+            {"engine": "deepagents"},
+        ),
+    )
+
+    def _fake_validate(*args, **kwargs):
+        bundle = EvidenceBundle(
+            bundle_id="bundle-active",
+            created_at="2026-03-07T00:00:00+00:00",
+            candidate=candidate_active,
+            static_evidence=[static_active],
+            positive_runtime=[RuntimeEvidence("r1", "ok", 1, False, False, False, None, [], {})],
+            negative_runtime=[RuntimeEvidence("r2", "ok", 0, False, False, False, None, [], {})],
+            repro_run_ids=["r1"],
+            gate_result=GateResult("DROPPED", ["V0"], "V3", "missing"),
+            limitations=["missing"],
+            planner_trace={
+                "attempts": [
+                    {
+                        "phase": "positive",
+                        "index": 0,
+                        "request_id": "r1",
+                        "request": {"method": "GET", "path": "/"},
+                        "runtime_status": "ok",
+                        "http_status": 200,
+                        "call_count": 1,
+                        "analysis_flags": ["flag-a"],
+                        "new_flags": ["flag-a"],
+                        "elapsed_ms": 1,
+                        "auth_context": "anonymous",
+                    }
+                ]
+            },
+        )
+        return [bundle], {"VALIDATED": 0, "DROPPED": 1, "NEEDS_HUMAN_SETUP": 0}
+
+    monkeypatch.setattr("padv.orchestrator.graphs.validate_candidates_runtime", _fake_validate)
+
+    summary = run_with_graph(config, str(tmp_path), store, "variant")
+    mapping_path = store.runs_dir / summary.run_id / "candidate_run_map.jsonl"
+    assert mapping_path.exists()
+    records = [
+        json.loads(line)
+        for line in mapping_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    by_candidate = {record["candidate_id"]: record for record in records}
+    assert set(by_candidate.keys()) == {"cand-00001", "cand-00002"}
+    assert by_candidate["cand-00001"]["reason_if_skipped"].startswith("resume-clean-completed")
+    assert by_candidate["cand-00002"]["bundle_id"] == "bundle-active"
+    assert by_candidate["cand-00002"]["attempt_count"] == 1
+
+
+def test_resume_filter_keeps_candidate_when_last_run_not_clean(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
+    config.agent.max_iterations = 1
+    config.agent.improvement_patience = 0
+    store = EvidenceStore(tmp_path / ".padv")
+    _force_node_runner(monkeypatch)
+    monkeypatch.setattr("padv.orchestrator.graphs.ensure_agent_session", lambda *args, **kwargs: object())
+
+    candidate = _mk_candidate("cand-00001", ["joern"])
+    static = _mk_evidence("cand-00001", "joern::sql")
+    signature = f"{candidate.vuln_class}|{candidate.file_path}|{candidate.line}|{candidate.sink}"
+    store.save_frontier_state(
+        {
+            "version": 1,
+            "updated_at": "2026-03-07T00:00:00+00:00",
+            "iteration": 0,
+            "stagnation_rounds": 0,
+            "hypotheses": [],
+            "failed_paths": [],
+            "coverage": {"files": [], "classes": [], "signals": [], "sinks": [], "web_paths": []},
+            "history": [],
+            "attempt_history": [],
+            "candidate_resume": {
+                signature: {
+                    "candidate_id": candidate.candidate_id,
+                    "signature": signature,
+                    "completed_clean": False,
+                    "last_iteration": 1,
+                }
+            },
+            "runtime_coverage": {"flags": [], "classes": []},
+        }
+    )
+
+    monkeypatch.setattr(
+        "padv.orchestrator.graphs.discover_candidates_with_meta",
+        lambda *_args, **_kwargs: ([candidate], [static], _mk_joern_meta(findings=1, app_findings=1, candidate_count=1)),
+    )
+    monkeypatch.setattr(
+        "padv.orchestrator.graphs.discover_scip_candidates_safe_with_meta",
+        lambda *_args, **_kwargs: ([], [], [], _mk_scip_meta(), None),
+    )
+    monkeypatch.setattr("padv.orchestrator.graphs.discover_web_hints", lambda *_args, **_kwargs: ({}, None))
+    monkeypatch.setattr(
+        "padv.orchestrator.graphs.rank_candidates_with_deepagents",
+        lambda candidates, *_args, **_kwargs: (candidates, {"engine": "deepagents", "ordered_ids": [c.candidate_id for c in candidates]}),
+    )
+    monkeypatch.setattr(
+        "padv.orchestrator.graphs.skeptic_refine_with_deepagents",
+        lambda candidates, *_args, **_kwargs: (candidates, {"engine": "deepagents", "failed_paths": []}),
+    )
+
+    seen_schedule: dict[str, list[str]] = {}
+
+    def _fake_schedule(candidates, *_args, **_kwargs):
+        seen_schedule["ids"] = [c.candidate_id for c in candidates]
+        return candidates, {c.candidate_id: 1.0 for c in candidates}, {"engine": "deepagents", "selected": [c.candidate_id for c in candidates]}
+
+    monkeypatch.setattr("padv.orchestrator.graphs.schedule_actions_with_deepagents", _fake_schedule)
+    monkeypatch.setattr(
+        "padv.orchestrator.graphs.make_validation_plans_with_deepagents",
+        lambda candidates, config, repo_root=None, session=None: (
+            {
+                c.candidate_id: ValidationPlan(
+                    candidate_id=c.candidate_id,
+                    intercepts=["mysqli_query"],
+                    positive_requests=[{"method": "GET", "path": "/", "query": {config.canary.parameter_name: "a"}}] * 3,
+                    negative_requests=[{"method": "GET", "path": "/", "query": {config.canary.parameter_name: "b"}}],
+                    canary="a",
+                )
+                for c in candidates
+            },
+            {"engine": "deepagents"},
+        ),
+    )
+    monkeypatch.setattr(
+        "padv.orchestrator.graphs.validate_candidates_runtime",
+        lambda *args, **kwargs: (
+            [
+                EvidenceBundle(
+                    bundle_id="bundle-1",
+                    created_at="2026-03-07T00:00:00+00:00",
+                    candidate=candidate,
+                    static_evidence=[static],
+                    positive_runtime=[RuntimeEvidence("r1", "ok", 1, False, False, False, None, [], {})],
+                    negative_runtime=[RuntimeEvidence("r2", "ok", 0, False, False, False, None, [], {})],
+                    repro_run_ids=["r1"],
+                    gate_result=GateResult("DROPPED", ["V0"], "V3", "missing"),
+                    limitations=["missing"],
+                )
+            ],
+            {"VALIDATED": 0, "DROPPED": 1, "NEEDS_HUMAN_SETUP": 0},
+        ),
+    )
+
+    run_with_graph(config, str(tmp_path), store, "variant")
+    assert seen_schedule["ids"] == ["cand-00001"]
