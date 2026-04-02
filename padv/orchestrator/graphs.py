@@ -529,7 +529,7 @@ def _assert_persist_invariants(chk: _InvariantChecker, _stage: str) -> None:
 
 
 def _noop_invariants(_chk: _InvariantChecker, _stage: str) -> None:
-    pass
+    """No invariants to check for this stage (e.g. init, continue_or_stop)."""
 
 
 _STAGE_INVARIANT_DISPATCH: dict[str, Callable[[_InvariantChecker, str], None]] = {

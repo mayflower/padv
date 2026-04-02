@@ -636,28 +636,39 @@ async def _discover_with_playwright_async(
                 return "done"
             return "again"
 
-        builder = StateGraph(_WebState)
-        builder.add_node("navigate_extract", _node_navigate_extract)
-        builder.add_node("llm_plan", _node_llm_plan)
-        builder.add_edge(START, "navigate_extract")
-        builder.add_edge("navigate_extract", "llm_plan")
-        builder.add_conditional_edges("llm_plan", _route_continue, {"again": "navigate_extract", "done": END})
-
-        graph = builder.compile()
-        result = await graph.ainvoke(
-            {
-                "queue": initial_queue, "seen": initial_seen, "visited": [],
-                "found": {}, "pages": [], "requests": [], "errors": [], "steps": 0,
-            }
+        result = await _run_crawl_graph(
+            _node_navigate_extract, _node_llm_plan, _route_continue,
+            initial_queue, initial_seen,
         )
 
         await context.close()
         await browser.close()
 
+    return _finalize_discovery(result, initial_queue)
+
+
+async def _run_crawl_graph(
+    navigate_node: Any, llm_node: Any, route_fn: Any,
+    initial_queue: list[str], initial_seen: list[str],
+) -> dict[str, Any]:
+    from langgraph.graph import END, START, StateGraph  # type: ignore[import-not-found]
+    builder = StateGraph(_WebState)
+    builder.add_node("navigate_extract", navigate_node)
+    builder.add_node("llm_plan", llm_node)
+    builder.add_edge(START, "navigate_extract")
+    builder.add_edge("navigate_extract", "llm_plan")
+    builder.add_conditional_edges("llm_plan", route_fn, {"again": "navigate_extract", "done": END})
+    graph = builder.compile()
+    return await graph.ainvoke({
+        "queue": initial_queue, "seen": initial_seen, "visited": [],
+        "found": {}, "pages": [], "requests": [], "errors": [], "steps": 0,
+    })
+
+
+def _finalize_discovery(result: Any, initial_queue: list[str]) -> dict[str, Any]:
     found = result.get("found") if isinstance(result, dict) else None
     if not isinstance(found, dict):
         return _empty_discovery_result(initial_queue)
-
     normalized_found = _normalize_found_results(found)
     artifacts = _build_discovery_artifacts(result, initial_queue)
     return {"hints": normalized_found, "artifacts": artifacts}

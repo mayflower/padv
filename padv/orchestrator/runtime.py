@@ -6,6 +6,8 @@ import uuid
 from time import monotonic
 from typing import Any
 
+from dataclasses import dataclass
+
 from padv.config.schema import PadvConfig
 from padv.dynamic.http.runner import RequestError, send_request
 from padv.dynamic.sandbox import adapter as sandbox_adapter
@@ -1060,32 +1062,44 @@ def _build_planner_trace(
     }
 
 
+@dataclass
+class _ValidationContext:
+    """Shared context for single-candidate runtime validation."""
+    config: PadvConfig
+    store: EvidenceStore
+    run_id: str
+    cookie_jar: dict[str, str]
+    auth_state: dict[str, Any]
+    planner_trace: dict[str, Any]
+    discovery_trace: dict[str, Any]
+    artifact_refs: list[str]
+
+
 def _validate_single_candidate_runtime(
-    config: PadvConfig, store: EvidenceStore, run_id: str,
+    ctx: _ValidationContext,
     candidate: Candidate, plan: ValidationPlan,
     candidate_static: list[StaticEvidence], evidence_signals: list[str],
-    cookie_jar: dict[str, str], auth_state: dict[str, Any],
-    planner_trace: dict[str, Any], discovery_trace: dict[str, Any],
-    artifact_refs: list[str], profile: Any,
+    profile: Any,
     request_budget_remaining: int, run_deadline: float,
 ) -> tuple[EvidenceBundle, int]:
     attempts: list[dict[str, Any]] = []
     seen_flags: set[str] = set()
+    config = ctx.config
     candidate_deadline = min(run_deadline, monotonic() + float(config.budgets.max_seconds_per_candidate))
     total_cost = 0
 
     positive_runs, repro_ids, pos_cost = _run_positive_phase(
-        config, candidate, plan, cookie_jar, request_budget_remaining, candidate_deadline, attempts, seen_flags,
+        config, candidate, plan, ctx.cookie_jar, request_budget_remaining, candidate_deadline, attempts, seen_flags,
     )
     total_cost += pos_cost
 
     negative_runs, neg_cost = _run_negative_phase(
-        config, candidate, plan, cookie_jar, request_budget_remaining - total_cost, candidate_deadline, attempts, seen_flags,
+        config, candidate, plan, ctx.cookie_jar, request_budget_remaining - total_cost, candidate_deadline, attempts, seen_flags,
     )
     total_cost += neg_cost
 
     differential_pairs, diff_cost = _run_differential_phase(
-        config, candidate, plan, positive_runs, auth_state, request_budget_remaining - total_cost, candidate_deadline, attempts, seen_flags,
+        config, candidate, plan, positive_runs, ctx.auth_state, request_budget_remaining - total_cost, candidate_deadline, attempts, seen_flags,
     )
     total_cost += diff_cost
 
@@ -1093,7 +1107,7 @@ def _validate_single_candidate_runtime(
         config=config, candidate=candidate, static_evidence=candidate_static,
         positive_runs=positive_runs, negative_runs=negative_runs,
         intercepts=_oracle_functions(plan), canary=plan.canary,
-        preconditions=_normalize_gate_preconditions(candidate, cookie_jar, config),
+        preconditions=_normalize_gate_preconditions(candidate, ctx.cookie_jar, config),
         evidence_signals=evidence_signals, vuln_class=candidate.vuln_class,
         differential_pairs=differential_pairs,
     )
@@ -1101,13 +1115,13 @@ def _validate_single_candidate_runtime(
     positive_export, negative_export, differential_export = _sanitize_exports(config, positive_runs, negative_runs, differential_pairs)
 
     bundle = EvidenceBundle(
-        bundle_id=f"bundle-{run_id}-{candidate.candidate_id}",
+        bundle_id=f"bundle-{ctx.run_id}-{candidate.candidate_id}",
         created_at=utc_now_iso(), candidate=candidate, static_evidence=candidate_static,
         positive_runtime=positive_export, negative_runtime=negative_export, repro_run_ids=repro_ids,
         gate_result=gate_result,
         limitations=[gate_result.reason] if gate_result.decision != "VALIDATED" else [],
-        differential_pairs=differential_export, artifact_refs=artifact_refs, discovery_trace=discovery_trace,
-        planner_trace=_build_planner_trace(_candidate_hypotheses(planner_trace, candidate.candidate_id), plan, attempts),
+        differential_pairs=differential_export, artifact_refs=ctx.artifact_refs, discovery_trace=ctx.discovery_trace,
+        planner_trace=_build_planner_trace(_candidate_hypotheses(ctx.planner_trace, candidate.candidate_id), plan, attempts),
         bundle_type=_bundle_type_for_decision(gate_result.decision),
         validation_contract={
             "profile": profile.to_dict(), "class_contract_id": plan.class_contract_id,
@@ -1116,9 +1130,9 @@ def _validate_single_candidate_runtime(
             "required_witnesses": list(profile.required_witnesses),
             "required_negative_controls": list(profile.required_negative_controls),
         },
-        environment_facts=_environment_facts(candidate, auth_state, plan),
+        environment_facts=_environment_facts(candidate, ctx.auth_state, plan),
     )
-    store.save_bundle(bundle)
+    ctx.store.save_bundle(bundle)
     return bundle, total_cost
 
 
@@ -1127,6 +1141,42 @@ def _extract_auth_cookie_jar(auth_state: dict[str, Any]) -> dict[str, str]:
     if not isinstance(cookie_jar_raw, dict):
         return {}
     return {str(k): str(v) for k, v in cookie_jar_raw.items() if str(k).strip()}
+
+
+def _process_candidate(
+    ctx: _ValidationContext,
+    candidate: Candidate,
+    plans_by_candidate: dict[str, ValidationPlan],
+    static_by_candidate: dict[str, list[StaticEvidence]],
+    request_budget_remaining: int,
+    run_deadline: float,
+) -> tuple[EvidenceBundle, int]:
+    candidate = apply_validation_profile(candidate)
+    profile = profile_for_vuln_class(candidate.canonical_class or candidate.vuln_class)
+
+    existing_bundle = _load_existing_bundle(ctx.store, ctx.run_id, candidate.candidate_id)
+    if existing_bundle is not None:
+        return existing_bundle, 0
+
+    candidate_static = static_by_candidate.get(candidate.candidate_id, [])
+    evidence_signals = _collect_evidence_signals(candidate_static, candidate)
+
+    if not is_runtime_validatable(candidate):
+        bundle = _build_analysis_only_bundle(
+            ctx.run_id, candidate, candidate_static, evidence_signals,
+            ctx.artifact_refs, ctx.discovery_trace, ctx.auth_state, profile,
+        )
+        ctx.store.save_bundle(bundle)
+        return bundle, 0
+
+    plan = plans_by_candidate.get(candidate.candidate_id)
+    if plan is None:
+        raise RuntimeError(f"missing agent-generated validation plan for candidate: {candidate.candidate_id}")
+
+    return _validate_single_candidate_runtime(
+        ctx, candidate, plan, candidate_static, evidence_signals, profile,
+        request_budget_remaining, run_deadline,
+    )
 
 
 def validate_candidates_runtime(
@@ -1160,35 +1210,18 @@ def validate_candidates_runtime(
     if config.sandbox.reset_cmd:
         sandbox_adapter.reset(config.sandbox)
 
+    ctx = _ValidationContext(
+        config=config, store=store, run_id=run_id,
+        cookie_jar=cookie_jar, auth_state=auth_state,
+        planner_trace=planner_trace, discovery_trace=discovery_trace,
+        artifact_refs=artifact_refs,
+    )
+
     for candidate in candidates:
-        candidate = apply_validation_profile(candidate)
-        profile = profile_for_vuln_class(candidate.canonical_class or candidate.vuln_class)
         if monotonic() >= run_deadline:
             break
-
-        existing_bundle = _load_existing_bundle(store, run_id, candidate.candidate_id)
-        if existing_bundle is not None:
-            decisions[existing_bundle.gate_result.decision] = decisions.get(existing_bundle.gate_result.decision, 0) + 1
-            bundles.append(existing_bundle)
-            continue
-
-        candidate_static = static_by_candidate.get(candidate.candidate_id, [])
-        evidence_signals = _collect_evidence_signals(candidate_static, candidate)
-
-        if not is_runtime_validatable(candidate):
-            bundle = _build_analysis_only_bundle(run_id, candidate, candidate_static, evidence_signals, artifact_refs, discovery_trace, auth_state, profile)
-            store.save_bundle(bundle)
-            decisions[bundle.gate_result.decision] = decisions.get(bundle.gate_result.decision, 0) + 1
-            bundles.append(bundle)
-            continue
-
-        plan = plans_by_candidate.get(candidate.candidate_id)
-        if plan is None:
-            raise RuntimeError(f"missing agent-generated validation plan for candidate: {candidate.candidate_id}")
-
-        bundle, cost = _validate_single_candidate_runtime(
-            config, store, run_id, candidate, plan, candidate_static, evidence_signals,
-            cookie_jar, auth_state, planner_trace, discovery_trace, artifact_refs, profile,
+        bundle, cost = _process_candidate(
+            ctx, candidate, plans_by_candidate, static_by_candidate,
             request_budget_remaining, run_deadline,
         )
         request_budget_remaining -= cost
