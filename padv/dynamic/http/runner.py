@@ -75,7 +75,7 @@ def send_request(
             body_text = resp.read().decode("utf-8", errors="replace")
             return HttpResponse(
                 status_code=getattr(resp, "status", 200),
-                headers={k: v for k, v in resp.headers.items()},
+                headers=dict(resp.headers.items()),
                 body=body_text,
             )
     except Exception as exc:  # pragma: no cover

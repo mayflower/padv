@@ -3,7 +3,7 @@ from __future__ import annotations
 import urllib.parse
 
 from padv.config.schema import PadvConfig
-from padv.models import Candidate, DifferentialPair, EnvironmentFacts, GateResult, RuntimeEvidence, StaticEvidence, ValidationPlan
+from padv.models import Candidate, DifferentialPair, GateResult, RuntimeEvidence, StaticEvidence
 from padv.static.joern.query_sets import VULN_CLASS_SPECS
 from padv.taxonomy import canonicalize_vuln_class
 
@@ -232,7 +232,7 @@ def _has_xxe_entity_witness(runs: list[RuntimeEvidence], intercepts: set[str]) -
     return False
 
 
-def _derived_class_flags(
+def _derive_oracle_witness_flags(
     class_key: str,
     positive_runs: list[RuntimeEvidence],
     negative_runs: list[RuntimeEvidence],
@@ -242,36 +242,170 @@ def _derived_class_flags(
 ) -> tuple[set[str], set[str]]:
     positive_flags: set[str] = set()
     negative_flags: set[str] = set()
-
     oracle_witness = _CLASS_ORACLE_WITNESS_FLAGS.get(class_key)
-    if oracle_witness:
-        min_positive_hits = min(2, len(positive_runs)) if positive_runs else 0
-        pos_hits = _typed_oracle_hit_count(positive_runs, intercept_set) or _oracle_hit_count(positive_runs, intercept_set, canary, config)
-        neg_hits = _typed_oracle_hit_count(negative_runs, intercept_set) or _oracle_hit_count(negative_runs, intercept_set, canary, config)
-        if min_positive_hits > 0 and pos_hits >= min_positive_hits:
-            positive_flags.add(oracle_witness)
-        if neg_hits > 0:
-            negative_flags.add(oracle_witness)
+    if not oracle_witness:
+        return positive_flags, negative_flags
+    min_positive_hits = min(2, len(positive_runs)) if positive_runs else 0
+    pos_hits = _typed_oracle_hit_count(positive_runs, intercept_set) or _oracle_hit_count(positive_runs, intercept_set, canary, config)
+    neg_hits = _typed_oracle_hit_count(negative_runs, intercept_set) or _oracle_hit_count(negative_runs, intercept_set, canary, config)
+    if min_positive_hits > 0 and pos_hits >= min_positive_hits:
+        positive_flags.add(oracle_witness)
+    if neg_hits > 0:
+        negative_flags.add(oracle_witness)
+    return positive_flags, negative_flags
+
+
+def _derive_sql_injection_flags(
+    positive_runs: list[RuntimeEvidence],
+    negative_runs: list[RuntimeEvidence],
+) -> set[str]:
+    flags: set[str] = set()
+    if _has_status_diff(positive_runs, negative_runs):
+        flags.add("sql_status_diff_witness")
+    if _has_body_diff(positive_runs, negative_runs):
+        flags.add("sql_body_diff_witness")
+    if _has_sql_error_witness(positive_runs, negative_runs):
+        flags.add("sql_error_witness")
+    return flags
+
+
+def _derive_ssrf_flags(
+    positive_runs: list[RuntimeEvidence],
+    negative_runs: list[RuntimeEvidence],
+    intercept_set: set[str],
+) -> tuple[set[str], set[str]]:
+    positive_flags: set[str] = set()
+    negative_flags: set[str] = set()
+    if _has_ssrf_url_arg_witness(positive_runs, intercept_set):
+        positive_flags.add("ssrf_url_arg_witness")
+    if _has_ssrf_url_arg_witness(negative_runs, intercept_set):
+        negative_flags.add("ssrf_url_arg_witness")
+    return positive_flags, negative_flags
+
+
+def _derive_xxe_flags(
+    positive_runs: list[RuntimeEvidence],
+    negative_runs: list[RuntimeEvidence],
+    intercept_set: set[str],
+) -> tuple[set[str], set[str]]:
+    positive_flags: set[str] = set()
+    negative_flags: set[str] = set()
+    if _has_xxe_entity_witness(positive_runs, intercept_set):
+        positive_flags.add("xxe_entity_witness")
+    if _has_xxe_entity_witness(negative_runs, intercept_set):
+        negative_flags.add("xxe_entity_witness")
+    return positive_flags, negative_flags
+
+
+def _derived_class_flags(
+    class_key: str,
+    positive_runs: list[RuntimeEvidence],
+    negative_runs: list[RuntimeEvidence],
+    intercept_set: set[str],
+    canary: str,
+    config: PadvConfig,
+) -> tuple[set[str], set[str]]:
+    positive_flags, negative_flags = _derive_oracle_witness_flags(
+        class_key, positive_runs, negative_runs, intercept_set, canary, config,
+    )
 
     if class_key == "sql_injection_boundary":
-        if _has_status_diff(positive_runs, negative_runs):
-            positive_flags.add("sql_status_diff_witness")
-        if _has_body_diff(positive_runs, negative_runs):
-            positive_flags.add("sql_body_diff_witness")
-        if _has_sql_error_witness(positive_runs, negative_runs):
-            positive_flags.add("sql_error_witness")
+        positive_flags |= _derive_sql_injection_flags(positive_runs, negative_runs)
     elif class_key in {"ssrf", "outbound_request_influence"}:
-        if _has_ssrf_url_arg_witness(positive_runs, intercept_set):
-            positive_flags.add("ssrf_url_arg_witness")
-        if _has_ssrf_url_arg_witness(negative_runs, intercept_set):
-            negative_flags.add("ssrf_url_arg_witness")
+        extra_pos, extra_neg = _derive_ssrf_flags(positive_runs, negative_runs, intercept_set)
+        positive_flags |= extra_pos
+        negative_flags |= extra_neg
     elif class_key == "xxe_influence":
-        if _has_xxe_entity_witness(positive_runs, intercept_set):
-            positive_flags.add("xxe_entity_witness")
-        if _has_xxe_entity_witness(negative_runs, intercept_set):
-            negative_flags.add("xxe_entity_witness")
+        extra_pos, extra_neg = _derive_xxe_flags(positive_runs, negative_runs, intercept_set)
+        positive_flags |= extra_pos
+        negative_flags |= extra_neg
 
     return positive_flags, negative_flags
+
+
+def _evaluate_v0_scope(
+    positive_runs: list[RuntimeEvidence],
+    negative_runs: list[RuntimeEvidence],
+) -> tuple[list[RuntimeEvidence], list[RuntimeEvidence], GateResult | None]:
+    hard_scope_failures = {"auth_failed", "missing_key", "missing_intercept", "inactive"}
+    if any(run.status in hard_scope_failures for run in positive_runs):
+        return [], [], GateResult("DROPPED", [], "V0", "runtime not in valid scope")
+    in_scope_positive = [run for run in positive_runs if run.status != "request_failed"]
+    in_scope_negative = [run for run in negative_runs if run.status != "request_failed"]
+    if not in_scope_positive or not in_scope_negative:
+        return [], [], GateResult("DROPPED", [], "V0", "runtime not in valid scope")
+    return in_scope_positive, in_scope_negative, None
+
+
+def _evaluate_v2_corroboration(
+    static_evidence: list[StaticEvidence],
+    in_scope_positive_runs: list[RuntimeEvidence],
+    evidence_signals: list[str] | None,
+    passed: list[str],
+) -> GateResult | None:
+    if not static_evidence:
+        return GateResult("DROPPED", passed, "V2", "missing static evidence")
+    if not in_scope_positive_runs:
+        return GateResult("DROPPED", passed, "V2", "missing runtime evidence")
+    signal_set = {s.strip().lower() for s in (evidence_signals or []) if isinstance(s, str) and s.strip()}
+    if len(signal_set) < 2:
+        return GateResult("DROPPED", passed, "V2", "insufficient multi-evidence corroboration")
+    return None
+
+
+def _evaluate_v3v4_runtime_class(
+    rule: dict[str, object],
+    positive_flags: set[str],
+    negative_flags: set[str],
+    passed: list[str],
+) -> GateResult | None:
+    required_all = {
+        str(x).strip().casefold()
+        for x in rule.get("required_all", set())
+        if str(x).strip()
+    }
+    required_any = {
+        str(x).strip().casefold()
+        for x in rule.get("required_any", set())
+        if str(x).strip()
+    }
+    if required_all and not required_all.issubset(positive_flags):
+        return GateResult("DROPPED", passed, "V3", "runtime class witness missing")
+    if required_any and not (positive_flags & required_any):
+        return GateResult("DROPPED", passed, "V3", "runtime class witness missing")
+    passed.append("V3")
+
+    enforce_negative_clean = bool(rule.get("enforce_negative_clean", True))
+    witness_flags = required_all | required_any
+    if enforce_negative_clean and witness_flags and (negative_flags & witness_flags):
+        return GateResult("DROPPED", passed, "V4", "negative control matched class witness")
+    passed.append("V4")
+    return None
+
+
+def _run_has_canary_hit(run: RuntimeEvidence, intercept_set: set[str], canary: str, config: PadvConfig) -> bool:
+    typed_hit = any(bool(getattr(item, "matched_canary", False)) for item in getattr(run, "oracle_evidence", []) or [])
+    return typed_hit or _has_oracle_hit(run, intercept_set, canary, config)
+
+
+def _evaluate_v3v4_legacy(
+    in_scope_positive_runs: list[RuntimeEvidence],
+    in_scope_negative_runs: list[RuntimeEvidence],
+    intercept_set: set[str],
+    canary: str,
+    config: PadvConfig,
+    passed: list[str],
+) -> GateResult | None:
+    positive_hits = [_run_has_canary_hit(run, intercept_set, canary, config) for run in in_scope_positive_runs]
+    if not all(positive_hits):
+        return GateResult("DROPPED", passed, "V3", "canary boundary proof missing")
+    passed.append("V3")
+
+    negative_hits = [_run_has_canary_hit(run, intercept_set, canary, config) for run in in_scope_negative_runs]
+    if any(negative_hits):
+        return GateResult("DROPPED", passed, "V4", "negative control hit canary")
+    passed.append("V4")
+    return None
 
 
 def evaluate_candidate(
@@ -286,33 +420,23 @@ def evaluate_candidate(
     vuln_class: str | None = None,
     differential_pairs: list[DifferentialPair] | None = None,
     candidate: Candidate | None = None,
-    plan: ValidationPlan | None = None,
-    environment_facts: EnvironmentFacts | None = None,
 ) -> GateResult:
     passed: list[str] = []
     if candidate is not None and str(getattr(candidate, "validation_mode", "")).strip() == "analysis_only":
         return GateResult("CONFIRMED_ANALYSIS_FINDING", ["A0"], None, "analysis-only candidate confirmed by static and research evidence")
 
-    hard_scope_failures = {"auth_failed", "missing_key", "missing_intercept", "inactive"}
-    if any(run.status in hard_scope_failures for run in positive_runs):
-        return GateResult("DROPPED", passed, "V0", "runtime not in valid scope")
-    in_scope_positive_runs = [run for run in positive_runs if run.status != "request_failed"]
-    in_scope_negative_runs = [run for run in negative_runs if run.status != "request_failed"]
-    if not in_scope_positive_runs or not in_scope_negative_runs:
-        return GateResult("DROPPED", passed, "V0", "runtime not in valid scope")
+    in_scope_positive_runs, in_scope_negative_runs, v0_fail = _evaluate_v0_scope(positive_runs, negative_runs)
+    if v0_fail is not None:
+        return v0_fail
     passed.append("V0")
 
     if preconditions:
         return GateResult("NEEDS_HUMAN_SETUP", passed, "V1", "preconditions unresolved")
     passed.append("V1")
 
-    if not static_evidence:
-        return GateResult("DROPPED", passed, "V2", "missing static evidence")
-    if not in_scope_positive_runs:
-        return GateResult("DROPPED", passed, "V2", "missing runtime evidence")
-    signal_set = {s.strip().lower() for s in (evidence_signals or []) if isinstance(s, str) and s.strip()}
-    if len(signal_set) < 2:
-        return GateResult("DROPPED", passed, "V2", "insufficient multi-evidence corroboration")
+    v2_fail = _evaluate_v2_corroboration(static_evidence, in_scope_positive_runs, evidence_signals, passed)
+    if v2_fail is not None:
+        return v2_fail
     passed.append("V2")
 
     class_key = canonicalize_vuln_class(
@@ -341,45 +465,16 @@ def evaluate_candidate(
         rule = _CLASS_WITNESS_RULES.get(class_key)
         if rule is None:
             return GateResult("DROPPED", passed, "V3", "runtime witness rule missing for class")
-        required_all = {
-            str(x).strip().casefold()
-            for x in rule.get("required_all", set())
-            if str(x).strip()
-        }
-        required_any = {
-            str(x).strip().casefold()
-            for x in rule.get("required_any", set())
-            if str(x).strip()
-        }
-
-        if required_all and not required_all.issubset(positive_flags):
-            return GateResult("DROPPED", passed, "V3", "runtime class witness missing")
-        if required_any and not (positive_flags & required_any):
-            return GateResult("DROPPED", passed, "V3", "runtime class witness missing")
-        passed.append("V3")
-
-        enforce_negative_clean = bool(rule.get("enforce_negative_clean", True))
-        witness_flags = required_all | required_any
-        if enforce_negative_clean and witness_flags and (negative_flags & witness_flags):
-            return GateResult("DROPPED", passed, "V4", "negative control matched class witness")
-        passed.append("V4")
+        v3v4_fail = _evaluate_v3v4_runtime_class(rule, positive_flags, negative_flags, passed)
+        if v3v4_fail is not None:
+            return v3v4_fail
     else:
         # Legacy fallback for non-runtime classes and unknown classes only.
-        positive_hits = []
-        for run in in_scope_positive_runs:
-            typed_hit = any(bool(getattr(item, "matched_canary", False)) for item in getattr(run, "oracle_evidence", []) or [])
-            positive_hits.append(typed_hit or _has_oracle_hit(run, intercept_set, canary, config))
-        if not all(positive_hits):
-            return GateResult("DROPPED", passed, "V3", "canary boundary proof missing")
-        passed.append("V3")
-
-        negative_hits = []
-        for run in in_scope_negative_runs:
-            typed_hit = any(bool(getattr(item, "matched_canary", False)) for item in getattr(run, "oracle_evidence", []) or [])
-            negative_hits.append(typed_hit or _has_oracle_hit(run, intercept_set, canary, config))
-        if any(negative_hits):
-            return GateResult("DROPPED", passed, "V4", "negative control hit canary")
-        passed.append("V4")
+        v3v4_fail = _evaluate_v3v4_legacy(
+            in_scope_positive_runs, in_scope_negative_runs, intercept_set, canary, config, passed,
+        )
+        if v3v4_fail is not None:
+            return v3v4_fail
 
     if len(in_scope_positive_runs) < 2 or len(in_scope_negative_runs) < 1:
         return GateResult("DROPPED", passed, "V5", "insufficient repro runs")

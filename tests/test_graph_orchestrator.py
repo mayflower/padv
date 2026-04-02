@@ -266,11 +266,11 @@ def _install_agent_stubs(
             )
         return hypotheses, {"engine": "stub", "hypothesis_ids": [item.hypothesis_id for item in hypotheses]}
 
-    def _challenge(_runtime, _config, *, hypotheses, frontier_state):
+    def _challenge(_runtime, _config, *, hypotheses):
         state["challenge_calls"] = int(state["challenge_calls"]) + 1
         return [], {"engine": "stub", "round": state["challenge_calls"]}
 
-    def _plan(_runtime, config, *, hypotheses, frontier_state):
+    def _plan(_runtime, config, *, hypotheses):
         plans: dict[str, ValidationPlan] = {}
         attempts: list[ExperimentAttempt] = []
         for idx, hypothesis in enumerate(hypotheses, start=1):
@@ -461,7 +461,7 @@ def test_analyze_with_graph_applies_configured_skeptic_rounds(monkeypatch: pytes
 
     calls = {"count": 0}
 
-    def _fake_challenge(_runtime, _config, *, hypotheses, frontier_state):
+    def _fake_challenge(_runtime, _config, *, hypotheses):
         calls["count"] += 1
         return [], {"engine": "stub", "round": calls["count"]}
 

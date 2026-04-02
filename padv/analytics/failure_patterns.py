@@ -40,6 +40,79 @@ def _suggestion_for_pattern(failed_gate: str, vuln_class: str, top_sources: list
     return "Investigate recurring gate failures and adjust candidate synthesis quality."
 
 
+def _accumulate_bundle_failure(
+    bundle: dict[str, Any],
+    bundle_id: str,
+    groups: dict[tuple[str, str], dict[str, Any]],
+    gate_distribution: Counter[str],
+) -> bool:
+    """Process one bundle for failure analysis.  Returns True if the bundle was a failure."""
+    gate_result = bundle.get("gate_result", {})
+    if not isinstance(gate_result, dict):
+        return False
+    decision = _as_str(gate_result.get("decision"))
+    if decision in {"VALIDATED", "CONFIRMED_ANALYSIS_FINDING"}:
+        return False
+
+    failed_gate = _as_str(gate_result.get("failed_gate"), "unknown")
+    reason = _as_str(gate_result.get("reason"), "unknown")
+    gate_distribution[failed_gate] += 1
+
+    candidate = bundle.get("candidate", {})
+    if not isinstance(candidate, dict):
+        return True
+
+    vuln_class = _as_str(candidate.get("vuln_class"), "unknown")
+    candidate_id = _as_str(candidate.get("candidate_id"), bundle_id)
+    confidence = _as_float(candidate.get("confidence"), 0.0)
+    provenance = candidate.get("provenance", [])
+    if not isinstance(provenance, list):
+        provenance = []
+    normalized_provenance = sorted(
+        {_as_str(p).strip().lower() for p in provenance if _as_str(p).strip()}
+    )
+
+    key = (vuln_class, failed_gate)
+    entry = groups[key]
+    entry["count"] += 1
+    entry["reason_counter"][reason] += 1
+    entry["candidate_ids"].append(candidate_id)
+    entry["confidences"].append(confidence)
+    for source in normalized_provenance:
+        entry["provenance_counter"][source] += 1
+    return True
+
+
+def _build_pattern(vuln_class: str, failed_gate: str, entry: dict[str, Any]) -> FailurePattern:
+    count = int(entry["count"])
+    reason_counter: Counter[str] = entry["reason_counter"]
+    reason = reason_counter.most_common(1)[0][0] if reason_counter else "unknown"
+
+    confidences: list[float] = entry["confidences"] or [0.0]
+    min_conf = min(confidences)
+    max_conf = max(confidences)
+
+    provenance_counter: Counter[str] = entry["provenance_counter"]
+    provenance_correlation = {
+        source: round(src_count / count, 4)
+        for source, src_count in provenance_counter.items()
+    }
+    top_sources = [source for source, _ in provenance_counter.most_common(2)]
+    suggestion = _suggestion_for_pattern(failed_gate, vuln_class, top_sources)
+
+    return FailurePattern(
+        pattern_id="",
+        vuln_class=vuln_class,
+        failed_gate=failed_gate,
+        failure_reason=reason,
+        occurrence_count=count,
+        example_candidate_ids=entry["candidate_ids"][:5],
+        provenance_correlation=provenance_correlation,
+        confidence_range=(round(min_conf, 4), round(max_conf, 4)),
+        suggestion=suggestion,
+    )
+
+
 def analyze_failures(store: EvidenceStore, min_occurrences: int = 3) -> FailureAnalysis:
     bundle_ids = store.list_bundle_ids()
     run_ids = store.list_run_ids()
@@ -63,80 +136,14 @@ def analyze_failures(store: EvidenceStore, min_occurrences: int = 3) -> FailureA
         if not isinstance(bundle, dict):
             continue
         total_candidates += 1
-
-        gate_result = bundle.get("gate_result", {})
-        if not isinstance(gate_result, dict):
-            continue
-        decision = _as_str(gate_result.get("decision"))
-        if decision in {"VALIDATED", "CONFIRMED_ANALYSIS_FINDING"}:
-            continue
-
-        failed_gate = _as_str(gate_result.get("failed_gate"), "unknown")
-        reason = _as_str(gate_result.get("reason"), "unknown")
-        gate_distribution[failed_gate] += 1
-        total_failures += 1
-
-        candidate = bundle.get("candidate", {})
-        if not isinstance(candidate, dict):
-            continue
-
-        vuln_class = _as_str(candidate.get("vuln_class"), "unknown")
-        candidate_id = _as_str(candidate.get("candidate_id"), bundle_id)
-        confidence = _as_float(candidate.get("confidence"), 0.0)
-        provenance = candidate.get("provenance", [])
-        if not isinstance(provenance, list):
-            provenance = []
-        normalized_provenance = sorted(
-            {
-                _as_str(p).strip().lower()
-                for p in provenance
-                if _as_str(p).strip()
-            }
-        )
-
-        key = (vuln_class, failed_gate)
-        entry = groups[key]
-        entry["count"] += 1
-        entry["reason_counter"][reason] += 1
-        entry["candidate_ids"].append(candidate_id)
-        entry["confidences"].append(confidence)
-        for source in normalized_provenance:
-            entry["provenance_counter"][source] += 1
+        if _accumulate_bundle_failure(bundle, bundle_id, groups, gate_distribution):
+            total_failures += 1
 
     patterns: list[FailurePattern] = []
     for (vuln_class, failed_gate), entry in groups.items():
-        count = int(entry["count"])
-        if count < min_occurrences:
+        if int(entry["count"]) < min_occurrences:
             continue
-
-        reason_counter: Counter[str] = entry["reason_counter"]
-        reason = reason_counter.most_common(1)[0][0] if reason_counter else "unknown"
-
-        confidences: list[float] = entry["confidences"] or [0.0]
-        min_conf = min(confidences)
-        max_conf = max(confidences)
-
-        provenance_counter: Counter[str] = entry["provenance_counter"]
-        provenance_correlation = {
-            source: round(src_count / count, 4)
-            for source, src_count in provenance_counter.items()
-        }
-        top_sources = [source for source, _ in provenance_counter.most_common(2)]
-        suggestion = _suggestion_for_pattern(failed_gate, vuln_class, top_sources)
-
-        patterns.append(
-            FailurePattern(
-                pattern_id="",
-                vuln_class=vuln_class,
-                failed_gate=failed_gate,
-                failure_reason=reason,
-                occurrence_count=count,
-                example_candidate_ids=entry["candidate_ids"][:5],
-                provenance_correlation=provenance_correlation,
-                confidence_range=(round(min_conf, 4), round(max_conf, 4)),
-                suggestion=suggestion,
-            )
-        )
+        patterns.append(_build_pattern(vuln_class, failed_gate, entry))
 
     patterns.sort(key=lambda p: (-p.occurrence_count, p.vuln_class, p.failed_gate))
     for idx, pattern in enumerate(patterns, start=1):

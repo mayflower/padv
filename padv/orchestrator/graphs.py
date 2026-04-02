@@ -5,7 +5,7 @@ import hashlib
 from dataclasses import asdict, is_dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, TypedDict
+from typing import Any, Callable, TypedDict, cast
 from urllib.parse import urlsplit, urlunsplit
 
 from padv.analytics.failure_patterns import analyze_failures
@@ -138,7 +138,7 @@ _AGENT_RUNTIMES: dict[str, Any] = {}
 
 
 def _safe_copy_candidate(candidate: Candidate) -> Candidate:
-    return replace(candidate)
+    return cast(Candidate, replace(candidate))
 
 
 def _now_iso() -> str:
@@ -520,7 +520,6 @@ def _assert_stage_invariants(state: GraphState, stage: str) -> None:
     if stage == "persist":
         _expect_list("candidates")
         _expect_list("static_evidence")
-        return
 
 
 def _stage_snapshot_payload(state: GraphState, stage: str) -> dict[str, Any]:
@@ -665,50 +664,47 @@ _OBJECTIVE_FAMILY_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
 )
 
 
+_VULN_CLASS_EXACT_MAP: dict[str, str] = {
+    "file_boundary_influence": "file_inclusion_path_traversal",
+    "debug_output_leak": "information_disclosure_misconfiguration",
+    "information_disclosure": "information_disclosure_misconfiguration",
+    "security_misconfiguration": "information_disclosure_misconfiguration",
+    "broken_access_control": "authn_authz_failures",
+    "idor_invariant_missing": "authn_authz_failures",
+    "auth_and_session_failures": "authn_authz_failures",
+}
+
+_VULN_CLASS_SUBSTRING_MAP: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("sql",), "sql_injection"),
+    (("xss",), "cross_site_scripting"),
+    (("command",), "command_injection"),
+    (("code_injection",), "code_injection"),
+    (("ldap",), "ldap_injection"),
+    (("xpath",), "xpath_injection"),
+    (("file_upload",), "unrestricted_file_upload"),
+    (("ssrf", "outbound_request"), "ssrf"),
+    (("xxe", "xml_dos"), "xxe_xml_injection"),
+    (("deserialization", "gadget"), "deserialization"),
+    (("header",), "header_cookie_manipulation"),
+    (("regex_dos",), "regex_xml_dos"),
+    (("csrf",), "csrf"),
+    (("session",), "session_misuse"),
+    (("crypto",), "crypto_failures"),
+    (("software_data_integrity",), "software_data_integrity"),
+    (("logging_monitoring",), "logging_monitoring_failures"),
+)
+
+
 def _objective_family_from_vuln_class(vuln_class: str) -> str:
     key = str(vuln_class or "").strip().lower()
     if not key:
         return "unknown"
-    if "sql" in key:
-        return "sql_injection"
-    if "xss" in key:
-        return "cross_site_scripting"
-    if "command" in key:
-        return "command_injection"
-    if "code_injection" in key:
-        return "code_injection"
-    if "ldap" in key:
-        return "ldap_injection"
-    if "xpath" in key:
-        return "xpath_injection"
-    if key == "file_boundary_influence":
-        return "file_inclusion_path_traversal"
-    if "file_upload" in key:
-        return "unrestricted_file_upload"
-    if key in {"debug_output_leak", "information_disclosure", "security_misconfiguration"}:
-        return "information_disclosure_misconfiguration"
-    if "ssrf" in key or "outbound_request" in key:
-        return "ssrf"
-    if "xxe" in key or "xml_dos" in key:
-        return "xxe_xml_injection"
-    if "deserialization" in key or "gadget" in key:
-        return "deserialization"
-    if "header" in key:
-        return "header_cookie_manipulation"
-    if "regex_dos" in key:
-        return "regex_xml_dos"
-    if key in {"broken_access_control", "idor_invariant_missing", "auth_and_session_failures"}:
-        return "authn_authz_failures"
-    if "csrf" in key:
-        return "csrf"
-    if "session" in key:
-        return "session_misuse"
-    if "crypto" in key:
-        return "crypto_failures"
-    if "software_data_integrity" in key:
-        return "software_data_integrity"
-    if "logging_monitoring" in key:
-        return "logging_monitoring_failures"
+    exact = _VULN_CLASS_EXACT_MAP.get(key)
+    if exact is not None:
+        return exact
+    for substrings, family in _VULN_CLASS_SUBSTRING_MAP:
+        if any(s in key for s in substrings):
+            return family
     return key
 
 
@@ -1209,8 +1205,7 @@ def _reset_iteration_state_for_new_objective(state: GraphState) -> None:
     )
 
 
-def _node_init(state: GraphState) -> GraphState:
-    _emit_progress(state, "init", "start")
+def _init_state_fields(state: GraphState) -> None:
     if not state.get("run_id"):
         state["run_id"] = new_run_id("analyze")
     state["stage_seq"] = 0
@@ -1269,17 +1264,8 @@ def _node_init(state: GraphState) -> GraphState:
     state["selected_candidates"] = list(state.get("selected_candidates", []))
     state["selected_static"] = list(state.get("selected_static", []))
 
-    if state.get("skip_discovery"):
-        analysis = analyze_failures(state["store"])
-        state["failure_analysis"] = analysis
-        _persist_failure_analysis_artifact(state, analysis)
-        state["discovery_trace"]["failure_patterns"] = len(analysis.patterns)
-        state["frontier_state"] = _default_frontier_state()
-        state["frontier_state"]["target_scope"] = _current_target_scope(state)
-        state["had_semantic_candidates"] = bool(state.get("selected_candidates"))
-        update_agent_runtime_context(_state_runtime(state), frontier_state=state["frontier_state"])
-        return _finalize_stage(state, "init", "validate-only state initialized")
 
+def _load_and_normalize_frontier(state: GraphState) -> dict[str, Any]:
     persisted = state["store"].load_frontier_state() or _default_frontier_state()
     if not isinstance(persisted, dict):
         persisted = _default_frontier_state()
@@ -1297,11 +1283,30 @@ def _node_init(state: GraphState) -> GraphState:
     persisted.setdefault("candidate_resume", {})
     persisted.setdefault("runtime_coverage", {"flags": [], "classes": []})
     persisted["target_scope"] = _current_target_scope(state)
-    state["frontier_state"] = persisted
+    return persisted
+
+
+def _init_failure_analysis(state: GraphState) -> None:
     analysis = analyze_failures(state["store"])
     state["failure_analysis"] = analysis
     _persist_failure_analysis_artifact(state, analysis)
     state["discovery_trace"]["failure_patterns"] = len(analysis.patterns)
+
+
+def _node_init(state: GraphState) -> GraphState:
+    _emit_progress(state, "init", "start")
+    _init_state_fields(state)
+
+    if state.get("skip_discovery"):
+        _init_failure_analysis(state)
+        state["frontier_state"] = _default_frontier_state()
+        state["frontier_state"]["target_scope"] = _current_target_scope(state)
+        state["had_semantic_candidates"] = bool(state.get("selected_candidates"))
+        update_agent_runtime_context(_state_runtime(state), frontier_state=state["frontier_state"])
+        return _finalize_stage(state, "init", "validate-only state initialized")
+
+    state["frontier_state"] = _load_and_normalize_frontier(state)
+    _init_failure_analysis(state)
     update_agent_runtime_context(_state_runtime(state), frontier_state=state["frontier_state"])
     return _finalize_stage(state, "init", "frontier and agent session ready")
 
@@ -2091,7 +2096,6 @@ def _node_skeptic_challenge(state: GraphState) -> GraphState:
             _state_runtime(state),
             state["config"],
             hypotheses=current_hypotheses,
-            frontier_state=state.get("frontier_state", {}),
         )
         all_refutations.extend(refutations)
         if isinstance(trace, dict):
@@ -2137,7 +2141,6 @@ def _node_experiment_plan(state: GraphState) -> GraphState:
         _state_runtime(state),
         state["config"],
         hypotheses=state.get("hypothesis_board", []),
-        frontier_state=state.get("frontier_state", {}),
     )
     state["plans_by_candidate"] = plans_by_candidate
     state["experiment_board"] = attempts
@@ -2636,6 +2639,61 @@ def _node_validation_plan(state: GraphState) -> GraphState:
     return _finalize_stage(state, "validation_plan", f"planned={len(plans_by_candidate)}")
 
 
+def _skip_reason_for_candidate(
+    candidate_id: str,
+    resume_filtered: set[str],
+    selected_ids: set[str],
+    scheduler_trace: dict[str, Any],
+) -> str:
+    if candidate_id in resume_filtered and candidate_id not in selected_ids:
+        reason = "resume-clean-completed"
+    elif candidate_id in selected_ids:
+        reason = "selected-not-executed"
+    else:
+        reason = "scheduler-not-selected"
+    triage_reason = _triage_reason_for_candidate(
+        scheduler_trace if isinstance(scheduler_trace, dict) else {},
+        candidate_id,
+    )
+    if triage_reason:
+        reason = f"{reason}; {triage_reason}"
+    return reason
+
+
+def _build_mapping_record(
+    candidate: Candidate,
+    bundle: Any | None,
+    iteration: int,
+    plans_by_candidate: dict[str, Any],
+    resume_filtered: set[str],
+    selected_ids: set[str],
+    scheduler_trace: dict[str, Any],
+) -> dict[str, Any]:
+    candidate_id = candidate.candidate_id
+    attempts = _extract_bundle_attempts(bundle) if bundle is not None else []
+    decision = ""
+    bundle_id = ""
+    reason_if_skipped = ""
+    if bundle is not None:
+        gate_result = getattr(bundle, "gate_result", None)
+        decision = str(getattr(gate_result, "decision", "")).strip()
+        bundle_id = str(getattr(bundle, "bundle_id", "")).strip()
+    else:
+        reason_if_skipped = _skip_reason_for_candidate(candidate_id, resume_filtered, selected_ids, scheduler_trace)
+
+    return {
+        "ts": _now_iso(),
+        "iteration": iteration,
+        "candidate_id": candidate_id,
+        "candidate_signature": _candidate_signature(candidate),
+        "plan_present": bool(candidate_id in plans_by_candidate),
+        "attempt_count": len(attempts),
+        "bundle_id": bundle_id,
+        "decision": decision,
+        "reason_if_skipped": reason_if_skipped,
+    }
+
+
 def _node_runtime_validate(state: GraphState) -> GraphState:
     _emit_progress(state, "runtime_validate", "start")
     if not state.get("run_validation"):
@@ -2645,23 +2703,18 @@ def _node_runtime_validate(state: GraphState) -> GraphState:
     resume_filtered = {str(x) for x in state.get("resume_filtered_candidates", []) if str(x).strip()}
     iteration = int((state.get("frontier_state") or {}).get("iteration", 0)) + 1
     if state.get("had_semantic_candidates") and not candidates:
-        payload = {
-            "run_id": state.get("run_id"),
-            "iteration": iteration,
-            "reason": "no-selected-candidates",
-            "had_semantic_candidates": True,
+        _persist_runtime_liveness_artifact(state, {
+            "run_id": state.get("run_id"), "iteration": iteration,
+            "reason": "no-selected-candidates", "had_semantic_candidates": True,
             "schedule_all_candidate_ids": [c.candidate_id for c in schedule_all],
             "resume_filtered_candidates": sorted(resume_filtered),
             "scheduler_trace": state.get("planner_trace", {}).get("scheduler", {}),
-        }
-        _persist_runtime_liveness_artifact(state, payload)
+        })
         raise RuntimeError("runtime validation invariant failed: semantic candidates present but none selected")
     static_evidence = state.get("selected_static") or state.get("static_evidence", [])
     bundles, decisions = validate_candidates_runtime(
-        config=state["config"],
-        store=state["store"],
-        static_evidence=static_evidence,
-        candidates=candidates,
+        config=state["config"], store=state["store"],
+        static_evidence=static_evidence, candidates=candidates,
         run_id=state["run_id"],
         plans_by_candidate=state.get("plans_by_candidate"),
         planner_trace=state.get("planner_trace"),
@@ -2670,9 +2723,8 @@ def _node_runtime_validate(state: GraphState) -> GraphState:
         auth_state=state.get("auth_state"),
     )
     if candidates and not bundles:
-        payload = {
-            "run_id": state.get("run_id"),
-            "iteration": iteration,
+        _persist_runtime_liveness_artifact(state, {
+            "run_id": state.get("run_id"), "iteration": iteration,
             "reason": "zero-bundles-for-selected-candidates",
             "selected_candidate_ids": [c.candidate_id for c in candidates],
             "schedule_all_candidate_ids": [c.candidate_id for c in schedule_all],
@@ -2680,8 +2732,7 @@ def _node_runtime_validate(state: GraphState) -> GraphState:
             "plans_present": sorted((state.get("plans_by_candidate") or {}).keys()),
             "scheduler_trace": state.get("planner_trace", {}).get("scheduler", {}),
             "discovery_trace": state.get("discovery_trace", {}),
-        }
-        _persist_runtime_liveness_artifact(state, payload)
+        })
         raise RuntimeError("runtime validation invariant failed: selected candidates produced zero bundles")
 
     selected_ids = {c.candidate_id for c in candidates}
@@ -2691,45 +2742,13 @@ def _node_runtime_validate(state: GraphState) -> GraphState:
         str(getattr(getattr(bundle, "candidate", None), "candidate_id", "")): bundle
         for bundle in bundles
     }
-    mapping_records: list[dict[str, Any]] = []
-    for candidate in schedule_all:
-        candidate_id = candidate.candidate_id
-        bundle = bundles_by_candidate.get(candidate_id)
-        attempts = _extract_bundle_attempts(bundle) if bundle is not None else []
-        decision = ""
-        bundle_id = ""
-        reason_if_skipped = ""
-        if bundle is not None:
-            gate_result = getattr(bundle, "gate_result", None)
-            decision = str(getattr(gate_result, "decision", "")).strip()
-            bundle_id = str(getattr(bundle, "bundle_id", "")).strip()
-        else:
-            if candidate_id in resume_filtered and candidate_id not in selected_ids:
-                reason_if_skipped = "resume-clean-completed"
-            elif candidate_id in selected_ids:
-                reason_if_skipped = "selected-not-executed"
-            else:
-                reason_if_skipped = "scheduler-not-selected"
-            triage_reason = _triage_reason_for_candidate(
-                scheduler_trace if isinstance(scheduler_trace, dict) else {},
-                candidate_id,
-            )
-            if triage_reason:
-                reason_if_skipped = f"{reason_if_skipped}; {triage_reason}"
-
-        mapping_records.append(
-            {
-                "ts": _now_iso(),
-                "iteration": iteration,
-                "candidate_id": candidate_id,
-                "candidate_signature": _candidate_signature(candidate),
-                "plan_present": bool(candidate_id in plans_by_candidate),
-                "attempt_count": len(attempts),
-                "bundle_id": bundle_id,
-                "decision": decision,
-                "reason_if_skipped": reason_if_skipped,
-            }
+    mapping_records = [
+        _build_mapping_record(
+            candidate, bundles_by_candidate.get(candidate.candidate_id),
+            iteration, plans_by_candidate, resume_filtered, selected_ids, scheduler_trace,
         )
+        for candidate in schedule_all
+    ]
     _persist_candidate_run_mapping(state, mapping_records)
 
     state["iteration_bundles"] = list(bundles)

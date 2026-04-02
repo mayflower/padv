@@ -335,6 +335,140 @@ def _cookie_origin_fields(base_url: str) -> tuple[str, str, bool]:
     return scheme, host, secure
 
 
+def _build_initial_url_lists(
+    base_url: str,
+    seed_urls: list[str] | None,
+) -> tuple[list[str], list[str]]:
+    initial_queue: list[str] = []
+    initial_seen: list[str] = []
+    for raw in [base_url] + list(seed_urls or []):
+        normalized = _canonicalize_url(raw, base_url=base_url)
+        if not normalized or normalized in initial_seen:
+            continue
+        initial_seen.append(normalized)
+        initial_queue.append(normalized)
+    return initial_queue, initial_seen
+
+
+async def _inject_cookies(context: Any, auth_state: dict[str, Any] | None, base_url: str) -> None:
+    cookie_map = auth_state.get("cookies", {}) if isinstance(auth_state, dict) else {}
+    if not isinstance(cookie_map, dict) or not cookie_map:
+        return
+    scheme, host, secure = _cookie_origin_fields(base_url)
+    cookies_payload = [
+        {
+            "name": str(name),
+            "value": str(value),
+            "domain": host,
+            "path": "/",
+            "httpOnly": False,
+            "secure": secure,
+            "sameSite": "Lax",
+            "url": f"{scheme}://{host}/",
+        }
+        for name, value in cookie_map.items()
+        if str(name).strip()
+    ]
+    if cookies_payload:
+        await context.add_cookies(cookies_payload)
+
+
+def _make_request_recorder(requests: list[dict[str, Any]], base_url: str) -> Callable[[Any], None]:
+    def _record_request(request: Any) -> None:
+        try:
+            candidate = _canonicalize_url(request.url, base_url=base_url)
+            if not candidate:
+                return
+            path, params = _normalize_path(candidate)
+            requests.append(
+                {
+                    "url": candidate,
+                    "path": path,
+                    "method": str(getattr(request, "method", "") or "").upper(),
+                    "resource_type": str(getattr(request, "resource_type", "") or ""),
+                    "params": params,
+                }
+            )
+        except Exception:
+            return
+    return _record_request
+
+
+def _pop_next_unvisited(queue: list[str], visited: list[str]) -> str:
+    while queue:
+        candidate = queue.pop(0)
+        if candidate not in visited:
+            return candidate
+    return ""
+
+
+def _seed_urls_into_queue(
+    candidate_urls: list[str],
+    seen: list[str],
+    visited: list[str],
+    queue: list[str],
+    seed_cap: int,
+) -> None:
+    for url in candidate_urls[:8]:
+        if url in seen or url in visited:
+            continue
+        if len(seen) >= seed_cap:
+            break
+        seen.append(url)
+        queue.append(url)
+
+
+def _enqueue_llm_urls(
+    llm_urls: list[str],
+    base_url: str,
+    seen: list[str],
+    visited: list[str],
+    queue: list[str],
+    queue_cap: int,
+) -> None:
+    for raw in llm_urls:
+        normalized = _canonicalize_url(raw, base_url=base_url)
+        if not normalized or normalized in seen or normalized in visited:
+            continue
+        if len(seen) >= queue_cap:
+            break
+        seen.append(normalized)
+        queue.append(normalized)
+
+
+def _normalize_found_results(found: dict[str, list[str]]) -> dict[str, list[str]]:
+    normalized: dict[str, list[str]] = {}
+    for path, params in found.items():
+        if not isinstance(path, str):
+            continue
+        if isinstance(params, list):
+            normalized[path] = sorted({str(x).strip() for x in params if str(x).strip()})
+        else:
+            normalized[path] = []
+    return normalized
+
+
+def _build_discovery_artifacts(
+    result: dict[str, Any],
+    initial_queue: list[str],
+) -> dict[str, Any]:
+    pages = result.get("pages", []) if isinstance(result, dict) else []
+    requests_payload = result.get("requests", []) if isinstance(result, dict) else []
+    errors = result.get("errors", []) if isinstance(result, dict) else []
+    visited_urls = result.get("visited", []) if isinstance(result, dict) else []
+    return {
+        "seed_urls": initial_queue,
+        "visited_urls": [str(x).strip() for x in visited_urls if isinstance(x, str) and str(x).strip()],
+        "pages": [item for item in pages if isinstance(item, dict)],
+        "requests": [item for item in requests_payload if isinstance(item, dict)][:200],
+        "errors": [str(x).strip() for x in errors if isinstance(x, str) and str(x).strip()],
+    }
+
+
+def _empty_discovery_result(initial_queue: list[str] | None = None) -> dict[str, Any]:
+    return {"hints": {}, "artifacts": {"seed_urls": list(initial_queue or []), "visited_urls": [], "pages": [], "requests": [], "errors": []}}
+
+
 async def _discover_with_playwright_async(
     config: PadvConfig,
     seed_urls: list[str] | None = None,
@@ -344,66 +478,19 @@ async def _discover_with_playwright_async(
     from playwright.async_api import async_playwright  # type: ignore[import-not-found]
 
     base_url = config.target.base_url
-    initial_queue: list[str] = []
-    initial_seen: list[str] = []
-
-    for raw in [base_url] + list(seed_urls or []):
-        normalized = _canonicalize_url(raw, base_url=base_url)
-        if not normalized:
-            continue
-        if normalized in initial_seen:
-            continue
-        initial_seen.append(normalized)
-        initial_queue.append(normalized)
+    initial_queue, initial_seen = _build_initial_url_lists(base_url, seed_urls)
 
     if not initial_queue:
-        return {"hints": {}, "artifacts": {"seed_urls": [], "visited_urls": [], "pages": [], "requests": [], "errors": []}}
+        return _empty_discovery_result()
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=config.web.headless)
         context = await browser.new_context(ignore_https_errors=True)
-        cookie_map = auth_state.get("cookies", {}) if isinstance(auth_state, dict) else {}
-        if isinstance(cookie_map, dict) and cookie_map:
-            scheme, host, secure = _cookie_origin_fields(base_url)
-            cookies_payload = [
-                {
-                    "name": str(name),
-                    "value": str(value),
-                    "domain": host,
-                    "path": "/",
-                    "httpOnly": False,
-                    "secure": secure,
-                    "sameSite": "Lax",
-                    "url": f"{scheme}://{host}/",
-                }
-                for name, value in cookie_map.items()
-                if str(name).strip()
-            ]
-            if cookies_payload:
-                await context.add_cookies(cookies_payload)
+        await _inject_cookies(context, auth_state, base_url)
         page = await context.new_page()
         _install_dialog_guards(context, page)
         requests: list[dict[str, Any]] = []
-
-        def _record_request(request: Any) -> None:
-            try:
-                candidate = _canonicalize_url(request.url, base_url=base_url)
-                if not candidate:
-                    return
-                path, params = _normalize_path(candidate)
-                requests.append(
-                    {
-                        "url": candidate,
-                        "path": path,
-                        "method": str(getattr(request, "method", "") or "").upper(),
-                        "resource_type": str(getattr(request, "resource_type", "") or ""),
-                        "params": params,
-                    }
-                )
-            except Exception:
-                return
-
-        page.on("request", _record_request)
+        page.on("request", _make_request_recorder(requests, base_url))
 
         timeout_ms = max(1, int(config.web.request_timeout_seconds)) * 1000
 
@@ -416,28 +503,13 @@ async def _discover_with_playwright_async(
             errors = list(state.get("errors", []))
             steps = int(state.get("steps", 0))
 
-            current = ""
-            while queue:
-                candidate = queue.pop(0)
-                if candidate in visited:
-                    continue
-                current = candidate
-                break
-
+            current = _pop_next_unvisited(queue, visited)
             if not current:
                 return {
-                    "queue": queue,
-                    "seen": seen,
-                    "visited": visited,
-                    "found": found,
-                    "pages": pages,
-                    "requests": list(requests),
-                    "errors": errors,
-                    "steps": steps,
-                    "current_url": "",
-                    "current_path": "",
-                    "candidate_urls": [],
-                    "candidate_params": [],
+                    "queue": queue, "seen": seen, "visited": visited,
+                    "found": found, "pages": pages, "requests": list(requests),
+                    "errors": errors, "steps": steps, "current_url": "",
+                    "current_path": "", "candidate_urls": [], "candidate_params": [],
                 }
 
             steps += 1
@@ -454,28 +526,19 @@ async def _discover_with_playwright_async(
                 found = _add_found(found, current_path, query_params)
 
                 observation = await _extract_page_observations(page)
-                raw_urls = list(observation.get("urls", []))
                 raw_params = list(observation.get("params", []))
                 candidate_params = raw_params
                 found = _add_found(found, current_path, raw_params)
 
-                for raw in raw_urls:
+                for raw in observation.get("urls", []):
                     normalized = _canonicalize_url(raw, base_url=base_url)
                     if normalized:
                         candidate_urls.append(normalized)
 
-                seed_cap = max(config.web.max_pages * 6, 64)
-                for url in candidate_urls[:8]:
-                    if url in seen or url in visited:
-                        continue
-                    if len(seen) >= seed_cap:
-                        break
-                    seen.append(url)
-                    queue.append(url)
+                _seed_urls_into_queue(candidate_urls, seen, visited, queue, max(config.web.max_pages * 6, 64))
                 pages.append(
                     {
-                        "url": canonical_current,
-                        "path": current_path,
+                        "url": canonical_current, "path": current_path,
                         "summary": str(observation.get("summary", "")).strip(),
                         "title": str(observation.get("title", "")).strip(),
                         "headings": list(observation.get("headings", []))[:12],
@@ -491,17 +554,10 @@ async def _discover_with_playwright_async(
                 visited.append(canonical_current)
 
             return {
-                "queue": queue,
-                "seen": seen,
-                "visited": visited,
-                "found": found,
-                "pages": pages,
-                "requests": list(requests),
-                "errors": errors,
-                "steps": steps,
-                "current_url": canonical_current,
-                "current_path": current_path,
-                "candidate_urls": candidate_urls,
+                "queue": queue, "seen": seen, "visited": visited,
+                "found": found, "pages": pages, "requests": list(requests),
+                "errors": errors, "steps": steps, "current_url": canonical_current,
+                "current_path": current_path, "candidate_urls": candidate_urls,
                 "candidate_params": candidate_params,
             }
 
@@ -513,8 +569,6 @@ async def _discover_with_playwright_async(
 
             current_url = str(state.get("current_url", "")).strip()
             current_path = str(state.get("current_path", "")).strip() or "/"
-            candidate_urls = list(state.get("candidate_urls", []))
-            candidate_params = list(state.get("candidate_params", []))
 
             remaining = max(0, config.web.max_pages - len(visited))
             if not current_url or remaining <= 0:
@@ -524,42 +578,27 @@ async def _discover_with_playwright_async(
                 config,
                 current_url=current_url,
                 visited_urls=visited,
-                candidate_urls=candidate_urls,
-                candidate_params=candidate_params,
+                candidate_urls=list(state.get("candidate_urls", [])),
+                candidate_params=list(state.get("candidate_params", [])),
                 remaining_budget=remaining,
             )
 
             found = _add_found(found, current_path, llm_params)
-
-            queue_cap = max(config.web.max_pages * 8, 96)
-            for raw in llm_urls:
-                normalized = _canonicalize_url(raw, base_url=base_url)
-                if not normalized or normalized in seen or normalized in visited:
-                    continue
-                if len(seen) >= queue_cap:
-                    break
-                seen.append(normalized)
-                queue.append(normalized)
+            _enqueue_llm_urls(llm_urls, base_url, seen, visited, queue, max(config.web.max_pages * 8, 96))
 
             return {
-                "queue": queue,
-                "seen": seen,
-                "visited": visited,
-                "found": found,
+                "queue": queue, "seen": seen, "visited": visited, "found": found,
                 "pages": list(state.get("pages", [])),
                 "requests": list(requests),
                 "errors": list(state.get("errors", [])),
             }
 
         def _route_continue(state: _WebState) -> str:
-            steps = int(state.get("steps", 0))
-            visited = list(state.get("visited", []))
-            queue = list(state.get("queue", []))
-            if steps >= config.web.max_actions:
+            if int(state.get("steps", 0)) >= config.web.max_actions:
                 return "done"
-            if len(visited) >= config.web.max_pages:
+            if len(state.get("visited", [])) >= config.web.max_pages:
                 return "done"
-            if not queue:
+            if not state.get("queue"):
                 return "done"
             return "again"
 
@@ -573,14 +612,8 @@ async def _discover_with_playwright_async(
         graph = builder.compile()
         result = await graph.ainvoke(
             {
-                "queue": initial_queue,
-                "seen": initial_seen,
-                "visited": [],
-                "found": {},
-                "pages": [],
-                "requests": [],
-                "errors": [],
-                "steps": 0,
+                "queue": initial_queue, "seen": initial_seen, "visited": [],
+                "found": {}, "pages": [], "requests": [], "errors": [], "steps": 0,
             }
         )
 
@@ -589,26 +622,10 @@ async def _discover_with_playwright_async(
 
     found = result.get("found") if isinstance(result, dict) else None
     if not isinstance(found, dict):
-        return {"hints": {}, "artifacts": {"seed_urls": initial_queue, "visited_urls": [], "pages": [], "requests": [], "errors": []}}
-    normalized_found: dict[str, list[str]] = {}
-    for path, params in found.items():
-        if not isinstance(path, str):
-            continue
-        if isinstance(params, list):
-            normalized_found[path] = sorted({str(x).strip() for x in params if str(x).strip()})
-        else:
-            normalized_found[path] = []
-    pages = result.get("pages", []) if isinstance(result, dict) else []
-    requests_payload = result.get("requests", []) if isinstance(result, dict) else []
-    errors = result.get("errors", []) if isinstance(result, dict) else []
-    visited_urls = result.get("visited", []) if isinstance(result, dict) else []
-    artifacts = {
-        "seed_urls": initial_queue,
-        "visited_urls": [str(x).strip() for x in visited_urls if isinstance(x, str) and str(x).strip()],
-        "pages": [item for item in pages if isinstance(item, dict)],
-        "requests": [item for item in requests_payload if isinstance(item, dict)][:200],
-        "errors": [str(x).strip() for x in errors if isinstance(x, str) and str(x).strip()],
-    }
+        return _empty_discovery_result(initial_queue)
+
+    normalized_found = _normalize_found_results(found)
+    artifacts = _build_discovery_artifacts(result, initial_queue)
     return {"hints": normalized_found, "artifacts": artifacts}
 
 
@@ -635,17 +652,79 @@ def _selector_for_name(name: str) -> str:
     return f'input[name="{esc}"]'
 
 
-async def _auth_with_playwright_async(config: PadvConfig) -> dict[str, Any]:
-    from playwright.async_api import async_playwright  # type: ignore[import-not-found]
-
-    if not config.auth.enabled:
-        return {"cookies": {}, "auth_enabled": False}
+def _validate_auth_config(config: PadvConfig) -> None:
     if not config.auth.login_url:
         raise RuntimeError("auth.enabled=true but auth.login_url is empty")
     if not config.auth.username:
         raise RuntimeError("auth.enabled=true but auth.username is empty")
     if not config.auth.password:
         raise RuntimeError("auth.enabled=true but auth.password is empty")
+
+
+def _collect_form_input_candidates(form_meta: Any) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    if not isinstance(form_meta, list):
+        return candidates
+    for form in form_meta:
+        if not isinstance(form, dict):
+            continue
+        for inp in form.get("inputs", []):
+            if isinstance(inp, dict):
+                candidates.append(inp)
+    return candidates
+
+
+def _heuristic_selectors_from_inputs(
+    input_candidates: list[dict[str, Any]],
+) -> tuple[str, str]:
+    username_selector = ""
+    password_selector = ""
+    for inp in input_candidates:
+        name = str(inp.get("name", "")).strip()
+        inp_type = str(inp.get("type", "")).strip().lower()
+        if not password_selector and inp_type == "password" and name:
+            password_selector = _selector_for_name(name)
+        if not username_selector and name and re.search(r"user|login|email|name", name, re.IGNORECASE):
+            username_selector = _selector_for_name(name)
+    return username_selector, password_selector
+
+
+async def _resolve_login_selectors(
+    config: PadvConfig,
+    form_meta: Any,
+    input_candidates: list[dict[str, Any]],
+) -> tuple[str, str, str]:
+    username_selector, password_selector = _heuristic_selectors_from_inputs(input_candidates)
+    llm_u, llm_p, llm_s = await _llm_select_login_selectors(config, form_meta)
+    if llm_u:
+        username_selector = llm_u
+    if llm_p:
+        password_selector = llm_p
+    submit_selector = llm_s or ""
+    if not password_selector:
+        password_selector = "input[type='password']"
+    if not username_selector:
+        username_selector = "input[type='email'], input[type='text']"
+    return username_selector, password_selector, submit_selector
+
+
+async def _submit_login_form(page: Any, submit_selector: str) -> None:
+    if submit_selector:
+        await page.click(submit_selector)
+        return
+    submit = page.locator("form button[type='submit'], form input[type='submit']").first
+    if await submit.count() > 0:
+        await submit.click()
+    else:
+        await page.keyboard.press("Enter")
+
+
+async def _auth_with_playwright_async(config: PadvConfig) -> dict[str, Any]:
+    from playwright.async_api import async_playwright  # type: ignore[import-not-found]
+
+    if not config.auth.enabled:
+        return {"cookies": {}, "auth_enabled": False}
+    _validate_auth_config(config)
 
     timeout_ms = max(1, int(config.web.request_timeout_seconds)) * 1000
 
@@ -682,51 +761,14 @@ async def _auth_with_playwright_async(config: PadvConfig) -> dict[str, Any]:
             """
         )
 
-        username_selector = ""
-        password_selector = ""
-        submit_selector = ""
-
-        candidates = []
-        if isinstance(form_meta, list):
-            for form in form_meta:
-                if not isinstance(form, dict):
-                    continue
-                for inp in form.get("inputs", []):
-                    if isinstance(inp, dict):
-                        candidates.append(inp)
-
-        for inp in candidates:
-            name = str(inp.get("name", "")).strip()
-            inp_type = str(inp.get("type", "")).strip().lower()
-            if not password_selector and inp_type == "password" and name:
-                password_selector = _selector_for_name(name)
-            if not username_selector and name and re.search(r"user|login|email|name", name, re.IGNORECASE):
-                username_selector = _selector_for_name(name)
-
-        llm_u, llm_p, llm_s = await _llm_select_login_selectors(config, form_meta)
-        if llm_u:
-            username_selector = llm_u
-        if llm_p:
-            password_selector = llm_p
-        if llm_s:
-            submit_selector = llm_s
-
-        if not password_selector:
-            password_selector = "input[type='password']"
-        if not username_selector:
-            username_selector = "input[type='email'], input[type='text']"
+        input_candidates = _collect_form_input_candidates(form_meta)
+        username_selector, password_selector, submit_selector = await _resolve_login_selectors(
+            config, form_meta, input_candidates,
+        )
 
         await page.fill(username_selector, config.auth.username)
         await page.fill(password_selector, config.auth.password)
-
-        if submit_selector:
-            await page.click(submit_selector)
-        else:
-            submit = page.locator("form button[type='submit'], form input[type='submit']").first
-            if await submit.count() > 0:
-                await submit.click()
-            else:
-                await page.keyboard.press("Enter")
+        await _submit_login_form(page, submit_selector)
 
         try:
             await page.wait_for_load_state("networkidle", timeout=timeout_ms)

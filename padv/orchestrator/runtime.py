@@ -1041,7 +1041,6 @@ def validate_candidates_runtime(
         gate_result = evaluate_candidate(
             config=config,
             candidate=candidate,
-            plan=plan,
             static_evidence=candidate_static,
             positive_runs=positive_runs,
             negative_runs=negative_runs,
@@ -1051,7 +1050,6 @@ def validate_candidates_runtime(
             evidence_signals=evidence_signals,
             vuln_class=candidate.vuln_class,
             differential_pairs=differential_pairs,
-            environment_facts=environment_facts,
         )
         decisions[gate_result.decision] = decisions.get(gate_result.decision, 0) + 1
 

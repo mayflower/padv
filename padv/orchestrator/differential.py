@@ -87,50 +87,61 @@ def _extract_lower_privilege(auth_state: dict[str, Any] | None) -> dict[str, Any
     return {}
 
 
+def _strip_auth_headers(request: dict[str, Any]) -> None:
+    headers = request.get("headers")
+    if not isinstance(headers, dict):
+        return
+    request["headers"] = {
+        str(key): value
+        for key, value in headers.items()
+        if str(key).casefold() != "authorization"
+    }
+
+
+def _strip_auth_cookies(request: dict[str, Any], auth_state: dict[str, Any] | None) -> None:
+    cookies = request.get("cookies")
+    if not isinstance(cookies, dict):
+        return
+    cookie_names = _auth_cookie_names(auth_state)
+    stripped: dict[str, Any] = {}
+    for key, value in cookies.items():
+        norm = str(key).casefold()
+        if norm in cookie_names:
+            continue
+        if any(hint in norm for hint in _AUTH_COOKIE_HINTS):
+            continue
+        stripped[str(key)] = value
+    request["cookies"] = stripped
+
+
+def _apply_lower_privilege(request: dict[str, Any], auth_state: dict[str, Any] | None) -> None:
+    lower_priv = _extract_lower_privilege(auth_state)
+    if not lower_priv:
+        return
+
+    lower_headers = lower_priv.get("headers")
+    if isinstance(lower_headers, dict):
+        current = request.get("headers")
+        merged = dict(current) if isinstance(current, dict) else {}
+        merged.update({str(k): v for k, v in lower_headers.items()})
+        request["headers"] = merged
+
+    lower_cookies = lower_priv.get("cookies")
+    if isinstance(lower_cookies, dict):
+        current = request.get("cookies")
+        merged = dict(current) if isinstance(current, dict) else {}
+        merged.update({str(k): v for k, v in lower_cookies.items()})
+        request["cookies"] = merged
+
+
 def build_unprivileged_request(
     privileged_request: dict[str, Any],
     auth_state: dict[str, Any] | None,
 ) -> dict[str, Any]:
     request = deepcopy(privileged_request)
-
-    headers = request.get("headers")
-    if isinstance(headers, dict):
-        stripped_headers: dict[str, Any] = {}
-        for key, value in headers.items():
-            if str(key).casefold() == "authorization":
-                continue
-            stripped_headers[str(key)] = value
-        request["headers"] = stripped_headers
-
-    cookie_names = _auth_cookie_names(auth_state)
-    cookies = request.get("cookies")
-    if isinstance(cookies, dict):
-        stripped_cookies: dict[str, Any] = {}
-        for key, value in cookies.items():
-            norm = str(key).casefold()
-            if norm in cookie_names:
-                continue
-            if any(hint in norm for hint in _AUTH_COOKIE_HINTS):
-                continue
-            stripped_cookies[str(key)] = value
-        request["cookies"] = stripped_cookies
-
-    lower_priv = _extract_lower_privilege(auth_state)
-    if lower_priv:
-        lower_headers = lower_priv.get("headers")
-        if isinstance(lower_headers, dict):
-            current = request.get("headers")
-            merged = dict(current) if isinstance(current, dict) else {}
-            merged.update({str(k): v for k, v in lower_headers.items()})
-            request["headers"] = merged
-
-        lower_cookies = lower_priv.get("cookies")
-        if isinstance(lower_cookies, dict):
-            current = request.get("cookies")
-            merged = dict(current) if isinstance(current, dict) else {}
-            merged.update({str(k): v for k, v in lower_cookies.items()})
-            request["cookies"] = merged
-
+    _strip_auth_headers(request)
+    _strip_auth_cookies(request, auth_state)
+    _apply_lower_privilege(request, auth_state)
     return request
 
 

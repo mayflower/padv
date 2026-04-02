@@ -2135,7 +2135,6 @@ def test_skeptic_subagent_accepts_single_turn_when_requirements_are_met(
         runtime,
         config,
         hypotheses=[_hypothesis()],
-        frontier_state={},
     )
 
     assert calls["count"] == 1
@@ -2164,7 +2163,6 @@ def test_skeptic_subagent_falls_back_on_agent_timeout(
         runtime,
         config,
         hypotheses=[hypothesis],
-        frontier_state={},
     )
 
     assert refutations == []
@@ -2205,7 +2203,6 @@ def test_skeptic_subagent_limits_scope_to_top_three_hypotheses(
         runtime,
         config,
         hypotheses=hypotheses,
-        frontier_state={"iteration": 5, "history": ["unused"]},
     )
 
     assert refutations == []
@@ -2241,7 +2238,6 @@ def test_skeptic_subagent_deprioritizes_environmental_preconditions_in_handoff(
         runtime,
         config,
         hypotheses=[hypothesis],
-        frontier_state={},
     )
 
     assert refutations == []
@@ -2289,7 +2285,6 @@ def test_skeptic_subagent_filters_environmental_refutations(
         runtime,
         config,
         hypotheses=[_hypothesis()],
-        frontier_state={},
     )
 
     assert [item.refutation_id for item in refutations] == ["ref-real"]
@@ -2351,7 +2346,6 @@ def test_experiment_subagent_accepts_single_turn_when_requirements_are_met(
         runtime,
         config,
         hypotheses=[_hypothesis()],
-        frontier_state={},
     )
 
     assert calls["count"] == 1
@@ -2401,7 +2395,6 @@ def test_experiment_subagent_limits_scope_to_top_three_hypotheses(
             runtime,
             config,
             hypotheses=hypotheses,
-            frontier_state={"iteration": 7, "history": ["unused"]},
         )
 
     assert len(envelopes) == 1
@@ -2449,7 +2442,6 @@ def test_experiment_subagent_accepts_single_plan_object(
         runtime,
         config,
         hypotheses=[hypothesis],
-        frontier_state={},
     )
 
     assert sorted(plans.keys()) == [hypothesis.candidate.candidate_id]
@@ -2507,7 +2499,6 @@ def test_experiment_subagent_falls_back_to_batch_planner(
         runtime,
         config,
         hypotheses=[hypothesis],
-        frontier_state={},
     )
 
     assert sorted(plans.keys()) == [hypothesis.candidate.candidate_id]

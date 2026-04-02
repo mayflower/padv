@@ -64,14 +64,9 @@ def _merge_candidate_fields(target: Candidate, incoming: Candidate) -> None:
         target.notes = f"{target.notes}; {incoming.notes}".strip("; ")
 
 
-def fuse_candidates_with_meta(
+def _merge_candidates_by_key(
     candidates: list[Candidate],
-    static_evidence: list[StaticEvidence],
-    config: PadvConfig,
-) -> tuple[list[Candidate], list[StaticEvidence], FusionMeta]:
-    if not candidates:
-        return [], [], FusionMeta(0, 0, 0, 0, {})
-
+) -> tuple[dict[str, tuple[str, str, int]], dict[tuple[str, str, int], Candidate], int]:
     key_by_old_id: dict[str, tuple[str, str, int]] = {}
     merged: dict[tuple[str, str, int], Candidate] = {}
     dropped_nonsemantic = 0
@@ -86,7 +81,13 @@ def fuse_candidates_with_meta(
             merged[key] = replace(cand)
             continue
         _merge_candidate_fields(current, cand)
+    return key_by_old_id, merged, dropped_nonsemantic
 
+
+def _assign_ids_and_boost(
+    merged: dict[tuple[str, str, int], Candidate],
+    max_candidates: int,
+) -> tuple[list[Candidate], dict[tuple[str, str, int], str], int]:
     merged_list = sorted(
         merged.items(),
         key=lambda item: (
@@ -96,8 +97,7 @@ def fuse_candidates_with_meta(
             item[1].line,
             item[1].vuln_class,
         ),
-    )
-    merged_list = merged_list[: config.budgets.max_candidates]
+    )[:max_candidates]
 
     new_candidates: list[Candidate] = []
     remap: dict[tuple[str, str, int], str] = {}
@@ -112,7 +112,14 @@ def fuse_candidates_with_meta(
             if "multi-signal-semantic" not in cand.notes:
                 cand.notes = f"{cand.notes}; multi-signal-semantic".strip("; ")
         new_candidates.append(cand)
+    return new_candidates, remap, dual_signal_candidates
 
+
+def _remap_static_evidence(
+    static_evidence: list[StaticEvidence],
+    key_by_old_id: dict[str, tuple[str, str, int]],
+    remap: dict[tuple[str, str, int], str],
+) -> list[StaticEvidence]:
     new_static: list[StaticEvidence] = []
     seen_hashes: set[tuple[str, str]] = set()
     for item in static_evidence:
@@ -137,7 +144,13 @@ def fuse_candidates_with_meta(
                 hash=item.hash,
             )
         )
+    return new_static
 
+
+def _build_evidence_graph(
+    new_candidates: list[Candidate],
+    new_static: list[StaticEvidence],
+) -> dict[str, dict[str, object]]:
     static_refs: dict[str, list[str]] = {}
     for item in new_static:
         static_refs.setdefault(item.candidate_id, []).append(item.query_id)
@@ -153,6 +166,21 @@ def fuse_candidates_with_meta(
             "static_query_ids": sorted(static_refs.get(cand.candidate_id, [])),
             "has_dual_signal": len(semantic) >= 2,
         }
+    return evidence_graph
+
+
+def fuse_candidates_with_meta(
+    candidates: list[Candidate],
+    static_evidence: list[StaticEvidence],
+    config: PadvConfig,
+) -> tuple[list[Candidate], list[StaticEvidence], FusionMeta]:
+    if not candidates:
+        return [], [], FusionMeta(0, 0, 0, 0, {})
+
+    key_by_old_id, merged, dropped_nonsemantic = _merge_candidates_by_key(candidates)
+    new_candidates, remap, dual_signal_candidates = _assign_ids_and_boost(merged, config.budgets.max_candidates)
+    new_static = _remap_static_evidence(static_evidence, key_by_old_id, remap)
+    evidence_graph = _build_evidence_graph(new_candidates, new_static)
 
     meta = FusionMeta(
         input_candidates=len(candidates),

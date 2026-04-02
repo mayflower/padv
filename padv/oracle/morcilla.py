@@ -25,7 +25,7 @@ def build_request_headers(
     intercepts: list[str],
     correlation_id: str,
 ) -> MorcillaRequestHeaders:
-    intercept_value = ", ".join(sorted(set(i for i in intercepts if i)))
+    intercept_value = ", ".join(sorted({i for i in intercepts if i}))
     return MorcillaRequestHeaders(
         key_header=f"{oracle.request_key_header}: {oracle.api_key}",
         intercept_header=f"{oracle.request_intercept_header}: {intercept_value}",

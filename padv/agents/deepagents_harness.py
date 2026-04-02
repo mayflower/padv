@@ -42,7 +42,7 @@ except Exception:  # pragma: no cover - optional at import time
 
 
 _JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
-_JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL | re.IGNORECASE)
+_JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(\{[^\}]*\})\s*```", re.DOTALL | re.IGNORECASE)
 _SEMANTIC_SIGNALS = frozenset({"joern", "scip"})
 _TRIAGE_FIELDS = (
     "reproducibility_gap",
@@ -187,105 +187,143 @@ def _default_rank(candidates: list[Candidate], mode: str) -> list[Candidate]:
     return runtime_first
 
 
+def _extract_text_from_message(msg: Any) -> str:
+    """Return the first non-empty text from a single message object."""
+    content = getattr(msg, "content", None)
+    if isinstance(content, str) and content.strip():
+        return content
+    if not isinstance(msg, dict):
+        return ""
+    raw = msg.get("content")
+    if isinstance(raw, str) and raw.strip():
+        return raw
+    if isinstance(raw, list):
+        chunks = [part.get("text", "") for part in raw if isinstance(part, dict)]
+        joined = "\n".join(x for x in chunks if x)
+        if joined.strip():
+            return joined
+    return ""
+
+
 def _extract_text(result: dict[str, Any]) -> str:
     messages = result.get("messages")
     if not isinstance(messages, list):
         return ""
     for msg in reversed(messages):
-        content = getattr(msg, "content", None)
-        if isinstance(content, str) and content.strip():
-            return content
-        if isinstance(msg, dict):
-            raw = msg.get("content")
-            if isinstance(raw, str) and raw.strip():
-                return raw
-            if isinstance(raw, list):
-                chunks = [part.get("text", "") for part in raw if isinstance(part, dict)]
-                joined = "\n".join(x for x in chunks if x)
-                if joined.strip():
-                    return joined
+        text = _extract_text_from_message(msg)
+        if text:
+            return text
     return ""
 
 
-def _extract_json(text: str) -> dict[str, Any] | None:
-    def _repair_json_like_string(payload: str) -> str:
-        out: list[str] = []
-        in_string = False
-        i = 0
-        while i < len(payload):
-            char = payload[i]
-            if char == '"':
-                escaped = 0
-                j = i - 1
-                while j >= 0 and payload[j] == "\\":
-                    escaped += 1
-                    j -= 1
-                if escaped % 2 == 0:
-                    in_string = not in_string
-                out.append(char)
-                i += 1
-                continue
-            if in_string and char == "\\" and i + 1 < len(payload):
-                nxt = payload[i + 1]
-                if nxt in '"\\/bfnrtu':
-                    out.append(char)
-                    out.append(nxt)
-                    i += 2
-                    continue
-                if nxt == "'":
-                    out.append("'")
-                    i += 2
-                    continue
-                out.append("\\\\")
-                out.append(nxt)
-                i += 2
-                continue
+def _count_trailing_backslashes(payload: str, pos: int) -> int:
+    """Count consecutive backslashes immediately before *pos* in *payload*."""
+    count = 0
+    j = pos - 1
+    while j >= 0 and payload[j] == "\\":
+        count += 1
+        j -= 1
+    return count
+
+
+def _repair_json_escape_at(payload: str, i: int, out: list[str]) -> int:
+    """Handle a backslash-escape inside a JSON string, returning the new index."""
+    nxt = payload[i + 1]
+    if nxt in '"\\/bfnrtu':
+        out.append("\\")
+        out.append(nxt)
+        return i + 2
+    if nxt == "'":
+        out.append("'")
+        return i + 2
+    out.append("\\\\")
+    out.append(nxt)
+    return i + 2
+
+
+def _repair_json_like_string(payload: str) -> str:
+    """Fix non-standard escape sequences in a JSON-like string from LLM output."""
+    out: list[str] = []
+    in_string = False
+    i = 0
+    while i < len(payload):
+        char = payload[i]
+        if char == '"':
+            if _count_trailing_backslashes(payload, i) % 2 == 0:
+                in_string = not in_string
             out.append(char)
             i += 1
-        return "".join(out)
+            continue
+        if in_string and char == "\\" and i + 1 < len(payload):
+            i = _repair_json_escape_at(payload, i, out)
+            continue
+        out.append(char)
+        i += 1
+    return "".join(out)
 
-    def _attempt_parse(candidate: str) -> dict[str, Any] | None:
-        payload = str(candidate or "").strip()
-        if not payload:
-            return None
-        try:
-            data = json.loads(payload)
-            if isinstance(data, dict):
-                return data
-        except json.JSONDecodeError:
-            pass
 
-        # LLMs often emit JSON-looking payloads with markdown fences and
-        # non-JSON escapes like \' inside otherwise valid JSON strings.
-        repaired = _repair_json_like_string(payload)
-        if repaired != payload:
-            try:
-                data = json.loads(repaired)
-                if isinstance(data, dict):
-                    return data
-            except json.JSONDecodeError:
-                pass
+def _try_json_loads_as_dict(payload: str) -> dict[str, Any] | None:
+    """Try to parse *payload* as JSON; return the dict or ``None``."""
+    try:
+        data = json.loads(payload)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
 
-        decoder = json.JSONDecoder()
-        for idx, char in enumerate(payload):
-            if char != "{":
-                continue
-            for source in (payload[idx:], repaired[idx:] if repaired != payload else None):
-                if not source:
-                    continue
-                try:
-                    data, _end = decoder.raw_decode(source)
-                except json.JSONDecodeError:
-                    continue
-                if isinstance(data, dict):
-                    return data
+
+def _try_raw_decode_dict(decoder: json.JSONDecoder, source: str) -> dict[str, Any] | None:
+    """Attempt ``raw_decode`` on *source* and return the dict or ``None``."""
+    try:
+        data, _end = decoder.raw_decode(source)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _attempt_json_parse(candidate: str) -> dict[str, Any] | None:
+    """Try multiple strategies to extract a JSON dict from *candidate*."""
+    payload = str(candidate or "").strip()
+    if not payload:
         return None
 
+    result = _try_json_loads_as_dict(payload)
+    if result is not None:
+        return result
+
+    # LLMs often emit JSON-looking payloads with markdown fences and
+    # non-JSON escapes like \' inside otherwise valid JSON strings.
+    repaired = _repair_json_like_string(payload)
+    if repaired != payload:
+        result = _try_json_loads_as_dict(repaired)
+        if result is not None:
+            return result
+
+    return _scan_for_json_object(payload, repaired)
+
+
+def _scan_for_json_object(payload: str, repaired: str) -> dict[str, Any] | None:
+    """Walk *payload* looking for the first ``{`` that decodes to a dict."""
+    decoder = json.JSONDecoder()
+    sources_differ = repaired != payload
+    for idx, char in enumerate(payload):
+        if char != "{":
+            continue
+        result = _try_raw_decode_dict(decoder, payload[idx:])
+        if result is not None:
+            return result
+        if sources_differ:
+            result = _try_raw_decode_dict(decoder, repaired[idx:])
+            if result is not None:
+                return result
+    return None
+
+
+def _extract_json(text: str) -> dict[str, Any] | None:
     body = str(text or "").strip()
     if not body:
         return None
     for candidate in [body, *[match.group(1) for match in _JSON_FENCE_RE.finditer(body)]]:
-        data = _attempt_parse(candidate)
+        data = _attempt_json_parse(candidate)
         if isinstance(data, dict):
             return data
     return None
@@ -293,7 +331,7 @@ def _extract_json(text: str) -> dict[str, Any] | None:
 
 def _normalize_triage_entry(raw: Any) -> dict[str, str]:
     if not isinstance(raw, dict):
-        return {field: "" for field in _TRIAGE_FIELDS}
+        return dict.fromkeys(_TRIAGE_FIELDS, "")
     normalized: dict[str, str] = {}
     for field in _TRIAGE_FIELDS:
         value = raw.get(field, "")
@@ -302,24 +340,34 @@ def _normalize_triage_entry(raw: Any) -> dict[str, str]:
     return normalized
 
 
-def _normalize_triage_by_candidate(raw: Any, candidate_ids: set[str]) -> dict[str, dict[str, str]]:
+def _normalize_triage_from_dict(raw: dict[str, Any], candidate_ids: set[str]) -> dict[str, dict[str, str]]:
     out: dict[str, dict[str, str]] = {}
-    if isinstance(raw, dict):
-        for candidate_id, entry in raw.items():
-            cid = str(candidate_id).strip()
-            if not cid or cid not in candidate_ids:
-                continue
-            out[cid] = _normalize_triage_entry(entry)
-        return out
-    if isinstance(raw, list):
-        for entry in raw:
-            if not isinstance(entry, dict):
-                continue
-            cid = str(entry.get("candidate_id", "")).strip()
-            if not cid or cid not in candidate_ids:
-                continue
-            out[cid] = _normalize_triage_entry(entry)
+    for candidate_id, entry in raw.items():
+        cid = str(candidate_id).strip()
+        if not cid or cid not in candidate_ids:
+            continue
+        out[cid] = _normalize_triage_entry(entry)
     return out
+
+
+def _normalize_triage_from_list(raw: list[Any], candidate_ids: set[str]) -> dict[str, dict[str, str]]:
+    out: dict[str, dict[str, str]] = {}
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        cid = str(entry.get("candidate_id", "")).strip()
+        if not cid or cid not in candidate_ids:
+            continue
+        out[cid] = _normalize_triage_entry(entry)
+    return out
+
+
+def _normalize_triage_by_candidate(raw: Any, candidate_ids: set[str]) -> dict[str, dict[str, str]]:
+    if isinstance(raw, dict):
+        return _normalize_triage_from_dict(raw, candidate_ids)
+    if isinstance(raw, list):
+        return _normalize_triage_from_list(raw, candidate_ids)
+    return {}
 
 
 def _build_filesystem_tools(repo_root: str) -> list[Any]:
@@ -614,6 +662,22 @@ def _ensure_handoff_cache_db(db_path: Path) -> None:
         conn.commit()
 
 
+_CACHE_KEY_SKIP_KEYS = frozenset({"agent_threads", "__lock__", "thread_id", "updated_at", "created_at"})
+
+
+def _normalize_cache_value(value: Any) -> Any:
+    """Recursively strip volatile keys from a value for stable cache hashing."""
+    if isinstance(value, dict):
+        return {
+            key: _normalize_cache_value(item)
+            for key, item in value.items()
+            if key not in _CACHE_KEY_SKIP_KEYS
+        }
+    if isinstance(value, list):
+        return [_normalize_cache_value(item) for item in value]
+    return value
+
+
 def _handoff_cache_key(
     session: AgentSession,
     *,
@@ -623,20 +687,6 @@ def _handoff_cache_key(
     workspace_role: str,
     delegated_role: str | None,
 ) -> str:
-    def _normalize_cache_value(value: Any) -> Any:
-        if isinstance(value, dict):
-            normalized: dict[str, Any] = {}
-            for key, item in value.items():
-                if key in {"agent_threads", "__lock__"}:
-                    continue
-                if key in {"thread_id", "updated_at", "created_at"}:
-                    continue
-                normalized[key] = _normalize_cache_value(item)
-            return normalized
-        if isinstance(value, list):
-            return [_normalize_cache_value(item) for item in value]
-        return value
-
     payload = {
         "role": session.role,
         "model": session.model,
@@ -789,61 +839,87 @@ def _research_context_delta(shared_context: dict[str, Any], *, role: str) -> dic
     }
 
 
+def _merge_workspace_index_category_refs(target_refs: list[str], refs: list[Any]) -> None:
+    """Append unique non-empty string refs from *refs* into *target_refs*."""
+    for ref in refs:
+        text = str(ref).strip()
+        if text and text not in target_refs:
+            target_refs.append(text)
+
+
+def _merge_workspace_index_role(role_index: dict[str, Any], categories: dict[str, Any]) -> None:
+    """Merge category-level ref lists from *categories* into *role_index*."""
+    for category, refs in categories.items():
+        if not isinstance(refs, list):
+            continue
+        role_index.setdefault(category, [])
+        target_refs = role_index.get(category)
+        if not isinstance(target_refs, list):
+            continue
+        _merge_workspace_index_category_refs(target_refs, refs)
+
+
+def _merge_workspace_index_delta(context: dict[str, Any], workspace_index_delta: dict[str, Any]) -> None:
+    """Merge *workspace_index_delta* into *context*'s workspace_index."""
+    workspace_index = context.setdefault("workspace_index", {})
+    if not isinstance(workspace_index, dict):
+        return
+    for role, categories in workspace_index_delta.items():
+        if not isinstance(categories, dict):
+            continue
+        workspace_index.setdefault(role, {})
+        role_index = workspace_index.get(role)
+        if not isinstance(role_index, dict):
+            continue
+        _merge_workspace_index_role(role_index, categories)
+
+
+def _merge_keyed_entries_delta(context: dict[str, Any], key: str, key_delta: dict[str, Any]) -> None:
+    """Merge tool_usage or worklog delta entries into *context[key]*, deduplicating by ref."""
+    target = context.setdefault(key, {})
+    if not isinstance(target, dict):
+        return
+    for role, entries in key_delta.items():
+        if not isinstance(entries, list):
+            continue
+        target.setdefault(role, [])
+        dest = target.get(role)
+        if not isinstance(dest, list):
+            continue
+        _append_deduplicated_entries(dest, entries)
+
+
+def _append_deduplicated_entries(dest: list[dict[str, Any]], entries: list[Any]) -> None:
+    """Append entries to *dest*, skipping duplicates by ref."""
+    seen_refs: set[str] = {
+        str(item.get("ref", "")).strip()
+        for item in dest
+        if isinstance(item, dict)
+    }
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        ref = str(entry.get("ref", "")).strip()
+        if ref and ref in seen_refs:
+            continue
+        dest.append(entry)
+        if ref:
+            seen_refs.add(ref)
+
+
 def merge_agent_runtime_context_delta(runtime: AgentRuntime, delta: dict[str, Any]) -> None:
     if not isinstance(delta, dict) or not delta:
         return
     with _shared_context_lock(runtime.shared_context):
         workspace_index_delta = delta.get("workspace_index", {})
         if isinstance(workspace_index_delta, dict):
-            workspace_index = runtime.shared_context.setdefault("workspace_index", {})
-            if isinstance(workspace_index, dict):
-                for role, categories in workspace_index_delta.items():
-                    if not isinstance(categories, dict):
-                        continue
-                    workspace_index.setdefault(role, {})
-                    role_index = workspace_index.get(role)
-                    if not isinstance(role_index, dict):
-                        continue
-                    for category, refs in categories.items():
-                        if not isinstance(refs, list):
-                            continue
-                        role_index.setdefault(category, [])
-                        target_refs = role_index.get(category)
-                        if not isinstance(target_refs, list):
-                            continue
-                        for ref in refs:
-                            text = str(ref).strip()
-                            if text and text not in target_refs:
-                                target_refs.append(text)
+            _merge_workspace_index_delta(runtime.shared_context, workspace_index_delta)
 
         for key in ("tool_usage", "worklog"):
             key_delta = delta.get(key, {})
             if not isinstance(key_delta, dict):
                 continue
-            target = runtime.shared_context.setdefault(key, {})
-            if not isinstance(target, dict):
-                continue
-            for role, entries in key_delta.items():
-                if not isinstance(entries, list):
-                    continue
-                target.setdefault(role, [])
-                dest = target.get(role)
-                if not isinstance(dest, list):
-                    continue
-                seen_refs = {
-                    str(item.get("ref", "")).strip()
-                    for item in dest
-                    if isinstance(item, dict)
-                }
-                for entry in entries:
-                    if not isinstance(entry, dict):
-                        continue
-                    ref = str(entry.get("ref", "")).strip()
-                    if ref and ref in seen_refs:
-                        continue
-                    dest.append(entry)
-                    if ref:
-                        seen_refs.add(ref)
+            _merge_keyed_entries_delta(runtime.shared_context, key, key_delta)
 
 
 def clone_runtime_for_parallel_role(runtime: AgentRuntime, config: PadvConfig, *, role: str) -> AgentRuntime:
@@ -885,98 +961,76 @@ def finalize_parallel_role_runtime(runtime: AgentRuntime, *, role: str) -> dict[
     return delta
 
 
+def _compact_failed_paths(items: Any, limit: int, max_reason: int) -> list[dict[str, Any]]:
+    """Compact failed path entries to the last *limit* items with truncated reasons."""
+    if not isinstance(items, list):
+        return []
+    compact: list[dict[str, Any]] = []
+    for item in items[-limit:]:
+        if not isinstance(item, dict):
+            continue
+        reason = str(item.get("reason", "")).strip()
+        if len(reason) > max_reason:
+            reason = reason[: max_reason - 3].rstrip() + "..."
+        compact.append(
+            {
+                "path": str(item.get("path", "")).strip(),
+                "iteration": int(item.get("iteration", 0) or 0),
+                "reason": reason,
+            }
+        )
+    return compact
+
+
+def _safe_list_len(state: dict[str, Any], key: str) -> int:
+    """Return the length of *state[key]* if it is a list, else 0."""
+    value = state.get(key, [])
+    return len(value) if isinstance(value, list) else 0
+
+
+def _safe_dict_len(state: dict[str, Any], key: str) -> int:
+    """Return the length of *state[key]* if it is a dict, else 0."""
+    value = state.get(key, {})
+    return len(value) if isinstance(value, dict) else 0
+
+
+def _compact_coverage(raw: Any, tail: int) -> dict[str, list[Any]]:
+    """Extract and tail-truncate coverage sub-keys from *raw*."""
+    if not isinstance(raw, dict):
+        return {"files": [], "classes": [], "signals": [], "sinks": [], "web_paths": []}
+    return {
+        key: list(raw.get(key, []))[-tail:]
+        for key in ("files", "classes", "signals", "sinks", "web_paths")
+    }
+
+
+def _compact_runtime_coverage(raw: Any, tail: int) -> dict[str, list[Any]]:
+    """Extract and tail-truncate runtime_coverage sub-keys from *raw*."""
+    if not isinstance(raw, dict):
+        return {"flags": [], "classes": []}
+    return {
+        key: list(raw.get(key, []))[-tail:]
+        for key in ("flags", "classes")
+    }
+
+
 def _compact_frontier_state(frontier_state: dict[str, Any] | None) -> dict[str, Any]:
     if not isinstance(frontier_state, dict):
         return {}
 
-    def _compact_mapping(records: dict[str, Any], limit: int) -> dict[str, Any]:
-        if not isinstance(records, dict):
-            return {}
-        compact: dict[str, Any] = {}
-        for key in list(records.keys())[:limit]:
-            value = records.get(key)
-            if isinstance(value, dict):
-                compact[str(key)] = {
-                    "candidate_id": str(value.get("candidate_id", "")),
-                    "completed_clean": bool(value.get("completed_clean")),
-                    "last_iteration": int(value.get("last_iteration", 0) or 0),
-                }
-            else:
-                compact[str(key)] = value
-        return compact
-
-    def _compact_events(items: Any, limit: int) -> list[dict[str, Any]]:
-        if not isinstance(items, list):
-            return []
-        compact: list[dict[str, Any]] = []
-        for item in items[-limit:]:
-            if not isinstance(item, dict):
-                continue
-            compact.append(
-                {
-                    "candidate_id": str(item.get("candidate_id", "")),
-                    "vuln_class": str(item.get("vuln_class", "")),
-                    "iteration": int(item.get("iteration", 0) or 0),
-                    "decision": str(item.get("decision", item.get("status", ""))),
-                    "phase": str(item.get("phase", "")),
-                    "score": float(item.get("score", 0.0) or 0.0) if isinstance(item.get("score", 0.0), (int, float)) else 0.0,
-                }
-            )
-        return compact
-
-    def _compact_failed_paths(items: Any, limit: int, max_reason: int) -> list[dict[str, Any]]:
-        if not isinstance(items, list):
-            return []
-        compact: list[dict[str, Any]] = []
-        for item in items[-limit:]:
-            if not isinstance(item, dict):
-                continue
-            reason = str(item.get("reason", "")).strip()
-            if len(reason) > max_reason:
-                reason = reason[: max_reason - 3].rstrip() + "..."
-            compact.append(
-                {
-                    "path": str(item.get("path", "")).strip(),
-                    "iteration": int(item.get("iteration", 0) or 0),
-                    "reason": reason,
-                }
-            )
-        return compact
-
-    coverage = frontier_state.get("coverage", {})
-    runtime_coverage = frontier_state.get("runtime_coverage", {})
     return {
         "version": int(frontier_state.get("version", 0) or 0),
         "updated_at": str(frontier_state.get("updated_at", "")),
         "iteration": int(frontier_state.get("iteration", 0) or 0),
         "stagnation_rounds": int(frontier_state.get("stagnation_rounds", 0) or 0),
-        "failed_paths_count": len(frontier_state.get("failed_paths", []))
-        if isinstance(frontier_state.get("failed_paths", []), list)
-        else 0,
-        "coverage": {
-            "files": list(coverage.get("files", []))[-10:] if isinstance(coverage, dict) else [],
-            "classes": list(coverage.get("classes", []))[-10:] if isinstance(coverage, dict) else [],
-            "signals": list(coverage.get("signals", []))[-10:] if isinstance(coverage, dict) else [],
-            "sinks": list(coverage.get("sinks", []))[-10:] if isinstance(coverage, dict) else [],
-            "web_paths": list(coverage.get("web_paths", []))[-10:] if isinstance(coverage, dict) else [],
-        },
-        "runtime_coverage": {
-            "flags": list(runtime_coverage.get("flags", []))[-10:] if isinstance(runtime_coverage, dict) else [],
-            "classes": list(runtime_coverage.get("classes", []))[-10:] if isinstance(runtime_coverage, dict) else [],
-        },
+        "failed_paths_count": _safe_list_len(frontier_state, "failed_paths"),
+        "coverage": _compact_coverage(frontier_state.get("coverage", {}), 10),
+        "runtime_coverage": _compact_runtime_coverage(frontier_state.get("runtime_coverage", {}), 10),
         "failed_paths": _compact_failed_paths(frontier_state.get("failed_paths", []), 8, 240),
-        "hypotheses_count": len(frontier_state.get("hypotheses", []))
-        if isinstance(frontier_state.get("hypotheses", []), list)
-        else 0,
-        "history_count": len(frontier_state.get("history", []))
-        if isinstance(frontier_state.get("history", []), list)
-        else 0,
-        "attempt_history_count": len(frontier_state.get("attempt_history", []))
-        if isinstance(frontier_state.get("attempt_history", []), list)
-        else 0,
-        "candidate_resume_size": len(frontier_state.get("candidate_resume", {}))
-        if isinstance(frontier_state.get("candidate_resume", {}), dict)
-        else 0,
+        "hypotheses_count": _safe_list_len(frontier_state, "hypotheses"),
+        "history_count": _safe_list_len(frontier_state, "history"),
+        "attempt_history_count": _safe_list_len(frontier_state, "attempt_history"),
+        "candidate_resume_size": _safe_dict_len(frontier_state, "candidate_resume"),
     }
 
 
@@ -1191,6 +1245,100 @@ def _handoff_turn_checklist(category: str, turn: int) -> list[str]:
     return ["review latest context", "use tools before concluding"]
 
 
+def _filter_shared_list_by_selector(
+    items: list[Any],
+    token: str,
+    *,
+    haystack_keys: list[str] | None = None,
+    limit: int = 100,
+) -> list[Any]:
+    """Filter a list of dicts by a case-insensitive substring match."""
+    filtered = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if token:
+            if haystack_keys:
+                haystack = " ".join(str(item.get(k, "")) for k in haystack_keys).lower()
+            else:
+                haystack = json.dumps(item, ensure_ascii=True).lower()
+            if token not in haystack:
+                continue
+        filtered.append(item)
+    return filtered[:limit]
+
+
+def _filter_dict_payload_by_selector(payload: dict[str, Any], token: str) -> dict[str, Any]:
+    """Narrow a dict payload to entries whose JSON or key matches token."""
+    if not token:
+        return payload
+    narrowed: dict[str, Any] = {}
+    for key, value in payload.items():
+        text = json.dumps(value, ensure_ascii=True).lower()
+        if token in text or token in key.lower():
+            narrowed[key] = value
+    return narrowed
+
+
+def _append_bucket_sample(bucket: dict[str, Any], key: str, value: str, limit: int = 5) -> None:
+    """Add value to bucket[key] list if unique and under limit."""
+    if value and value not in bucket[key] and len(bucket[key]) < limit:
+        bucket[key].append(value)
+
+
+def _summarize_evidence_by_class(evidence: list[Any]) -> dict[str, Any]:
+    by_class: dict[str, dict[str, Any]] = {}
+    total = 0
+    for item in evidence:
+        if not isinstance(item, dict):
+            continue
+        total += 1
+        query_id = str(item.get("query_id", "")).strip()
+        vuln_class = query_id.split("::", 1)[-1] if "::" in query_id else query_id or "unknown"
+        bucket = by_class.setdefault(
+            vuln_class,
+            {"count": 0, "query_ids": [], "sample_files": [], "sample_candidate_ids": []},
+        )
+        bucket["count"] += 1
+        _append_bucket_sample(bucket, "query_ids", query_id)
+        _append_bucket_sample(bucket, "sample_files", str(item.get("file_path", "")).strip())
+        _append_bucket_sample(bucket, "sample_candidate_ids", str(item.get("candidate_id", "")).strip())
+    return {"total": total, "classes": {key: by_class[key] for key in sorted(by_class.keys())}, "_class_count": len(by_class)}
+
+
+def _summarize_candidates_by_class(candidates: list[Any]) -> dict[str, Any]:
+    by_class: dict[str, dict[str, Any]] = {}
+    total = 0
+    for item in candidates:
+        if not isinstance(item, dict):
+            continue
+        total += 1
+        vuln_class = str(item.get("vuln_class", "")).strip() or "unknown"
+        bucket = by_class.setdefault(
+            vuln_class,
+            {"count": 0, "sample_candidate_ids": [], "sample_files": [], "sample_sinks": []},
+        )
+        bucket["count"] += 1
+        _append_bucket_sample(bucket, "sample_candidate_ids", str(item.get("candidate_id", "")).strip())
+        _append_bucket_sample(bucket, "sample_files", str(item.get("file_path", "")).strip())
+        _append_bucket_sample(bucket, "sample_sinks", str(item.get("sink", "")).strip())
+    return {"total": total, "classes": {key: by_class[key] for key in sorted(by_class.keys())}, "_class_count": len(by_class)}
+
+
+def _build_tool_use_detail(tool_name: str, **metadata: Any) -> str:
+    detail = f"tool {tool_name}"
+    summary_bits: list[str] = []
+    for key in ("count", "selector", "prefix", "path"):
+        if key not in metadata:
+            continue
+        val = str(metadata[key]).strip() if key != "count" else str(metadata[key])
+        if key == "count" or val:
+            summary_bits.append(f"{key}={val[:80]}")
+    if summary_bits:
+        detail += " | " + ", ".join(summary_bits)
+    return detail
+
+
 def _build_shared_context_tools(shared_context: dict[str, Any], repo_root: str | None, *, role: str) -> list[Any]:
     try:
         from langchain_core.tools import tool  # type: ignore[import-not-found]
@@ -1237,33 +1385,11 @@ def _build_shared_context_tools(shared_context: dict[str, Any], repo_root: str |
         return relative
 
     def _record_tool_use(tool_name: str, **metadata: Any) -> None:
-        payload = {
-            "role": role,
-            "tool": str(tool_name),
-            **metadata,
-        }
+        payload = {"role": role, "tool": str(tool_name), **metadata}
         relative = _write_role_workspace("tool_calls", payload)
         _append_shared_context_entry(shared_context, key="tool_usage", role=role, payload={"ref": relative, **payload})
-        detail = f"tool {tool_name}"
-        summary_bits: list[str] = []
-        if "count" in metadata:
-            summary_bits.append(f"count={metadata['count']}")
-        if "selector" in metadata and str(metadata["selector"]).strip():
-            summary_bits.append(f"selector={str(metadata['selector'])[:80]}")
-        if "prefix" in metadata and str(metadata["prefix"]).strip():
-            summary_bits.append(f"prefix={str(metadata['prefix'])[:80]}")
-        if "path" in metadata and str(metadata["path"]).strip():
-            summary_bits.append(f"path={str(metadata['path'])[:80]}")
-        if summary_bits:
-            detail += " | " + ", ".join(summary_bits)
-        _emit_shared_progress(
-            shared_context,
-            role=role,
-            status="activity",
-            detail=detail,
-            artifact_ref=relative,
-            tool=tool_name,
-        )
+        detail = _build_tool_use_detail(tool_name, **metadata)
+        _emit_shared_progress(shared_context, role=role, status="activity", detail=detail, artifact_ref=relative, tool=tool_name)
 
     @tool("search_repo_text")
     def search_repo_text(pattern: str) -> str:
@@ -1288,87 +1414,56 @@ def _build_shared_context_tools(shared_context: dict[str, Any], repo_root: str |
         if not isinstance(findings, list):
             return "[]"
         wanted = str(channel or "").strip().lower()
-        filtered = []
-        for item in findings:
-            if not isinstance(item, dict):
-                continue
-            if wanted and str(item.get("channel", "")).strip().lower() != wanted:
-                continue
-            filtered.append(item)
+        filtered = [
+            item for item in findings
+            if isinstance(item, dict) and (not wanted or str(item.get("channel", "")).strip().lower() == wanted)
+        ]
         _record_tool_use("list_research_findings", channel=wanted, count=min(len(filtered), 100))
         return json.dumps(filtered[:100], ensure_ascii=True)
 
     @tool("list_hypotheses")
     def list_hypotheses(selector: str = "") -> str:
         """List current hypotheses filtered by objective, class, candidate or text selector."""
-        hypotheses = _shared_context_snapshot(shared_context, "hypotheses", [])
-        if not isinstance(hypotheses, list):
+        items = _shared_context_snapshot(shared_context, "hypotheses", [])
+        if not isinstance(items, list):
             return "[]"
         token = str(selector or "").strip().lower()
-        filtered = []
-        for item in hypotheses:
-            if not isinstance(item, dict):
-                continue
-            haystack = json.dumps(item, ensure_ascii=True).lower()
-            if token and token not in haystack:
-                continue
-            filtered.append(item)
-        _record_tool_use("list_hypotheses", selector=token[:120], count=min(len(filtered), 100))
-        return json.dumps(filtered[:100], ensure_ascii=True)
+        filtered = _filter_shared_list_by_selector(items, token)
+        _record_tool_use("list_hypotheses", selector=token[:120], count=len(filtered))
+        return json.dumps(filtered, ensure_ascii=True)
 
     @tool("list_refutations")
     def list_refutations(selector: str = "") -> str:
         """List current refutations filtered by hypothesis, severity or text selector."""
-        refutations = _shared_context_snapshot(shared_context, "refutations", [])
-        if not isinstance(refutations, list):
+        items = _shared_context_snapshot(shared_context, "refutations", [])
+        if not isinstance(items, list):
             return "[]"
         token = str(selector or "").strip().lower()
-        filtered = []
-        for item in refutations:
-            if not isinstance(item, dict):
-                continue
-            haystack = json.dumps(item, ensure_ascii=True).lower()
-            if token and token not in haystack:
-                continue
-            filtered.append(item)
-        _record_tool_use("list_refutations", selector=token[:120], count=min(len(filtered), 100))
-        return json.dumps(filtered[:100], ensure_ascii=True)
+        filtered = _filter_shared_list_by_selector(items, token)
+        _record_tool_use("list_refutations", selector=token[:120], count=len(filtered))
+        return json.dumps(filtered, ensure_ascii=True)
 
     @tool("list_experiment_attempts")
     def list_experiment_attempts(selector: str = "") -> str:
         """List current planned experiment attempts filtered by hypothesis or text selector."""
-        attempts = _shared_context_snapshot(shared_context, "experiment_board", [])
-        if not isinstance(attempts, list):
+        items = _shared_context_snapshot(shared_context, "experiment_board", [])
+        if not isinstance(items, list):
             return "[]"
         token = str(selector or "").strip().lower()
-        filtered = []
-        for item in attempts:
-            if not isinstance(item, dict):
-                continue
-            haystack = json.dumps(item, ensure_ascii=True).lower()
-            if token and token not in haystack:
-                continue
-            filtered.append(item)
-        _record_tool_use("list_experiment_attempts", selector=token[:120], count=min(len(filtered), 100))
-        return json.dumps(filtered[:100], ensure_ascii=True)
+        filtered = _filter_shared_list_by_selector(items, token)
+        _record_tool_use("list_experiment_attempts", selector=token[:120], count=len(filtered))
+        return json.dumps(filtered, ensure_ascii=True)
 
     @tool("list_task_delegations")
     def list_task_delegations(selector: str = "") -> str:
         """List recorded root task delegations filtered by subagent type or text selector."""
-        delegations = _shared_context_snapshot(shared_context, "delegations", [])
-        if not isinstance(delegations, list):
+        items = _shared_context_snapshot(shared_context, "delegations", [])
+        if not isinstance(items, list):
             return "[]"
         token = str(selector or "").strip().lower()
-        filtered = []
-        for item in delegations:
-            if not isinstance(item, dict):
-                continue
-            haystack = json.dumps(item, ensure_ascii=True).lower()
-            if token and token not in haystack:
-                continue
-            filtered.append(item)
-        _record_tool_use("list_task_delegations", selector=token[:120], count=min(len(filtered), 100))
-        return json.dumps(filtered[:100], ensure_ascii=True)
+        filtered = _filter_shared_list_by_selector(items, token)
+        _record_tool_use("list_task_delegations", selector=token[:120], count=len(filtered))
+        return json.dumps(filtered, ensure_ascii=True)
 
     @tool("lookup_semantic_evidence")
     def lookup_semantic_evidence(selector: str = "") -> str:
@@ -1377,23 +1472,11 @@ def _build_shared_context_tools(shared_context: dict[str, Any], repo_root: str |
         evidence = _shared_context_snapshot(shared_context, "static_evidence", [])
         if not isinstance(evidence, list):
             return "[]"
-        filtered = []
-        for item in evidence:
-            if not isinstance(item, dict):
-                continue
-            haystack = " ".join(
-                [
-                    str(item.get("candidate_id", "")),
-                    str(item.get("query_id", "")),
-                    str(item.get("file_path", "")),
-                    str(item.get("snippet", "")),
-                ]
-            ).lower()
-            if token and token not in haystack:
-                continue
-            filtered.append(item)
-        _record_tool_use("lookup_semantic_evidence", selector=token[:120], count=min(len(filtered), 100))
-        return json.dumps(filtered[:100], ensure_ascii=True)
+        filtered = _filter_shared_list_by_selector(
+            evidence, token, haystack_keys=["candidate_id", "query_id", "file_path", "snippet"],
+        )
+        _record_tool_use("lookup_semantic_evidence", selector=token[:120], count=len(filtered))
+        return json.dumps(filtered, ensure_ascii=True)
 
     @tool("summarize_semantic_evidence")
     def summarize_semantic_evidence(_: str = "") -> str:
@@ -1401,34 +1484,8 @@ def _build_shared_context_tools(shared_context: dict[str, Any], repo_root: str |
         evidence = _shared_context_snapshot(shared_context, "static_evidence", [])
         if not isinstance(evidence, list):
             return "{}"
-        by_class: dict[str, dict[str, Any]] = {}
-        total = 0
-        for item in evidence:
-            if not isinstance(item, dict):
-                continue
-            total += 1
-            query_id = str(item.get("query_id", "")).strip()
-            vuln_class = query_id.split("::", 1)[-1] if "::" in query_id else query_id or "unknown"
-            bucket = by_class.setdefault(
-                vuln_class,
-                {
-                    "count": 0,
-                    "query_ids": [],
-                    "sample_files": [],
-                    "sample_candidate_ids": [],
-                },
-            )
-            bucket["count"] += 1
-            file_path = str(item.get("file_path", "")).strip()
-            candidate_id = str(item.get("candidate_id", "")).strip()
-            if query_id and query_id not in bucket["query_ids"] and len(bucket["query_ids"]) < 5:
-                bucket["query_ids"].append(query_id)
-            if file_path and file_path not in bucket["sample_files"] and len(bucket["sample_files"]) < 5:
-                bucket["sample_files"].append(file_path)
-            if candidate_id and candidate_id not in bucket["sample_candidate_ids"] and len(bucket["sample_candidate_ids"]) < 5:
-                bucket["sample_candidate_ids"].append(candidate_id)
-        summary = {"total": total, "classes": {key: by_class[key] for key in sorted(by_class.keys())}}
-        _record_tool_use("summarize_semantic_evidence", class_count=len(by_class), total=total)
+        summary = _summarize_evidence_by_class(evidence)
+        _record_tool_use("summarize_semantic_evidence", class_count=summary.pop("_class_count", 0), total=summary["total"])
         return json.dumps(summary, ensure_ascii=True)
 
     @tool("lookup_candidate_seeds")
@@ -1438,23 +1495,11 @@ def _build_shared_context_tools(shared_context: dict[str, Any], repo_root: str |
         candidates = _shared_context_snapshot(shared_context, "candidate_seeds", [])
         if not isinstance(candidates, list):
             return "[]"
-        filtered = []
-        for item in candidates:
-            if not isinstance(item, dict):
-                continue
-            haystack = " ".join(
-                [
-                    str(item.get("candidate_id", "")),
-                    str(item.get("vuln_class", "")),
-                    str(item.get("file_path", "")),
-                    str(item.get("sink", "")),
-                ]
-            ).lower()
-            if token and token not in haystack:
-                continue
-            filtered.append(item)
-        _record_tool_use("lookup_candidate_seeds", selector=token[:120], count=min(len(filtered), 100))
-        return json.dumps(filtered[:100], ensure_ascii=True)
+        filtered = _filter_shared_list_by_selector(
+            candidates, token, haystack_keys=["candidate_id", "vuln_class", "file_path", "sink"],
+        )
+        _record_tool_use("lookup_candidate_seeds", selector=token[:120], count=len(filtered))
+        return json.dumps(filtered, ensure_ascii=True)
 
     @tool("summarize_candidate_seeds")
     def summarize_candidate_seeds(_: str = "") -> str:
@@ -1462,34 +1507,8 @@ def _build_shared_context_tools(shared_context: dict[str, Any], repo_root: str |
         candidates = _shared_context_snapshot(shared_context, "candidate_seeds", [])
         if not isinstance(candidates, list):
             return "{}"
-        by_class: dict[str, dict[str, Any]] = {}
-        total = 0
-        for item in candidates:
-            if not isinstance(item, dict):
-                continue
-            total += 1
-            vuln_class = str(item.get("vuln_class", "")).strip() or "unknown"
-            bucket = by_class.setdefault(
-                vuln_class,
-                {
-                    "count": 0,
-                    "sample_candidate_ids": [],
-                    "sample_files": [],
-                    "sample_sinks": [],
-                },
-            )
-            bucket["count"] += 1
-            candidate_id = str(item.get("candidate_id", "")).strip()
-            file_path = str(item.get("file_path", "")).strip()
-            sink = str(item.get("sink", "")).strip()
-            if candidate_id and candidate_id not in bucket["sample_candidate_ids"] and len(bucket["sample_candidate_ids"]) < 5:
-                bucket["sample_candidate_ids"].append(candidate_id)
-            if file_path and file_path not in bucket["sample_files"] and len(bucket["sample_files"]) < 5:
-                bucket["sample_files"].append(file_path)
-            if sink and sink not in bucket["sample_sinks"] and len(bucket["sample_sinks"]) < 5:
-                bucket["sample_sinks"].append(sink)
-        summary = {"total": total, "classes": {key: by_class[key] for key in sorted(by_class.keys())}}
-        _record_tool_use("summarize_candidate_seeds", class_count=len(by_class), total=total)
+        summary = _summarize_candidates_by_class(candidates)
+        _record_tool_use("summarize_candidate_seeds", class_count=summary.pop("_class_count", 0), total=summary["total"])
         return json.dumps(summary, ensure_ascii=True)
 
     @tool("lookup_web_state")
@@ -1502,16 +1521,9 @@ def _build_shared_context_tools(shared_context: dict[str, Any], repo_root: str |
             "auth_contexts": _shared_context_snapshot(shared_context, "auth_contexts", {}),
             "artifact_index": _shared_context_snapshot(shared_context, "artifact_index", {}),
         }
-        if not token:
-            _record_tool_use("lookup_web_state", selector="", keys=sorted(payload.keys()))
-            return json.dumps(payload, ensure_ascii=True)
-        narrowed: dict[str, Any] = {}
-        for key, value in payload.items():
-            text = json.dumps(value, ensure_ascii=True).lower()
-            if token in text or token in key.lower():
-                narrowed[key] = value
-        _record_tool_use("lookup_web_state", selector=token[:120], keys=sorted(narrowed.keys()))
-        return json.dumps(narrowed, ensure_ascii=True)
+        result = _filter_dict_payload_by_selector(payload, token)
+        _record_tool_use("lookup_web_state", selector=token[:120], keys=sorted(result.keys()))
+        return json.dumps(result, ensure_ascii=True)
 
     @tool("lookup_playwright_artifacts")
     def lookup_playwright_artifacts(selector: str = "") -> str:
@@ -1526,16 +1538,9 @@ def _build_shared_context_tools(shared_context: dict[str, Any], repo_root: str |
             "visited_urls": artifacts.get("visited_urls", []),
             "errors": artifacts.get("errors", []),
         }
-        if not token:
-            _record_tool_use("lookup_playwright_artifacts", selector="", keys=sorted(payload.keys()))
-            return json.dumps(payload, ensure_ascii=True)
-        narrowed: dict[str, Any] = {}
-        for key, value in payload.items():
-            text = json.dumps(value, ensure_ascii=True).lower()
-            if token in text or token in key.lower():
-                narrowed[key] = value
-        _record_tool_use("lookup_playwright_artifacts", selector=token[:120], keys=sorted(narrowed.keys()))
-        return json.dumps(narrowed, ensure_ascii=True)
+        result = _filter_dict_payload_by_selector(payload, token)
+        _record_tool_use("lookup_playwright_artifacts", selector=token[:120], keys=sorted(result.keys()))
+        return json.dumps(result, ensure_ascii=True)
 
     @tool("lookup_runtime_history")
     def lookup_runtime_history(selector: str = "") -> str:
@@ -1546,16 +1551,9 @@ def _build_shared_context_tools(shared_context: dict[str, Any], repo_root: str |
             "witness_bundles": _shared_context_snapshot(shared_context, "witness_bundles", []),
             "gate_history": _shared_context_snapshot(shared_context, "gate_history", []),
         }
-        if not token:
-            _record_tool_use("lookup_runtime_history", selector="", keys=sorted(payload.keys()))
-            return json.dumps(payload, ensure_ascii=True)
-        narrowed: dict[str, Any] = {}
-        for key, value in payload.items():
-            text = json.dumps(value, ensure_ascii=True).lower()
-            if token in text or token in key.lower():
-                narrowed[key] = value
-        _record_tool_use("lookup_runtime_history", selector=token[:120], keys=sorted(narrowed.keys()))
-        return json.dumps(narrowed, ensure_ascii=True)
+        result = _filter_dict_payload_by_selector(payload, token)
+        _record_tool_use("lookup_runtime_history", selector=token[:120], keys=sorted(result.keys()))
+        return json.dumps(result, ensure_ascii=True)
 
     @tool("list_agent_workspace")
     def list_agent_workspace(prefix: str = "") -> str:
@@ -2079,6 +2077,66 @@ def _write_workspace_json(runtime: AgentRuntime, *, role: str, category: str, pa
     return relative
 
 
+def _build_handoff_prompt(
+    session: AgentSession,
+    artifact_role: str,
+    delegated_role: str | None,
+    handoff_ref: str,
+    category_guidance: str,
+    response_contract: str,
+    recent_worklog_refs: list[str],
+    recent_tool_refs: list[str],
+) -> str:
+    if delegated_role:
+        return (
+            "You are the root supervisor. "
+            f"You must delegate this task via the task tool using subagent_type='{delegated_role}'. "
+            "Do not solve it directly from the root context. "
+            f"Tell the delegated subagent to inspect the handoff artifact at '{handoff_ref}'. "
+            f"The delegated subagent owns workspace role '{artifact_role}'. "
+            f"Recent worklog refs for delegated role '{artifact_role}': {json.dumps(recent_worklog_refs, ensure_ascii=True)}. "
+            f"Recent tool-call refs for delegated role '{artifact_role}': {json.dumps(recent_tool_refs, ensure_ascii=True)}. "
+            f"{category_guidance} "
+            f"Return only the delegated subagent's strict JSON matching this response contract: {response_contract}"
+        )
+    return (
+        f"You are continuing the durable {session.role} agent workspace. "
+        f"Use the workspace tools to inspect the handoff artifact at '{handoff_ref}'. "
+        f"Recent worklog refs for your role: {json.dumps(recent_worklog_refs, ensure_ascii=True)}. "
+        f"Recent tool-call refs for your role: {json.dumps(recent_tool_refs, ensure_ascii=True)}. "
+        f"{category_guidance} "
+        "Use repo and shared-state tools before concluding. "
+        f"Return strict JSON matching this response contract: {response_contract}"
+    )
+
+
+def _build_handoff_success_meta(
+    handoff_ref: str,
+    response_ref: str,
+    session: AgentSession,
+    artifact_role: str,
+    delegated_role: str | None,
+    cache_key: str,
+    runtime: AgentRuntime,
+) -> dict[str, Any]:
+    return {
+        "handoff_ref": handoff_ref,
+        "response_ref": response_ref,
+        "response_refs": [response_ref],
+        "progress_refs": [],
+        "turns": 1,
+        "invocation_role": session.role,
+        "workspace_role": artifact_role,
+        "delegated_role": delegated_role,
+        "worklog_refs": _workspace_index_refs(runtime.shared_context, role=artifact_role, category="worklog"),
+        "tool_refs": _workspace_index_refs(runtime.shared_context, role=artifact_role, category="tool_calls"),
+        "delegation_refs": _workspace_index_refs(runtime.shared_context, role="root", category="delegations"),
+        "cache_hit": False,
+        "cache_source": "",
+        "cache_key": cache_key,
+    }
+
+
 def _invoke_agent_handoff(
     runtime: AgentRuntime,
     session: AgentSession,
@@ -2186,28 +2244,10 @@ def _invoke_agent_handoff(
         )
         recent_worklog_refs = _workspace_index_refs(runtime.shared_context, role=artifact_role, category="worklog")[-5:]
         recent_tool_refs = _workspace_index_refs(runtime.shared_context, role=artifact_role, category="tool_calls")[-5:]
-        if delegated_role:
-            prompt = (
-                "You are the root supervisor. "
-                f"You must delegate this task via the task tool using subagent_type='{delegated_role}'. "
-                "Do not solve it directly from the root context. "
-                f"Tell the delegated subagent to inspect the handoff artifact at '{handoff_ref}'. "
-                f"The delegated subagent owns workspace role '{artifact_role}'. "
-                f"Recent worklog refs for delegated role '{artifact_role}': {json.dumps(recent_worklog_refs, ensure_ascii=True)}. "
-                f"Recent tool-call refs for delegated role '{artifact_role}': {json.dumps(recent_tool_refs, ensure_ascii=True)}. "
-                f"{category_guidance} "
-                f"Return only the delegated subagent's strict JSON matching this response contract: {response_contract}"
-            )
-        else:
-            prompt = (
-                f"You are continuing the durable {session.role} agent workspace. "
-                f"Use the workspace tools to inspect the handoff artifact at '{handoff_ref}'. "
-                f"Recent worklog refs for your role: {json.dumps(recent_worklog_refs, ensure_ascii=True)}. "
-                f"Recent tool-call refs for your role: {json.dumps(recent_tool_refs, ensure_ascii=True)}. "
-                f"{category_guidance} "
-                "Use repo and shared-state tools before concluding. "
-                f"Return strict JSON matching this response contract: {response_contract}"
-            )
+        prompt = _build_handoff_prompt(
+            session, artifact_role, delegated_role, handoff_ref, category_guidance,
+            response_contract, recent_worklog_refs, recent_tool_refs,
+        )
         parsed = _invoke_agent_session_with_timeout(
             session,
             prompt,
@@ -2235,9 +2275,6 @@ def _invoke_agent_handoff(
                 f"{session.role} returned non-final continue response for {category}; "
                 "DeepAgents handoffs must return a final structured result"
             )
-        current_worklog_refs = _workspace_index_refs(runtime.shared_context, role=artifact_role, category="worklog")
-        current_tool_refs = _workspace_index_refs(runtime.shared_context, role=artifact_role, category="tool_calls")
-        current_delegation_refs = _workspace_index_refs(runtime.shared_context, role="root", category="delegations")
         _emit_shared_progress(
             runtime.shared_context,
             role=artifact_role,
@@ -2251,22 +2288,7 @@ def _invoke_agent_handoff(
             delegated_role=delegated_role,
         )
         _store_handoff_cache(runtime.checkpoint_dir, cache_key, parsed)
-        meta = {
-            "handoff_ref": handoff_ref,
-            "response_ref": response_ref,
-            "response_refs": [response_ref],
-            "progress_refs": [],
-            "turns": 1,
-            "invocation_role": session.role,
-            "workspace_role": artifact_role,
-            "delegated_role": delegated_role,
-            "worklog_refs": current_worklog_refs,
-            "tool_refs": current_tool_refs,
-            "delegation_refs": current_delegation_refs,
-            "cache_hit": False,
-            "cache_source": "",
-            "cache_key": cache_key,
-        }
+        meta = _build_handoff_success_meta(handoff_ref, response_ref, session, artifact_role, delegated_role, cache_key, runtime)
         _resolve_inflight_handoff(cache_key, result=parsed)
         return parsed, meta
     except Exception as exc:
@@ -2343,7 +2365,7 @@ def _invoke_deepagent_json(
             parsed = _extract_json(content)
             if parsed is None:
                 raw_ref = _persist_raw_agent_output(active_session, content=content, kind="non_json_response")
-                detail = f"deepagents returned non-JSON response"
+                detail = "deepagents returned non-JSON response"
                 if raw_ref:
                     detail += f" (raw_ref={raw_ref})"
                 raise AgentExecutionError(detail)
@@ -2354,6 +2376,40 @@ def _invoke_deepagent_json(
     if last_error is not None:
         raise last_error
     raise AgentExecutionError("deepagents invocation failed")
+
+
+def _persist_invoke_exception(session: AgentSession, exc: Exception) -> str | None:
+    return _persist_raw_agent_output(
+        session,
+        content=json.dumps(
+            {
+                "role": session.role,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+                "traceback": traceback.format_exc()[:24000],
+            },
+            ensure_ascii=True,
+            indent=2,
+        ),
+        kind="invoke_exception",
+    )
+
+
+def _invoke_session_once(session: AgentSession, prompt: str) -> dict[str, Any]:
+    with session.invoke_lock:
+        result = session.agent.invoke(
+            {"messages": [{"role": "user", "content": prompt}]},
+            config={"configurable": {"thread_id": session.thread_id}},
+        )
+    content = _extract_text(result if isinstance(result, dict) else {})
+    parsed = _extract_json(content)
+    if parsed is None:
+        raw_ref = _persist_raw_agent_output(session, content=content, kind="non_json_response")
+        detail = f"{session.role} returned non-JSON response"
+        if raw_ref:
+            detail += f" (raw_ref={raw_ref})"
+        raise AgentExecutionError(detail)
+    return parsed
 
 
 def invoke_agent_session_json(
@@ -2368,40 +2424,14 @@ def invoke_agent_session_json(
 
     for _attempt in range(1, max_attempts + 1):
         try:
-            with session.invoke_lock:
-                result = session.agent.invoke(
-                    {"messages": [{"role": "user", "content": prompt}]},
-                    config={"configurable": {"thread_id": session.thread_id}},
-                )
-            content = _extract_text(result if isinstance(result, dict) else {})
-            parsed = _extract_json(content)
-            if parsed is None:
-                raw_ref = _persist_raw_agent_output(session, content=content, kind="non_json_response")
-                detail = f"{session.role} returned non-JSON response"
-                if raw_ref:
-                    detail += f" (raw_ref={raw_ref})"
-                raise AgentExecutionError(detail)
-            return parsed
+            return _invoke_session_once(session, prompt)
         except TimeoutError as exc:
             last_error = AgentExecutionError(str(exc))
+        except AgentExecutionError as exc:
+            last_error = exc
+            continue
         except Exception as exc:
-            if isinstance(exc, AgentExecutionError):
-                last_error = exc
-                continue
-            raw_ref = _persist_raw_agent_output(
-                session,
-                content=json.dumps(
-                    {
-                        "role": session.role,
-                        "error_type": type(exc).__name__,
-                        "error": str(exc),
-                        "traceback": traceback.format_exc()[:24000],
-                    },
-                    ensure_ascii=True,
-                    indent=2,
-                ),
-                kind="invoke_exception",
-            )
+            raw_ref = _persist_invoke_exception(session, exc)
             detail = f"{session.role} invocation failed: {exc}"
             if raw_ref:
                 detail += f" (raw_ref={raw_ref})"
@@ -2558,51 +2588,63 @@ def _normalize_stringish_list(raw: Any) -> list[str]:
     return out
 
 
-def _candidate_from_hypothesis_item(item: dict[str, Any], idx: int) -> Candidate:
-    def _canonical_candidate_id(current_id: str, refs: list[str]) -> str:
-        token = str(current_id).strip()
-        ref_ids = [
-            str(ref).strip()
-            for ref in refs
-            if isinstance(ref, (str, int, float)) and re.match(r"^(cand|scip)-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)?$", str(ref).strip())
-        ]
-        if not token:
-            return ref_ids[0] if ref_ids else token
-        if token in ref_ids:
-            return token
-        for ref_id in ref_ids:
-            if token.startswith(f"{ref_id}-"):
-                return ref_id
+def _canonical_candidate_id(current_id: str, refs: list[str]) -> str:
+    token = str(current_id).strip()
+    ref_ids = [
+        str(ref).strip()
+        for ref in refs
+        if isinstance(ref, (str, int, float)) and re.match(r"^(cand|scip)-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)?$", str(ref).strip())
+    ]
+    if not token:
         return ref_ids[0] if ref_ids else token
+    if token in ref_ids:
+        return token
+    for ref_id in ref_ids:
+        if token.startswith(f"{ref_id}-"):
+            return ref_id
+    return ref_ids[0] if ref_ids else token
 
+
+def _candidate_from_payload(item: dict[str, Any]) -> Candidate | None:
     candidate_payload = item.get("candidate")
-    if isinstance(candidate_payload, dict):
-        try:
-            candidate = Candidate(**candidate_payload)
-            candidate.expected_intercepts = _normalize_stringish_list(candidate.expected_intercepts)
-            candidate.provenance = _normalize_stringish_list(candidate.provenance)
-            candidate.evidence_refs = _normalize_stringish_list(candidate.evidence_refs)
-            candidate.auth_requirements = _normalize_stringish_list(candidate.auth_requirements)
-            candidate.web_path_hints = _normalize_stringish_list(candidate.web_path_hints)
-            candidate.preconditions = _normalize_stringish_list(candidate.preconditions)
-            candidate.candidate_id = _canonical_candidate_id(candidate.candidate_id, candidate.evidence_refs)
-            return candidate
-        except TypeError:
-            pass
+    if not isinstance(candidate_payload, dict):
+        return None
+    try:
+        candidate = Candidate(**candidate_payload)
+        candidate.expected_intercepts = _normalize_stringish_list(candidate.expected_intercepts)
+        candidate.provenance = _normalize_stringish_list(candidate.provenance)
+        candidate.evidence_refs = _normalize_stringish_list(candidate.evidence_refs)
+        candidate.auth_requirements = _normalize_stringish_list(candidate.auth_requirements)
+        candidate.web_path_hints = _normalize_stringish_list(candidate.web_path_hints)
+        candidate.preconditions = _normalize_stringish_list(candidate.preconditions)
+        candidate.candidate_id = _canonical_candidate_id(candidate.candidate_id, candidate.evidence_refs)
+        return candidate
+    except TypeError:
+        return None
+
+
+def _safe_int(value: Any, default: int = 1) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _candidate_from_hypothesis_item(item: dict[str, Any], idx: int) -> Candidate:
+    from_payload = _candidate_from_payload(item)
+    if from_payload is not None:
+        return from_payload
+
     candidate_id = str(item.get("candidate_id", "")).strip() or f"cand-{idx:05d}"
     vuln_class = str(item.get("vuln_class", "")).strip() or "unknown"
-    file_path = str(item.get("file_path", "")).strip() or "unknown.php"
-    line_value = item.get("line", 1)
-    try:
-        line = int(line_value)
-    except Exception:
-        line = 1
     sink = str(item.get("sink", "")).strip() or "unknown"
-    confidence_value = item.get("confidence", 0.0)
-    try:
-        confidence = float(confidence_value)
-    except Exception:
-        confidence = 0.0
     expected_intercepts = [
         *_normalize_stringish_list(item.get("expected_intercepts", []))
     ] or ([sink] if sink else [])
@@ -2611,34 +2653,45 @@ def _candidate_from_hypothesis_item(item: dict[str, Any], idx: int) -> Candidate
         candidate_id=_canonical_candidate_id(candidate_id, evidence_refs),
         vuln_class=vuln_class,
         title=str(item.get("title", "")).strip() or vuln_class,
-        file_path=file_path,
-        line=line,
+        file_path=str(item.get("file_path", "")).strip() or "unknown.php",
+        line=_safe_int(item.get("line", 1)),
         sink=sink,
         expected_intercepts=expected_intercepts,
         notes=str(item.get("notes", "")).strip(),
         provenance=_normalize_stringish_list(item.get("provenance", [])),
         evidence_refs=evidence_refs,
-        confidence=confidence,
+        confidence=_safe_float(item.get("confidence", 0.0)),
         auth_requirements=_normalize_stringish_list(item.get("auth_requirements", [])),
         web_path_hints=_normalize_stringish_list(item.get("web_path_hints", [])),
         preconditions=_normalize_stringish_list(item.get("preconditions", [])),
     )
 
 
-def _normalize_hypotheses(raw: Any) -> list[Hypothesis]:
+def _unwrap_hypotheses_input(raw: Any) -> list[Any] | None:
     if isinstance(raw, dict):
         if isinstance(raw.get("hypotheses"), list):
-            raw = raw.get("hypotheses")
-        elif isinstance(raw.get("hypothesis"), dict):
-            raw = [raw.get("hypothesis")]
-        elif {"hypothesis_id", "objective_id", "vuln_class", "title", "rationale"} & set(raw.keys()):
-            raw = [raw]
-        else:
-            return []
-    if not isinstance(raw, list):
+            return raw.get("hypotheses")
+        if isinstance(raw.get("hypothesis"), dict):
+            return [raw.get("hypothesis")]
+        if {"hypothesis_id", "objective_id", "vuln_class", "title", "rationale"} & set(raw.keys()):
+            return [raw]
+        return None
+    if isinstance(raw, list):
+        return raw
+    return None
+
+
+def _hypothesis_metadata(item: dict[str, Any]) -> dict[str, Any]:
+    excluded = {"hypothesis_id", "objective_id", "vuln_class", "title", "rationale", "evidence_refs", "candidate", "candidate_id", "status", "confidence"}
+    return {k: v for k, v in item.items() if k not in excluded}
+
+
+def _normalize_hypotheses(raw: Any) -> list[Hypothesis]:
+    items = _unwrap_hypotheses_input(raw)
+    if items is None:
         return []
     out: list[Hypothesis] = []
-    for idx, item in enumerate(raw, start=1):
+    for idx, item in enumerate(items, start=1):
         if not isinstance(item, dict):
             continue
         candidate = _candidate_from_hypothesis_item(item, idx)
@@ -2656,7 +2709,7 @@ def _normalize_hypotheses(raw: Any) -> list[Hypothesis]:
                 auth_requirements=list(candidate.auth_requirements),
                 preconditions=list(candidate.preconditions),
                 web_path_hints=list(candidate.web_path_hints),
-                metadata={k: v for k, v in item.items() if k not in {"hypothesis_id", "objective_id", "vuln_class", "title", "rationale", "evidence_refs", "candidate", "candidate_id", "status", "confidence"}},
+                metadata=_hypothesis_metadata(item),
             )
         )
     return out
@@ -2687,19 +2740,25 @@ def _normalize_refutations(raw: Any) -> list[Refutation]:
     return out
 
 
+def _unwrap_experiment_attempts_input(raw: Any) -> list[Any] | None:
+    if isinstance(raw, dict):
+        if isinstance(raw.get("plans"), list):
+            return raw.get("plans")
+        if {"candidate_id", "vuln_class", "title", "file_path", "sink"} & set(raw.keys()):
+            return [raw]
+        return None
+    if isinstance(raw, list):
+        return raw
+    return None
+
+
 def _normalize_experiment_attempts(raw: Any, config: PadvConfig) -> tuple[dict[str, ValidationPlan], list[ExperimentAttempt]]:
     plans: dict[str, ValidationPlan] = {}
     attempts: list[ExperimentAttempt] = []
-    if isinstance(raw, dict):
-        if isinstance(raw.get("plans"), list):
-            raw = raw.get("plans")
-        elif {"candidate_id", "vuln_class", "title", "file_path", "sink"} & set(raw.keys()):
-            raw = [raw]
-        else:
-            return plans, attempts
-    if not isinstance(raw, list):
+    items = _unwrap_experiment_attempts_input(raw)
+    if items is None:
         return plans, attempts
-    for idx, item in enumerate(raw, start=1):
+    for idx, item in enumerate(items, start=1):
         if not isinstance(item, dict):
             continue
         candidate = _candidate_from_hypothesis_item(item, idx)
@@ -2897,6 +2956,171 @@ def skeptic_refine_with_deepagents(
     return refined, trace
 
 
+def _resolve_candidate_id(
+    raw: Any,
+    by_id: dict[str, Candidate],
+    candidate_id_pattern: re.Pattern[str],
+    trailing_num_pattern: re.Pattern[str],
+    numeric_suffix_map: dict[int, list[str]],
+) -> str | None:
+    value = str(raw).strip()
+    if not value:
+        return None
+    if value in by_id:
+        return value
+    for known_id in sorted(by_id.keys(), key=len, reverse=True):
+        if known_id in value:
+            return known_id
+    match = candidate_id_pattern.search(value)
+    if not match:
+        return None
+    token = match.group(0)
+    if token in by_id:
+        return token
+    num_match = trailing_num_pattern.search(token)
+    if not num_match:
+        return None
+    num = int(num_match.group(1))
+    numeric_ids = numeric_suffix_map.get(num, [])
+    if len(numeric_ids) == 1:
+        return numeric_ids[0]
+    return None
+
+
+def _parse_info_gain_score(raw: Any) -> float | None:
+    if isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    if not isinstance(raw, str):
+        return None
+    token = raw.strip()
+    if not token:
+        return None
+    try:
+        return float(token)
+    except ValueError:
+        match = re.search(r"[-+]?\d+(?:\.\d+)?", token)
+        if match:
+            try:
+                return float(match.group(0))
+            except ValueError:
+                return None
+        return None
+
+
+def _build_numeric_suffix_map(by_id: dict[str, Candidate]) -> dict[int, list[str]]:
+    trailing_num_pattern = re.compile(r"(?:cand|scip)-0*(\d+)$", re.IGNORECASE)
+    numeric_suffix_map: dict[int, list[str]] = {}
+    for cid in by_id:
+        match = trailing_num_pattern.search(cid)
+        if not match:
+            continue
+        num = int(match.group(1))
+        numeric_suffix_map.setdefault(num, []).append(cid)
+    return numeric_suffix_map
+
+
+def _parse_agent_actions(
+    raw_actions: list[Any],
+    by_id: dict[str, Candidate],
+) -> tuple[dict[str, float], list[dict[str, Any]]]:
+    candidate_id_pattern = re.compile(r"(?:cand|scip)-\d+", re.IGNORECASE)
+    trailing_num_pattern = re.compile(r"(?:cand|scip)-0*(\d+)$", re.IGNORECASE)
+    numeric_suffix_map = _build_numeric_suffix_map(by_id)
+
+    selected_scores: dict[str, float] = {}
+    actions: list[dict[str, Any]] = []
+    for item in raw_actions:
+        if not isinstance(item, dict):
+            continue
+        candidate_id = _resolve_candidate_id(
+            item.get("candidate_id"), by_id, candidate_id_pattern, trailing_num_pattern, numeric_suffix_map,
+        )
+        if candidate_id is None:
+            continue
+        score = _parse_info_gain_score(item.get("expected_info_gain"))
+        if score is None:
+            continue
+        if candidate_id in selected_scores:
+            selected_scores[candidate_id] = max(selected_scores[candidate_id], score)
+        else:
+            selected_scores[candidate_id] = score
+        actions.append(
+            {
+                "candidate_id": candidate_id,
+                "action": str(item.get("action", "validate")).strip() or "validate",
+                "expected_info_gain": score,
+                "rationale": str(item.get("rationale", "")).strip(),
+            }
+        )
+    return selected_scores, actions
+
+
+def _compute_base_priority(candidate: Candidate, seen_classes: set[str], seen_files: set[str]) -> float:
+    score = max(0.0, min(1.0, float(candidate.confidence)))
+    if candidate.vuln_class not in seen_classes:
+        score += 0.30
+    if candidate.file_path not in seen_files:
+        score += 0.20
+    semantic_count = len(
+        {
+            signal.strip().lower()
+            for signal in candidate.provenance
+            if isinstance(signal, str) and signal.strip().lower() in _SEMANTIC_SIGNALS
+        }
+    )
+    score += 0.08 * semantic_count
+    if candidate.web_path_hints:
+        score += 0.04
+    if candidate.expected_intercepts:
+        score += 0.03
+    return score
+
+
+def _extract_coverage_sets(frontier_state: dict[str, Any]) -> tuple[set[str], set[str]]:
+    coverage = frontier_state.get("coverage", {}) if isinstance(frontier_state, dict) else {}
+    seen_files = {
+        str(x).strip()
+        for x in coverage.get("files", [])
+        if isinstance(x, str) and str(x).strip()
+    } if isinstance(coverage, dict) else set()
+    seen_classes = {
+        str(x).strip()
+        for x in coverage.get("classes", [])
+        if isinstance(x, str) and str(x).strip()
+    } if isinstance(coverage, dict) else set()
+    return seen_files, seen_classes
+
+
+def _select_candidates_by_class_quota(
+    ranked_ids: list[str],
+    by_id: dict[str, Candidate],
+    limit: int,
+) -> list[str]:
+    selected_ids: list[str] = []
+    class_selected: set[str] = set()
+
+    # Pass 1: keep at least one candidate per class when possible.
+    for cid in ranked_ids:
+        candidate = by_id[cid]
+        if candidate.vuln_class in class_selected:
+            continue
+        selected_ids.append(cid)
+        class_selected.add(candidate.vuln_class)
+        if len(selected_ids) >= limit:
+            return selected_ids
+
+    # Pass 2: fill remaining slots by priority.
+    for cid in ranked_ids:
+        if cid in selected_ids:
+            continue
+        selected_ids.append(cid)
+        if len(selected_ids) >= limit:
+            break
+    return selected_ids
+
+
 def schedule_actions_with_deepagents(
     candidates: list[Candidate],
     config: PadvConfig,
@@ -2944,121 +3168,13 @@ def schedule_actions_with_deepagents(
         raise AgentExecutionError("deepagents scheduler response missing actions list")
 
     by_id = {c.candidate_id: c for c in candidates}
-    candidate_id_pattern = re.compile(r"(?:cand|scip)-\d+", re.IGNORECASE)
-    trailing_num_pattern = re.compile(r"(?:cand|scip)-0*([0-9]+)$", re.IGNORECASE)
-    numeric_suffix_map: dict[int, list[str]] = {}
-    for cid in by_id:
-        match = trailing_num_pattern.search(cid)
-        if not match:
-            continue
-        num = int(match.group(1))
-        numeric_suffix_map.setdefault(num, []).append(cid)
+    selected_scores, actions = _parse_agent_actions(raw_actions, by_id)
 
-    def _resolve_candidate_id(raw: Any) -> str | None:
-        value = str(raw).strip()
-        if not value:
-            return None
-        if value in by_id:
-            return value
-        for known_id in sorted(by_id.keys(), key=len, reverse=True):
-            if known_id in value:
-                return known_id
-        match = candidate_id_pattern.search(value)
-        if match:
-            token = match.group(0)
-            if token in by_id:
-                return token
-            num_match = trailing_num_pattern.search(token)
-            if num_match:
-                num = int(num_match.group(1))
-                numeric_ids = numeric_suffix_map.get(num, [])
-                if len(numeric_ids) == 1:
-                    return numeric_ids[0]
-        return None
-
-    def _parse_score(raw: Any) -> float | None:
-        if isinstance(raw, bool):
-            return None
-        if isinstance(raw, (int, float)):
-            return float(raw)
-        if isinstance(raw, str):
-            token = raw.strip()
-            if not token:
-                return None
-            try:
-                return float(token)
-            except ValueError:
-                match = re.search(r"[-+]?\d+(?:\.\d+)?", token)
-                if match:
-                    try:
-                        return float(match.group(0))
-                    except ValueError:
-                        return None
-                return None
-        return None
-
-    selected_scores: dict[str, float] = {}
-    actions: list[dict[str, Any]] = []
-    for item in raw_actions:
-        if not isinstance(item, dict):
-            continue
-        candidate_id = _resolve_candidate_id(item.get("candidate_id"))
-        if candidate_id is None:
-            continue
-        score = _parse_score(item.get("expected_info_gain"))
-        if score is None:
-            continue
-        normalized_score = score
-        if candidate_id in selected_scores:
-            selected_scores[candidate_id] = max(selected_scores[candidate_id], normalized_score)
-        else:
-            selected_scores[candidate_id] = normalized_score
-        actions.append(
-            {
-                "candidate_id": candidate_id,
-                "action": str(item.get("action", "validate")).strip() or "validate",
-                "expected_info_gain": normalized_score,
-                "rationale": str(item.get("rationale", "")).strip(),
-            }
-        )
-
-    coverage = frontier_state.get("coverage", {}) if isinstance(frontier_state, dict) else {}
-    seen_files = {
-        str(x).strip()
-        for x in coverage.get("files", [])
-        if isinstance(x, str) and str(x).strip()
-    } if isinstance(coverage, dict) else set()
-    seen_classes = {
-        str(x).strip()
-        for x in coverage.get("classes", [])
-        if isinstance(x, str) and str(x).strip()
-    } if isinstance(coverage, dict) else set()
-
-    def _semantic_signal_count(candidate: Candidate) -> int:
-        return len(
-            {
-                signal.strip().lower()
-                for signal in candidate.provenance
-                if isinstance(signal, str) and signal.strip().lower() in _SEMANTIC_SIGNALS
-            }
-        )
-
-    def _base_priority(candidate: Candidate) -> float:
-        score = max(0.0, min(1.0, float(candidate.confidence)))
-        if candidate.vuln_class not in seen_classes:
-            score += 0.30
-        if candidate.file_path not in seen_files:
-            score += 0.20
-        score += 0.08 * _semantic_signal_count(candidate)
-        if candidate.web_path_hints:
-            score += 0.04
-        if candidate.expected_intercepts:
-            score += 0.03
-        return score
+    seen_files, seen_classes = _extract_coverage_sets(frontier_state)
 
     combined_scores: dict[str, float] = {}
     for cid, candidate in by_id.items():
-        score = _base_priority(candidate)
+        score = _compute_base_priority(candidate, seen_classes, seen_files)
         if cid in selected_scores:
             score = max(score, 1.0 + selected_scores[cid])
         combined_scores[cid] = score
@@ -3068,27 +3184,7 @@ def schedule_actions_with_deepagents(
         key=lambda cid: (-combined_scores[cid], -by_id[cid].confidence, by_id[cid].file_path, by_id[cid].line),
     )
     limit = max(1, max_candidates)
-    selected_ids: list[str] = []
-    class_selected: set[str] = set()
-
-    # Pass 1: keep at least one candidate per class when possible.
-    for cid in ranked_ids:
-        candidate = by_id[cid]
-        if candidate.vuln_class in class_selected:
-            continue
-        selected_ids.append(cid)
-        class_selected.add(candidate.vuln_class)
-        if len(selected_ids) >= limit:
-            break
-
-    # Pass 2: fill remaining slots by priority.
-    if len(selected_ids) < limit:
-        for cid in ranked_ids:
-            if cid in selected_ids:
-                continue
-            selected_ids.append(cid)
-            if len(selected_ids) >= limit:
-                break
+    selected_ids = _select_candidates_by_class_quota(ranked_ids, by_id, limit)
 
     selected = [by_id[cid] for cid in selected_ids]
     limited_ids = {c.candidate_id for c in selected}
@@ -3112,109 +3208,284 @@ def schedule_actions_with_deepagents(
     return selected, selected_objective_scores, trace
 
 
-def _normalize_validation_plan_response(
+def _normalize_plan_string_list(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    return [str(x).strip() for x in value if str(x).strip()]
+
+
+def _normalize_oracle_function(value: str) -> str:
+    token = str(value).strip().replace("->", "::")
+    if not token:
+        return ""
+    match = re.match(r"^([A-Za-z_][A-Za-z0-9_:]*)\s*(?:\(\s*\))?$", token)
+    if match:
+        return match.group(1)
+    match = re.match(r"^([A-Za-z_][A-Za-z0-9_:]*)\s*\(", token)
+    if match:
+        return match.group(1)
+    return ""
+
+
+def _extract_path_hint(value: str, method: str | None = None) -> str:
+    text = str(value).strip()
+    if not text:
+        return ""
+    lowered = text.casefold()
+    if method:
+        method_lower = method.casefold()
+        match = re.search(rf"\b{re.escape(method_lower)}\b(?:\s+request\b.*?\bto\b|\s+)(/[A-Za-z0-9_./?&=%:-]+)", lowered)
+        if match:
+            return match.group(1)
+    match = re.search(r"\b(?:get|post|put|patch|delete|head|options)\b(?:\s+request\b.*?\bto\b|\s+)(/[A-Za-z0-9_./?&=%:-]+)", lowered)
+    if match:
+        return match.group(1)
+    if text.startswith("/"):
+        return text
+    return ""
+
+
+def _preferred_request_path_from_candidate(candidate: Candidate, request_expectations: list[str], method: str) -> str:
+    candidates: list[str] = []
+    if candidate.entrypoint_hint:
+        candidates.append(str(candidate.entrypoint_hint))
+    candidates.extend(str(x) for x in candidate.web_path_hints if str(x).strip())
+    candidates.extend(request_expectations)
+    for raw in candidates:
+        hint = _extract_path_hint(raw, method)
+        if hint and hint != "/":
+            return hint
+    return "/"
+
+
+def _classify_intercept_item(item: str, lowered: str) -> str:
+    """Return 'oracle', 'request', 'response', or 'skip' for a single intercept."""
+    if not item:
+        return "skip"
+    if re.match(r"^(get|post|put|patch|delete|head|options)\s+/", lowered):
+        return "request"
+    if lowered.startswith("content-type:") or lowered.startswith("soapaction:") or lowered.startswith("cookie:"):
+        return "request"
+    if lowered.startswith("http "):
+        return "response"
+    if "<" in item and ">" in item:
+        if any(marker in lowered for marker in ("<output", "<pre", "<script", "<html", "<body")):
+            return "response"
+        return "request"
+    if "/" in item and " " not in item and item.startswith("/"):
+        return "request"
+    if "=" in item and " " not in item and not item.startswith("uid=") and not item.startswith("www-data"):
+        return "request"
+    if any(marker in lowered for marker in ("uid=", "www-data", "root:x", "phpinfo", "fatal error", "warning:", "notice:")):
+        return "response"
+    return "oracle"
+
+
+def _split_intercepts(values: list[str]) -> tuple[list[str], list[str], list[str]]:
+    oracle_functions: list[str] = []
+    request_expectations: list[str] = []
+    response_witnesses: list[str] = []
+    for raw in values:
+        item = str(raw).strip()
+        lowered = item.casefold()
+        classification = _classify_intercept_item(item, lowered)
+        if classification == "request":
+            request_expectations.append(item)
+        elif classification == "response":
+            response_witnesses.append(item)
+        elif classification == "oracle":
+            oracle_functions.append(_normalize_oracle_function(item))
+    return (
+        sorted(dict.fromkeys(x for x in oracle_functions if x)),
+        sorted(dict.fromkeys(x for x in request_expectations if x)),
+        sorted(dict.fromkeys(x for x in response_witnesses if x)),
+    )
+
+
+def _inject_canary_value(value: str, canary_value: str) -> str:
+    stripped = str(value)
+    if canary_value in stripped:
+        return stripped
+    return f"{stripped} {canary_value}".strip()
+
+
+def _inject_canary_into_mapping(mapping: dict[str, str], canary_value: str, reserved_query_keys: set[str], fallback_key: str) -> dict[str, str]:
+    mutated = {str(k): str(v) for k, v in mapping.items()}
+    injected = False
+    for key in list(mutated.keys()):
+        if key.casefold() in reserved_query_keys:
+            continue
+        mutated[key] = _inject_canary_value(mutated[key], canary_value)
+        injected = True
+    if not injected:
+        mutated[fallback_key] = canary_value
+    return mutated
+
+
+def _inject_canary_into_xml(body_text: str, canary_value: str) -> str:
+    def _replace(match: re.Match[str]) -> str:
+        opening, content, closing = match.group(1), match.group(2), match.group(3)
+        content = content.strip()
+        if not content or canary_value in content:
+            return match.group(0)
+        return f"{opening}{_inject_canary_value(content, canary_value)}{closing}"
+
+    return re.sub(r"(<([A-Za-z0-9:_-]+)[^>]*>)([^<]+)(</\\2>)", _replace, body_text)
+
+
+_ALLOWED_HTTP_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
+
+
+def _normalize_request_body_string(
+    body_str: str,
+    canary_value: str,
+    reserved_query_keys: set[str],
+    fallback_key: str,
+    normalized: dict[str, Any],
+) -> None:
+    parsed: object | None = None
+    try:
+        parsed = json.loads(body_str)
+    except json.JSONDecodeError:
+        parsed = None
+    if isinstance(parsed, dict):
+        normalized["body"] = _inject_canary_into_mapping(
+            {str(k): str(v) for k, v in parsed.items()},
+            canary_value,
+            reserved_query_keys,
+            fallback_key,
+        )
+        normalized.setdefault("headers", {})
+        normalized["headers"].setdefault("Content-Type", "application/json")
+        return
+    if "=" in body_str and not body_str.startswith("<"):
+        form_pairs = urllib.parse.parse_qsl(body_str, keep_blank_values=True)
+        if form_pairs:
+            normalized["body"] = _inject_canary_into_mapping(dict(form_pairs), canary_value, reserved_query_keys, fallback_key)
+            normalized.setdefault("headers", {})
+            normalized["headers"].setdefault("Content-Type", "application/x-www-form-urlencoded")
+            return
+        normalized["body_text"] = _inject_canary_value(body_str, canary_value)
+        return
+    normalized["body_text"] = (
+        _inject_canary_into_xml(body_str, canary_value)
+        if body_str.startswith("<")
+        else _inject_canary_value(body_str, canary_value)
+    )
+    normalized.setdefault("headers", {})
+    if body_str.startswith("<"):
+        normalized["headers"].setdefault("Content-Type", "text/xml")
+
+
+def _normalize_plan_request(
+    req: dict[str, Any],
+    canary_value: str,
     candidate: Candidate,
+    request_expectations: list[str],
+    reserved_query_keys: set[str],
+    fallback_key: str,
+) -> dict[str, Any]:
+    method_raw = req.get("method")
+    method = str(method_raw).strip().upper() if method_raw is not None else "GET"
+    if method not in _ALLOWED_HTTP_METHODS:
+        method = "GET"
+
+    path_raw = req.get("path")
+    path = str(path_raw).strip() if path_raw is not None else ""
+    if not path:
+        path = _preferred_request_path_from_candidate(candidate, request_expectations, method)
+    if not path.startswith("/"):
+        path = "/" + path
+
+    query = req.get("query")
+    if not isinstance(query, dict):
+        query = req.get("params")
+    if isinstance(query, dict):
+        q = _inject_canary_into_mapping({str(k): str(v) for k, v in query.items()}, canary_value, reserved_query_keys, fallback_key)
+    else:
+        q = {fallback_key: canary_value}
+
+    body = req.get("body")
+    headers = req.get("headers")
+    normalized: dict[str, Any] = {"method": method, "path": path, "query": q}
+    if isinstance(headers, dict):
+        normalized["headers"] = {str(k): str(v) for k, v in headers.items() if str(k).strip()}
+    if body is None:
+        return normalized
+    if isinstance(body, dict):
+        normalized["body"] = _inject_canary_into_mapping({str(k): str(v) for k, v in body.items()}, canary_value, reserved_query_keys, fallback_key)
+    elif isinstance(body, str):
+        _normalize_request_body_string(body.strip(), canary_value, reserved_query_keys, fallback_key, normalized)
+    else:
+        normalized["body_text"] = _inject_canary_value(str(body), canary_value)
+    return normalized
+
+
+def _request_transport(req: dict[str, Any]) -> str:
+    headers = req.get("headers")
+    content_type = ""
+    if isinstance(headers, dict):
+        content_type = str(
+            headers.get("Content-Type")
+            or headers.get("content-type")
+            or ""
+        ).casefold()
+    if "multipart/form-data" in content_type:
+        return "multipart"
+    if "application/json" in content_type:
+        return "json"
+    if "xml" in content_type or isinstance(req.get("body_text"), str) and str(req.get("body_text", "")).lstrip().startswith("<"):
+        return "xml"
+    if isinstance(req.get("body"), dict):
+        return "form"
+    return "query"
+
+
+def _neutralize_control_mapping(mapping: dict[str, Any], marker: str, canonical_class: str) -> dict[str, Any]:
+    result = {
+        str(k): ("1" if str(v).strip() else marker)
+        for k, v in mapping.items()
+    }
+    if result:
+        first = next(iter(result))
+        result[first] = marker if canonical_class == "xss_output_boundary" else "1"
+    return result
+
+
+def _neutralize_body_text(raw: str, canonical_class: str, marker: str) -> str:
+    if canonical_class == "xxe_influence":
+        cleaned = re.sub(r"<!DOCTYPE[^>]*>", "", raw, flags=re.IGNORECASE | re.DOTALL)
+        return re.sub(r"<!ENTITY[^>]*>", "", cleaned, flags=re.IGNORECASE | re.DOTALL)
+    if canonical_class == "command_injection_boundary":
+        return re.sub(r"[;&|`$><]", "", raw)
+    if canonical_class == "sql_injection_boundary":
+        return re.sub(r"(?i)(union|select|sleep|and|or|--|#|')", "", raw)
+    return marker
+
+
+def _neutralize_control_request(req: dict[str, Any], label: str, canonical_class: str) -> dict[str, Any]:
+    clone = copy.deepcopy(req)
+    marker = f"padv-negative-{label}"
+    if isinstance(clone.get("query"), dict):
+        clone["query"] = _neutralize_control_mapping(clone["query"], marker, canonical_class)
+    if isinstance(clone.get("body"), dict):
+        clone["body"] = _neutralize_control_mapping(clone["body"], marker, canonical_class)
+    if isinstance(clone.get("body_text"), str):
+        clone["body_text"] = _neutralize_body_text(str(clone["body_text"]), canonical_class, marker)
+    return clone
+
+
+
+def _resolve_plan_fields(
     response: dict[str, Any],
-    config: PadvConfig,
-) -> ValidationPlan:
-    candidate = apply_validation_profile(candidate)
-    profile = profile_for_vuln_class(candidate.canonical_class or candidate.vuln_class)
-    intercepts = response.get("intercepts")
+    candidate: Candidate,
+) -> tuple[list[str], list[str], list[str], list[str]]:
+    """Resolve oracle_functions, request_expectations, response_witnesses from response and candidate."""
+    original_intercepts = _normalize_plan_string_list(response.get("intercepts"))
     oracle_functions_raw = response.get("oracle_functions")
     request_expectations_raw = response.get("request_expectations")
     response_witnesses_raw = response.get("response_witnesses")
-    pos = response.get("positive_requests")
-    neg = response.get("negative_requests")
-    if not isinstance(pos, list) or not isinstance(neg, list):
-        raise AgentExecutionError("deepagents plan response missing required list fields")
 
-    def _normalize_string_list(value: Any) -> list[str]:
-        if not isinstance(value, list):
-            return []
-        return [str(x).strip() for x in value if str(x).strip()]
-
-    def _normalize_oracle_function(value: str) -> str:
-        token = str(value).strip().replace("->", "::")
-        if not token:
-            return ""
-        match = re.match(r"^([A-Za-z_][A-Za-z0-9_:]*)\s*(?:\(\s*\))?$", token)
-        if match:
-            return match.group(1)
-        match = re.match(r"^([A-Za-z_][A-Za-z0-9_:]*)\s*\(", token)
-        if match:
-            return match.group(1)
-        return ""
-
-    def _extract_path_hint(value: str, method: str | None = None) -> str:
-        text = str(value).strip()
-        if not text:
-            return ""
-        lowered = text.casefold()
-        if method:
-            method_lower = method.casefold()
-            match = re.search(rf"\b{re.escape(method_lower)}\b(?:\s+request\b.*?\bto\b|\s+)(/[A-Za-z0-9_./?&=%:-]+)", lowered)
-            if match:
-                return match.group(1)
-        match = re.search(r"\b(?:get|post|put|patch|delete|head|options)\b(?:\s+request\b.*?\bto\b|\s+)(/[A-Za-z0-9_./?&=%:-]+)", lowered)
-        if match:
-            return match.group(1)
-        if text.startswith("/"):
-            return text
-        return ""
-
-    def _preferred_request_path(method: str) -> str:
-        candidates: list[str] = []
-        if candidate.entrypoint_hint:
-            candidates.append(str(candidate.entrypoint_hint))
-        candidates.extend(str(x) for x in candidate.web_path_hints if str(x).strip())
-        candidates.extend(request_expectations)
-        for raw in candidates:
-            hint = _extract_path_hint(raw, method)
-            if hint and hint != "/":
-                return hint
-        return "/"
-
-    def _split_intercepts(values: list[str]) -> tuple[list[str], list[str], list[str]]:
-        oracle_functions: list[str] = []
-        request_expectations: list[str] = []
-        response_witnesses: list[str] = []
-        for raw in values:
-            item = str(raw).strip()
-            lowered = item.casefold()
-            if not item:
-                continue
-            if re.match(r"^(get|post|put|patch|delete|head|options)\s+/", lowered):
-                request_expectations.append(item)
-                continue
-            if lowered.startswith("content-type:") or lowered.startswith("soapaction:") or lowered.startswith("cookie:"):
-                request_expectations.append(item)
-                continue
-            if lowered.startswith("http "):
-                response_witnesses.append(item)
-                continue
-            if "<" in item and ">" in item:
-                if any(marker in lowered for marker in ("<output", "<pre", "<script", "<html", "<body")):
-                    response_witnesses.append(item)
-                else:
-                    request_expectations.append(item)
-                continue
-            if "/" in item and " " not in item and item.startswith("/"):
-                request_expectations.append(item)
-                continue
-            if "=" in item and " " not in item and not item.startswith("uid=") and not item.startswith("www-data"):
-                request_expectations.append(item)
-                continue
-            if any(marker in lowered for marker in ("uid=", "www-data", "root:x", "phpinfo", "fatal error", "warning:", "notice:")):
-                response_witnesses.append(item)
-                continue
-            oracle_functions.append(_normalize_oracle_function(item))
-        return (
-            sorted(dict.fromkeys(x for x in oracle_functions if x)),
-            sorted(dict.fromkeys(x for x in request_expectations if x)),
-            sorted(dict.fromkeys(x for x in response_witnesses if x)),
-        )
-
-    original_intercepts = _normalize_string_list(intercepts)
     allowed_oracle_functions = sorted(
         {
             normalized
@@ -3226,12 +3497,12 @@ def _normalize_validation_plan_response(
     oracle_functions = sorted(
         dict.fromkeys(
             normalized
-            for normalized in (_normalize_oracle_function(x) for x in _normalize_string_list(oracle_functions_raw))
+            for normalized in (_normalize_oracle_function(x) for x in _normalize_plan_string_list(oracle_functions_raw))
             if normalized
         )
     )
-    request_expectations = sorted(dict.fromkeys(_normalize_string_list(request_expectations_raw)))
-    response_witnesses = sorted(dict.fromkeys(_normalize_string_list(response_witnesses_raw)))
+    request_expectations = sorted(dict.fromkeys(_normalize_plan_string_list(request_expectations_raw)))
+    response_witnesses = sorted(dict.fromkeys(_normalize_plan_string_list(response_witnesses_raw)))
 
     if original_intercepts and (not oracle_functions or not request_expectations or not response_witnesses):
         split_oracle, split_request, split_response = _split_intercepts(original_intercepts)
@@ -3244,7 +3515,6 @@ def _normalize_validation_plan_response(
 
     if allowed_oracle_functions:
         oracle_functions = [item for item in oracle_functions if item in allowed_oracle_functions]
-
     if not oracle_functions:
         oracle_functions = list(allowed_oracle_functions)
     if not oracle_functions:
@@ -3252,199 +3522,116 @@ def _normalize_validation_plan_response(
 
     normalized_intercepts = sorted(
         dict.fromkeys(
-            [
-                *original_intercepts,
-                *oracle_functions,
-                *request_expectations,
-                *response_witnesses,
-            ]
+            [*original_intercepts, *oracle_functions, *request_expectations, *response_witnesses]
         )
     )
-    canary = f"padv-{candidate.candidate_id}-{uuid.uuid4().hex[:10]}"
+    return oracle_functions, request_expectations, response_witnesses, normalized_intercepts
 
-    allowed_methods = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
-    reserved_query_keys = {
+
+def _build_reserved_query_keys(config: PadvConfig) -> set[str]:
+    return {
         config.canary.parameter_name.casefold(),
         "page",
-        "popUpNotificationCode".casefold(),
+        "popupnotificationcode",
         "security_level",
         "security-level",
         "phpsessid",
         "wsdl",
     }
 
-    def _inject_canary_value(value: str, canary_value: str) -> str:
-        stripped = str(value)
-        if canary_value in stripped:
-            return stripped
-        return f"{stripped} {canary_value}".strip()
 
-    def _inject_canary_into_mapping(mapping: dict[str, str], canary_value: str) -> dict[str, str]:
-        mutated = {str(k): str(v) for k, v in mapping.items()}
-        injected = False
-        for key in list(mutated.keys()):
-            if key.casefold() in reserved_query_keys:
+def _filter_plan_requests(
+    items: list[dict[str, Any]],
+    *,
+    control: bool,
+    canary: str,
+    candidate: Candidate,
+    request_expectations: list[str],
+    reserved_query_keys: set[str],
+    fallback_key: str,
+    profile: Any,
+) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for idx, item in enumerate(items):
+        canary_value = "padv-negative-control" if control else canary
+        normalized = _normalize_plan_request(item, canary_value, candidate, request_expectations, reserved_query_keys, fallback_key)
+        if profile.allowed_transports:
+            transport = _request_transport(normalized)
+            if transport not in profile.allowed_transports:
                 continue
-            mutated[key] = _inject_canary_value(mutated[key], canary_value)
-            injected = True
-        if not injected:
-            mutated[config.canary.parameter_name] = canary_value
-        return mutated
+        out.append(normalized)
+    return out
 
-    def _inject_canary_into_xml(body_text: str, canary_value: str) -> str:
-        def _replace(match: re.Match[str]) -> str:
-            opening, content, closing = match.group(1), match.group(2), match.group(3)
-            content = content.strip()
-            if not content or canary_value in content:
-                return match.group(0)
-            return f"{opening}{_inject_canary_value(content, canary_value)}{closing}"
 
-        return re.sub(r"(<([A-Za-z0-9:_-]+)[^>]*>)([^<]+)(</\\2>)", _replace, body_text)
-
-    def _normalize_request(req: dict[str, Any], canary_value: str) -> dict[str, Any]:
-        method_raw = req.get("method")
-        method = str(method_raw).strip().upper() if method_raw is not None else "GET"
-        if method not in allowed_methods:
-            method = "GET"
-
-        path_raw = req.get("path")
-        path = str(path_raw).strip() if path_raw is not None else ""
-        if not path:
-            path = _preferred_request_path(method)
-        if not path.startswith("/"):
-            path = "/" + path
-
-        query = req.get("query")
-        if not isinstance(query, dict):
-            query = req.get("params")
-        if isinstance(query, dict):
-            q = _inject_canary_into_mapping({str(k): str(v) for k, v in query.items()}, canary_value)
-        else:
-            q = {config.canary.parameter_name: canary_value}
-
-        body = req.get("body")
-        headers = req.get("headers")
-        normalized: dict[str, Any] = {"method": method, "path": path, "query": q}
-        if isinstance(headers, dict):
-            normalized["headers"] = {str(k): str(v) for k, v in headers.items() if str(k).strip()}
-        if body is not None:
-            if isinstance(body, dict):
-                normalized["body"] = _inject_canary_into_mapping({str(k): str(v) for k, v in body.items()}, canary_value)
-            elif isinstance(body, str):
-                body_str = body.strip()
-                parsed: object | None = None
-                try:
-                    parsed = json.loads(body_str)
-                except json.JSONDecodeError:
-                    parsed = None
-                if isinstance(parsed, dict):
-                    normalized["body"] = _inject_canary_into_mapping(
-                        {str(k): str(v) for k, v in parsed.items()},
-                        canary_value,
-                    )
-                    normalized.setdefault("headers", {})
-                    normalized["headers"].setdefault("Content-Type", "application/json")
-                elif "=" in body_str and not body_str.startswith("<"):
-                    form_pairs = urllib.parse.parse_qsl(body_str, keep_blank_values=True)
-                    if form_pairs:
-                        normalized["body"] = _inject_canary_into_mapping(dict(form_pairs), canary_value)
-                        normalized.setdefault("headers", {})
-                        normalized["headers"].setdefault("Content-Type", "application/x-www-form-urlencoded")
-                    else:
-                        normalized["body_text"] = _inject_canary_value(body_str, canary_value)
-                else:
-                    normalized["body_text"] = (
-                        _inject_canary_into_xml(body_str, canary_value)
-                        if body_str.startswith("<")
-                        else _inject_canary_value(body_str, canary_value)
-                    )
-                    normalized.setdefault("headers", {})
-                    if body_str.startswith("<"):
-                        normalized["headers"].setdefault("Content-Type", "text/xml")
-            else:
-                normalized["body_text"] = _inject_canary_value(str(body), canary_value)
-        return normalized
-
-    def _request_transport(req: dict[str, Any]) -> str:
-        headers = req.get("headers")
-        content_type = ""
-        if isinstance(headers, dict):
-            content_type = str(
-                headers.get("Content-Type")
-                or headers.get("content-type")
-                or ""
-            ).casefold()
-        if "multipart/form-data" in content_type:
-            return "multipart"
-        if "application/json" in content_type:
-            return "json"
-        if "xml" in content_type or isinstance(req.get("body_text"), str) and str(req.get("body_text", "")).lstrip().startswith("<"):
-            return "xml"
-        if isinstance(req.get("body"), dict):
-            return "form"
-        if isinstance(req.get("query"), dict) and req.get("query"):
-            return "query"
-        return "query"
-
-    def _neutralize_control(req: dict[str, Any], label: str) -> dict[str, Any]:
-        clone = copy.deepcopy(req)
-        marker = f"padv-negative-{label}"
-        if isinstance(clone.get("query"), dict):
-            clone["query"] = {
-                str(k): ("1" if str(v).strip() else marker)
-                for k, v in clone["query"].items()
-            }
-            if clone["query"]:
-                first = next(iter(clone["query"]))
-                clone["query"][first] = marker if profile.canonical_class == "xss_output_boundary" else "1"
-        if isinstance(clone.get("body"), dict):
-            clone["body"] = {
-                str(k): ("1" if str(v).strip() else marker)
-                for k, v in clone["body"].items()
-            }
-            if clone["body"]:
-                first = next(iter(clone["body"]))
-                clone["body"][first] = marker if profile.canonical_class == "xss_output_boundary" else "1"
-        if isinstance(clone.get("body_text"), str):
-            raw = str(clone["body_text"])
-            if profile.canonical_class == "xxe_influence":
-                clone["body_text"] = re.sub(r"<!DOCTYPE.*?>", "", raw, flags=re.IGNORECASE | re.DOTALL)
-                clone["body_text"] = re.sub(r"<!ENTITY.*?>", "", str(clone["body_text"]), flags=re.IGNORECASE | re.DOTALL)
-            elif profile.canonical_class == "command_injection_boundary":
-                clone["body_text"] = re.sub(r"[;&|`$><]", "", raw)
-            elif profile.canonical_class == "sql_injection_boundary":
-                clone["body_text"] = re.sub(r"(?i)(union|select|sleep|and|or|--|#|')", "", raw)
-            else:
-                clone["body_text"] = marker
-        return clone
-
-    def _filter_requests(items: list[dict[str, Any]], *, control: bool) -> list[dict[str, Any]]:
-        out: list[dict[str, Any]] = []
-        for idx, item in enumerate(items):
-            normalized = _normalize_request(item, "padv-negative-control" if control else canary)
-            if profile.allowed_transports:
-                transport = _request_transport(normalized)
-                if transport not in profile.allowed_transports:
-                    continue
-            out.append(normalized)
-        return out
-
-    positive_requests = _filter_requests([req for req in pos if isinstance(req, dict)], control=False)
-    if not positive_requests:
-        positive_requests = [{"method": "GET", "path": _preferred_request_path("GET"), "query": {config.canary.parameter_name: canary}}]
-    while len(positive_requests) < max(3, profile.min_positive_requests):
+def _ensure_positive_request_count(
+    positive_requests: list[dict[str, Any]],
+    min_count: int,
+    canary_param: str,
+) -> list[dict[str, Any]]:
+    while len(positive_requests) < min_count:
         clone = dict(positive_requests[-1])
         clone_query = dict(clone.get("query", {}))
-        clone_query[f"{config.canary.parameter_name}_step"] = str(len(positive_requests) + 1)
+        clone_query[f"{canary_param}_step"] = str(len(positive_requests) + 1)
         clone["query"] = clone_query
         positive_requests.append(clone)
-    positive_requests = positive_requests[:3]
+    return positive_requests[:3]
 
-    negative_requests = _filter_requests([req for req in neg if isinstance(req, dict)], control=True)
+
+def _ensure_negative_request_count(
+    negative_requests: list[dict[str, Any]],
+    positive_requests: list[dict[str, Any]],
+    min_count: int,
+    canonical_class: str,
+) -> list[dict[str, Any]]:
     if not negative_requests:
-        negative_requests = [_neutralize_control(positive_requests[0], "control-0")]
-    while len(negative_requests) < max(1, profile.min_negative_controls):
-        negative_requests.append(_neutralize_control(positive_requests[min(len(negative_requests), len(positive_requests) - 1)], f"control-{len(negative_requests)}"))
+        negative_requests = [_neutralize_control_request(positive_requests[0], "control-0", canonical_class)]
+    while len(negative_requests) < min_count:
+        source_idx = min(len(negative_requests), len(positive_requests) - 1)
+        negative_requests.append(
+            _neutralize_control_request(positive_requests[source_idx], f"control-{len(negative_requests)}", canonical_class)
+        )
+    return negative_requests
+
+
+def _normalize_validation_plan_response(
+    candidate: Candidate,
+    response: dict[str, Any],
+    config: PadvConfig,
+) -> ValidationPlan:
+    candidate = apply_validation_profile(candidate)
+    profile = profile_for_vuln_class(candidate.canonical_class or candidate.vuln_class)
+    pos = response.get("positive_requests")
+    neg = response.get("negative_requests")
+    if not isinstance(pos, list) or not isinstance(neg, list):
+        raise AgentExecutionError("deepagents plan response missing required list fields")
+
+    oracle_functions, request_expectations, response_witnesses, normalized_intercepts = _resolve_plan_fields(response, candidate)
+    canary = f"padv-{candidate.candidate_id}-{uuid.uuid4().hex[:10]}"
+    reserved_query_keys = _build_reserved_query_keys(config)
+    fallback_key = config.canary.parameter_name
+
+    filter_kwargs: dict[str, Any] = {
+        "canary": canary,
+        "candidate": candidate,
+        "request_expectations": request_expectations,
+        "reserved_query_keys": reserved_query_keys,
+        "fallback_key": fallback_key,
+        "profile": profile,
+    }
+
+    positive_requests = _filter_plan_requests(
+        [req for req in pos if isinstance(req, dict)], control=False, **filter_kwargs,
+    )
+    if not positive_requests:
+        positive_requests = [{"method": "GET", "path": _preferred_request_path_from_candidate(candidate, request_expectations, "GET"), "query": {fallback_key: canary}}]
+    positive_requests = _ensure_positive_request_count(positive_requests, max(3, profile.min_positive_requests), fallback_key)
+
+    negative_requests = _filter_plan_requests(
+        [req for req in neg if isinstance(req, dict)], control=True, **filter_kwargs,
+    )
+    negative_requests = _ensure_negative_request_count(
+        negative_requests, positive_requests, max(1, profile.min_negative_controls), profile.canonical_class,
+    )
 
     environment_requirements = sorted(
         dict.fromkeys(
@@ -3514,6 +3701,64 @@ def make_validation_plan_with_deepagents(
     return plan, trace
 
 
+def _process_validation_plan_batch(
+    batch: list[Candidate],
+    config: PadvConfig,
+    class_hint: str,
+    *,
+    repo_root: str | None,
+    session: AgentSession | None,
+) -> tuple[dict[str, ValidationPlan], dict[str, dict[str, Any]]]:
+    payload = [cand.to_dict() for cand in batch]
+    prompt = (
+        "Create strict HTTP validation plans for each listed PHP web-security candidate. "
+        "Each plan needs exactly 3 positive and at least 1 negative request, deterministic canary injection, "
+        "and a clean separation between oracle functions, request expectations, and response witnesses. "
+        "Prioritize reachable paths from web_path_hints and exploit-relevant parameters. "
+        'Return JSON: {"plans":[{"candidate_id":"...","oracle_functions":[...],"request_expectations":[...],"response_witnesses":[...],"intercepts":[...],"positive_requests":[...],"'
+        '"negative_requests":[...],"strategy":"...","negative_control_strategy":"...","plan_notes":[...]}],'
+        '"notes":[...]}. '
+        f"{class_hint} "
+        f"Canary parameter: {config.canary.parameter_name}. "
+        f"Candidates: {json.dumps(payload, ensure_ascii=True)}"
+    )
+    response = _invoke_deepagent_json(
+        prompt,
+        config,
+        repo_root=repo_root,
+        session=session,
+    )
+    raw_plans = response.get("plans")
+    if not isinstance(raw_plans, list):
+        raise AgentExecutionError("deepagents batch plan response missing plans list")
+
+    by_id = _index_raw_plans_by_candidate_id(raw_plans)
+    plans: dict[str, ValidationPlan] = {}
+    missing_ids: list[str] = []
+    for candidate in batch:
+        raw = by_id.get(candidate.candidate_id)
+        if isinstance(raw, dict):
+            plans[candidate.candidate_id] = _normalize_validation_plan_response(candidate, raw, config)
+            continue
+        missing_ids.append(candidate.candidate_id)
+    if missing_ids:
+        raise AgentExecutionError(
+            f"deepagents batch planner omitted candidate ids: {', '.join(sorted(missing_ids))}"
+        )
+    return plans, by_id
+
+
+def _index_raw_plans_by_candidate_id(raw_plans: list[Any]) -> dict[str, dict[str, Any]]:
+    by_id: dict[str, dict[str, Any]] = {}
+    for item in raw_plans:
+        if not isinstance(item, dict):
+            continue
+        cid = item.get("candidate_id")
+        if isinstance(cid, str) and cid.strip():
+            by_id[cid.strip()] = item
+    return by_id
+
+
 def make_validation_plans_with_deepagents(
     candidates: list[Candidate],
     config: PadvConfig,
@@ -3540,56 +3785,17 @@ def make_validation_plans_with_deepagents(
 
     for index in range(0, len(candidates), step):
         batch = candidates[index : index + step]
-        payload = [cand.to_dict() for cand in batch]
-        prompt = (
-            "Create strict HTTP validation plans for each listed PHP web-security candidate. "
-            "Each plan needs exactly 3 positive and at least 1 negative request, deterministic canary injection, "
-            "and a clean separation between oracle functions, request expectations, and response witnesses. "
-            "Prioritize reachable paths from web_path_hints and exploit-relevant parameters. "
-            'Return JSON: {"plans":[{"candidate_id":"...","oracle_functions":[...],"request_expectations":[...],"response_witnesses":[...],"intercepts":[...],"positive_requests":[...],'
-            '"negative_requests":[...],"strategy":"...","negative_control_strategy":"...","plan_notes":[...]}],'
-            '"notes":[...]}. '
-            f"{class_hint} "
-            f"Canary parameter: {config.canary.parameter_name}. "
-            f"Candidates: {json.dumps(payload, ensure_ascii=True)}"
+        batch_plans, by_id = _process_validation_plan_batch(
+            batch, config, class_hint, repo_root=repo_root, session=session,
         )
-        response = _invoke_deepagent_json(
-            prompt,
-            config,
-            repo_root=repo_root,
-            session=session,
-        )
-        raw_plans = response.get("plans")
-        if not isinstance(raw_plans, list):
-            raise AgentExecutionError("deepagents batch plan response missing plans list")
-
-        by_id: dict[str, dict[str, Any]] = {}
-        for item in raw_plans:
-            if not isinstance(item, dict):
-                continue
-            cid = item.get("candidate_id")
-            if isinstance(cid, str) and cid.strip():
-                by_id[cid.strip()] = item
-
-        missing_ids: list[str] = []
-        for candidate in batch:
-            raw = by_id.get(candidate.candidate_id)
-            if isinstance(raw, dict):
-                plans[candidate.candidate_id] = _normalize_validation_plan_response(candidate, raw, config)
-                continue
-            missing_ids.append(candidate.candidate_id)
-        if missing_ids:
-            raise AgentExecutionError(
-                f"deepagents batch planner omitted candidate ids: {', '.join(sorted(missing_ids))}"
-            )
-
+        plans.update(batch_plans)
         batches_trace.append(
             {
                 "batch_index": (index // step) + 1,
                 "batch_size": len(batch),
                 "returned_plan_ids": sorted(by_id.keys()),
-                "missing_ids": missing_ids,
-                "notes": response.get("notes", []),
+                "missing_ids": [],
+                "notes": [],
             }
         )
 
@@ -3713,7 +3919,6 @@ def challenge_hypotheses_with_subagent(
     config: PadvConfig,
     *,
     hypotheses: list[Hypothesis],
-    frontier_state: dict[str, Any],
 ) -> tuple[list[Refutation], dict[str, Any]]:
     prioritized_hypotheses = sorted(
         hypotheses,
@@ -3755,12 +3960,108 @@ def challenge_hypotheses_with_subagent(
         }
 
 
+def _collect_fallback_candidates(
+    prioritized_hypotheses: list[Hypothesis],
+) -> tuple[list[Candidate], dict[str, Hypothesis]]:
+    fallback_candidates: list[Candidate] = []
+    candidate_to_hypothesis: dict[str, Hypothesis] = {}
+    for item in prioritized_hypotheses:
+        candidate = item.candidate
+        if candidate.candidate_id in candidate_to_hypothesis:
+            continue
+        candidate_to_hypothesis[candidate.candidate_id] = item
+        fallback_candidates.append(candidate)
+    return fallback_candidates, candidate_to_hypothesis
+
+
+def _build_experiment_fallback_attempts(
+    fallback_candidates: list[Candidate],
+    candidate_to_hypothesis: dict[str, Hypothesis],
+    plans: dict[str, ValidationPlan],
+    exc: Exception,
+) -> list[ExperimentAttempt]:
+    attempts: list[ExperimentAttempt] = []
+    for idx, candidate in enumerate(fallback_candidates, start=1):
+        plan = plans.get(candidate.candidate_id)
+        hypothesis = candidate_to_hypothesis.get(candidate.candidate_id)
+        if plan is None or hypothesis is None:
+            continue
+        attempts.append(
+            ExperimentAttempt(
+                attempt_id=f"fallback-attempt-{idx:04d}",
+                hypothesis_id=hypothesis.hypothesis_id,
+                plan_id=f"fallback-plan-{idx:04d}",
+                request_refs=[],
+                witness_goal=hypothesis.vuln_class,
+                status="planned",
+                analysis_flags=["fallback-plan"],
+                metadata={"fallback_error": str(exc)},
+            )
+        )
+    return attempts
+
+
+def _plan_experiments_primary(
+    runtime: AgentRuntime,
+    config: PadvConfig,
+    hypotheses: list[Hypothesis],
+    prioritized_hypotheses: list[Hypothesis],
+) -> tuple[dict[str, ValidationPlan], list[ExperimentAttempt], dict[str, Any]]:
+    parsed, handoff_meta = _invoke_agent_handoff(
+        runtime,
+        runtime.subagents.get("experiment", runtime.root),
+        config,
+        category="experiment_plan",
+        envelope={
+            "hypotheses": _compact_hypotheses_for_skeptic(prioritized_hypotheses, limit=3),
+            "skeptic_scope": {
+                "focus": "exploit-invalidating objections only",
+                "defer_environmental_constraints": True,
+            },
+        },
+        response_contract='{"plans":[{"hypothesis_id":"...","candidate":{"candidate_id":"...","vuln_class":"...","title":"...","file_path":"...","line":1,"sink":"...","expected_intercepts":[...],"notes":"...","provenance":[...],"evidence_refs":[...],"confidence":0.0},"oracle_functions":[...],"request_expectations":[...],"response_witnesses":[...],"intercepts":[...],"positive_requests":[...],"negative_requests":[...],"strategy":"...","negative_control_strategy":"...","plan_notes":[...],"attempt_id":"...","plan_id":"...","request_refs":[...],"witness_goal":"...","status":"planned","analysis_flags":[...]}],"notes":[...]}',
+        workspace_role="experiment",
+    )
+    plans, attempts = _normalize_experiment_attempts(parsed.get("plans", parsed), config)
+    if hypotheses and not plans:
+        raise AgentExecutionError("experiment subagent returned zero plans")
+    return plans, attempts, {"engine": "deepagents", "notes": parsed.get("notes", []), "planned_candidate_ids": sorted(plans.keys()), **handoff_meta}
+
+
+def _plan_experiments_fallback(
+    runtime: AgentRuntime,
+    config: PadvConfig,
+    hypotheses: list[Hypothesis],
+    prioritized_hypotheses: list[Hypothesis],
+    exc: AgentExecutionError,
+) -> tuple[dict[str, ValidationPlan], list[ExperimentAttempt], dict[str, Any]]:
+    fallback_candidates, candidate_to_hypothesis = _collect_fallback_candidates(prioritized_hypotheses)
+    if not fallback_candidates:
+        raise exc
+    plans, fallback_trace = make_validation_plans_with_deepagents(
+        fallback_candidates,
+        config,
+        repo_root=runtime.repo_root,
+        session=runtime.subagents.get("experiment", runtime.root),
+        batch_size=2,
+    )
+    attempts = _build_experiment_fallback_attempts(fallback_candidates, candidate_to_hypothesis, plans, exc)
+    if hypotheses and not plans:
+        raise exc
+    return plans, attempts, {
+        "engine": "deepagents-fallback",
+        "notes": [],
+        "planned_candidate_ids": sorted(plans.keys()),
+        "fallback_error": str(exc),
+        "fallback_trace": fallback_trace,
+    }
+
+
 def plan_experiments_with_subagent(
     runtime: AgentRuntime,
     config: PadvConfig,
     *,
     hypotheses: list[Hypothesis],
-    frontier_state: dict[str, Any],
 ) -> tuple[dict[str, ValidationPlan], list[ExperimentAttempt], dict[str, Any]]:
     prioritized_hypotheses = sorted(
         hypotheses,
@@ -3770,70 +4071,9 @@ def plan_experiments_with_subagent(
     if not prioritized_hypotheses:
         return {}, [], {"engine": "deepagents", "reason": "no-hypotheses", "planned_candidate_ids": []}
     try:
-        parsed, handoff_meta = _invoke_agent_handoff(
-            runtime,
-            runtime.subagents.get("experiment", runtime.root),
-            config,
-            category="experiment_plan",
-            envelope={
-                "hypotheses": _compact_hypotheses_for_skeptic(prioritized_hypotheses, limit=3),
-                "skeptic_scope": {
-                    "focus": "exploit-invalidating objections only",
-                    "defer_environmental_constraints": True,
-                },
-            },
-            response_contract='{"plans":[{"hypothesis_id":"...","candidate":{"candidate_id":"...","vuln_class":"...","title":"...","file_path":"...","line":1,"sink":"...","expected_intercepts":[...],"notes":"...","provenance":[...],"evidence_refs":[...],"confidence":0.0},"oracle_functions":[...],"request_expectations":[...],"response_witnesses":[...],"intercepts":[...],"positive_requests":[...],"negative_requests":[...],"strategy":"...","negative_control_strategy":"...","plan_notes":[...],"attempt_id":"...","plan_id":"...","request_refs":[...],"witness_goal":"...","status":"planned","analysis_flags":[...]}],"notes":[...]}',
-            workspace_role="experiment",
-        )
-        plans, attempts = _normalize_experiment_attempts(parsed.get("plans", parsed), config)
-        if hypotheses and not plans:
-            raise AgentExecutionError("experiment subagent returned zero plans")
-        return plans, attempts, {"engine": "deepagents", "notes": parsed.get("notes", []), "planned_candidate_ids": sorted(plans.keys()), **handoff_meta}
+        return _plan_experiments_primary(runtime, config, hypotheses, prioritized_hypotheses)
     except AgentExecutionError as exc:
-        fallback_candidates: list[Candidate] = []
-        candidate_to_hypothesis: dict[str, Hypothesis] = {}
-        for item in prioritized_hypotheses:
-            candidate = item.candidate
-            if candidate.candidate_id in candidate_to_hypothesis:
-                continue
-            candidate_to_hypothesis[candidate.candidate_id] = item
-            fallback_candidates.append(candidate)
-        if not fallback_candidates:
-            raise
-        plans, fallback_trace = make_validation_plans_with_deepagents(
-            fallback_candidates,
-            config,
-            repo_root=runtime.repo_root,
-            session=runtime.subagents.get("experiment", runtime.root),
-            batch_size=2,
-        )
-        attempts: list[ExperimentAttempt] = []
-        for idx, candidate in enumerate(fallback_candidates, start=1):
-            plan = plans.get(candidate.candidate_id)
-            hypothesis = candidate_to_hypothesis.get(candidate.candidate_id)
-            if plan is None or hypothesis is None:
-                continue
-            attempts.append(
-                ExperimentAttempt(
-                    attempt_id=f"fallback-attempt-{idx:04d}",
-                    hypothesis_id=hypothesis.hypothesis_id,
-                    plan_id=f"fallback-plan-{idx:04d}",
-                    request_refs=[],
-                    witness_goal=hypothesis.vuln_class,
-                    status="planned",
-                    analysis_flags=["fallback-plan"],
-                    metadata={"fallback_error": str(exc)},
-                )
-            )
-        if hypotheses and not plans:
-            raise
-        return plans, attempts, {
-            "engine": "deepagents-fallback",
-            "notes": [],
-            "planned_candidate_ids": sorted(plans.keys()),
-            "fallback_error": str(exc),
-            "fallback_trace": fallback_trace,
-        }
+        return _plan_experiments_fallback(runtime, config, hypotheses, prioritized_hypotheses, exc)
 
 
 def decide_continue_with_root_agent(

@@ -197,6 +197,34 @@ def _run_scip_print(scip_file: Path, config: PadvConfig, repo_root: Path) -> str
     return proc.stdout or ""
 
 
+def _pattern_candidates(raw: str) -> set[str]:
+    candidates = {raw}
+    candidates.add(raw.replace(" ", ""))
+    candidates.add(re.sub(r"[^a-z0-9_$]", "", raw))
+    if "::" in raw:
+        candidates.add(raw.split("::", 1)[1])
+    if raw.startswith("$_get") or raw.startswith("$_post") or raw.startswith("$_session"):
+        candidates.add(raw.split("[", 1)[0])
+    if raw.startswith("echo"):
+        candidates.add("echo")
+    return candidates
+
+
+def _best_token_score(tokens: set[str], normalized: str, compact_symbol: str) -> int:
+    best = -1
+    for token in sorted(c for c in tokens if c):
+        compact_token = re.sub(r"[^a-z0-9_$]", "", token)
+        is_match = token in normalized
+        if not is_match and compact_token:
+            is_match = compact_token in compact_symbol or compact_symbol.startswith(compact_token)
+        if not is_match:
+            continue
+        score = len(compact_token or token)
+        if score > best:
+            best = score
+    return best
+
+
 def _match_vuln_class(symbol: str) -> str | None:
     normalized = symbol.casefold()
     compact_symbol = re.sub(r"[^a-z0-9_$]", "", normalized)
@@ -207,33 +235,11 @@ def _match_vuln_class(symbol: str) -> str | None:
             raw = pattern.replace("(", "").replace(")", "").replace("->", "::").casefold().strip()
             if not raw:
                 continue
-
-            candidates = {raw}
-            candidates.add(raw.replace(" ", ""))
-            candidates.add(re.sub(r"[^a-z0-9_$]", "", raw))
-            if "::" in raw:
-                candidates.add(raw.split("::", 1)[1])
-            if raw.startswith("$_get") or raw.startswith("$_post") or raw.startswith("$_session"):
-                candidates.add(raw.split("[", 1)[0])
-            if raw.startswith("echo"):
-                candidates.add("echo")
-
-            for token in sorted(c for c in candidates if c):
-                compact_token = re.sub(r"[^a-z0-9_$]", "", token)
-                matched = False
-                if token in normalized:
-                    matched = True
-                elif compact_token and compact_token in compact_symbol:
-                    matched = True
-                elif compact_token and compact_symbol.startswith(compact_token):
-                    matched = True
-                if not matched:
-                    continue
-
-                score = len(compact_token or token)
-                if score > best_score:
-                    best_score = score
-                    best_class = spec.vuln_class
+            tokens = _pattern_candidates(raw)
+            score = _best_token_score(tokens, normalized, compact_symbol)
+            if score > best_score:
+                best_score = score
+                best_class = spec.vuln_class
     return best_class
 
 
@@ -264,12 +270,11 @@ def _iter_documents(payload: object) -> list[tuple[str, list[dict[str, object]]]
     return out
 
 
-def _extract_hits_with_meta(print_stdout: str) -> tuple[list[ScipSymbolHit], ScipDiscoveryMeta]:
+def _parse_scip_payload(print_stdout: str) -> object:
     if isinstance(print_stdout, tuple) and len(print_stdout) == 1 and isinstance(print_stdout[0], str):
         print_stdout = print_stdout[0]
-    payload: object
     try:
-        payload = json.loads(print_stdout)
+        return json.loads(print_stdout)
     except json.JSONDecodeError:
         rows: list[object] = []
         for raw_line in print_stdout.splitlines():
@@ -280,7 +285,20 @@ def _extract_hits_with_meta(print_stdout: str) -> tuple[list[ScipSymbolHit], Sci
                 rows.append(json.loads(line))
             except json.JSONDecodeError:
                 continue
-        payload = rows
+        return rows
+
+
+def _line_number_from_occurrence(occ: dict[str, object]) -> int:
+    range_value = occ.get("range")
+    if isinstance(range_value, list) and range_value:
+        first = range_value[0]
+        if isinstance(first, int):
+            return first + 1
+    return 1
+
+
+def _extract_hits_with_meta(print_stdout: str) -> tuple[list[ScipSymbolHit], ScipDiscoveryMeta]:
+    payload = _parse_scip_payload(print_stdout)
 
     hits: list[ScipSymbolHit] = []
     seen: set[tuple[str, int, str, str]] = set()
@@ -296,13 +314,7 @@ def _extract_hits_with_meta(print_stdout: str) -> tuple[list[ScipSymbolHit], Sci
                 continue
             mapped_hits += 1
 
-            line_no = 1
-            range_value = occ.get("range")
-            if isinstance(range_value, list) and range_value:
-                first = range_value[0]
-                if isinstance(first, int):
-                    line_no = first + 1
-
+            line_no = _line_number_from_occurrence(occ)
             key = (file_path, line_no, symbol, vuln_class)
             if key in seen:
                 continue
