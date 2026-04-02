@@ -513,12 +513,75 @@ async def _navigate_and_extract_page(
     return canonical, path, query_params + raw_params, candidate_urls, observation
 
 
+def _route_continue_factory(config: PadvConfig) -> Callable[[_WebState], str]:
+    max_actions = config.web.max_actions
+    max_pages = config.web.max_pages
+
+    def _route(state: _WebState) -> str:
+        if int(state.get("steps", 0)) >= max_actions:
+            return "done"
+        if len(state.get("visited", [])) >= max_pages:
+            return "done"
+        return "done" if not state.get("queue") else "again"
+
+    return _route
+
+
+async def _crawl_with_browser(config: PadvConfig, page: Any, base_url: str, requests: list[dict[str, Any]], initial_queue: list[str], initial_seen: list[str]) -> dict[str, Any]:
+    timeout_ms = max(1, int(config.web.request_timeout_seconds)) * 1000
+
+    def _unpack(state: _WebState) -> tuple[list, list, list, dict, list, list, int]:
+        return (
+            list(state.get("queue", [])), list(state.get("seen", [])),
+            list(state.get("visited", [])), dict(state.get("found", {})),
+            list(state.get("pages", [])), list(state.get("errors", [])),
+            int(state.get("steps", 0)),
+        )
+
+    def _pack(queue: list, seen: list, visited: list, found: dict, pages_list: list, errors: list, steps: int, current_url: str, current_path: str, candidate_urls: list[str], candidate_params: list[str]) -> _WebState:
+        return {"queue": queue, "seen": seen, "visited": visited, "found": found, "pages": pages_list, "requests": list(requests), "errors": errors, "steps": steps, "current_url": current_url, "current_path": current_path, "candidate_urls": candidate_urls, "candidate_params": candidate_params}
+
+    async def _node_navigate_extract(state: _WebState) -> _WebState:
+        queue, seen, visited, found, pages_list, errors, steps = _unpack(state)
+        current = _pop_next_unvisited(queue, visited)
+        if not current:
+            return _pack(queue, seen, visited, found, pages_list, errors, steps, "", "", [], [])
+        steps += 1
+        canonical_current, current_path = current, _normalize_path(current)[0]
+        candidate_urls: list[str] = []
+        candidate_params: list[str] = []
+        try:
+            canonical_current, current_path, all_params, candidate_urls, obs = await _navigate_and_extract_page(page, current, base_url, timeout_ms)
+            candidate_params = list(obs.get("params", []))
+            found = _add_found(found, current_path, all_params)
+            _seed_urls_into_queue(candidate_urls, seen, visited, queue, max(config.web.max_pages * 6, 64))
+            pages_list.append(_build_page_record(canonical_current, current_path, obs, candidate_params, candidate_urls))
+        except Exception:
+            errors.append(f"navigation_failed:{current}")
+        if canonical_current not in visited:
+            visited.append(canonical_current)
+        return _pack(queue, seen, visited, found, pages_list, errors, steps, canonical_current, current_path, candidate_urls, candidate_params)
+
+    async def _node_llm_plan(state: _WebState) -> _WebState:
+        queue, seen, visited, found = list(state.get("queue", [])), list(state.get("seen", [])), list(state.get("visited", [])), dict(state.get("found", {}))
+        current_url = str(state.get("current_url", "")).strip()
+        current_path = str(state.get("current_path", "")).strip() or "/"
+        remaining = max(0, config.web.max_pages - len(visited))
+        if not current_url or remaining <= 0:
+            return {"queue": queue, "seen": seen, "visited": visited, "found": found}
+        llm_urls, llm_params = await _llm_select_next_urls(config, current_url=current_url, visited_urls=visited, candidate_urls=list(state.get("candidate_urls", [])), candidate_params=list(state.get("candidate_params", [])), remaining_budget=remaining)
+        found = _add_found(found, current_path, llm_params)
+        _enqueue_llm_urls(llm_urls, base_url, seen, visited, queue, max(config.web.max_pages * 8, 96))
+        return {"queue": queue, "seen": seen, "visited": visited, "found": found, "pages": list(state.get("pages", [])), "requests": list(requests), "errors": list(state.get("errors", []))}
+
+    return await _run_crawl_graph(_node_navigate_extract, _node_llm_plan, _route_continue_factory(config), initial_queue, initial_seen)
+
+
 async def _discover_with_playwright_async(
     config: PadvConfig,
     seed_urls: list[str] | None = None,
     auth_state: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    from langgraph.graph import END, START, StateGraph  # type: ignore[import-not-found]
     from playwright.async_api import async_playwright  # type: ignore[import-not-found]
 
     base_url = config.target.base_url
@@ -536,110 +599,7 @@ async def _discover_with_playwright_async(
         requests: list[dict[str, Any]] = []
         page.on("request", _make_request_recorder(requests, base_url))
 
-        timeout_ms = max(1, int(config.web.request_timeout_seconds)) * 1000
-
-        def _unpack_navigate_state(state: _WebState) -> tuple[list, list, list, dict, list, list, int]:
-            return (
-                list(state.get("queue", [])),
-                list(state.get("seen", [])),
-                list(state.get("visited", [])),
-                dict(state.get("found", {})),
-                list(state.get("pages", [])),
-                list(state.get("errors", [])),
-                int(state.get("steps", 0)),
-            )
-
-        def _build_navigate_result(
-            queue: list, seen: list, visited: list, found: dict,
-            pages_list: list, errors: list, steps: int,
-            current_url: str, current_path: str,
-            candidate_urls: list[str], candidate_params: list[str],
-        ) -> _WebState:
-            return {
-                "queue": queue, "seen": seen, "visited": visited,
-                "found": found, "pages": pages_list, "requests": list(requests),
-                "errors": errors, "steps": steps, "current_url": current_url,
-                "current_path": current_path, "candidate_urls": candidate_urls,
-                "candidate_params": candidate_params,
-            }
-
-        async def _node_navigate_extract(state: _WebState) -> _WebState:
-            queue, seen, visited, found, pages_list, errors, steps = _unpack_navigate_state(state)
-
-            current = _pop_next_unvisited(queue, visited)
-            if not current:
-                return _build_navigate_result(queue, seen, visited, found, pages_list, errors, steps, "", "", [], [])
-
-            steps += 1
-            canonical_current = current
-            current_path = _normalize_path(current)[0]
-            candidate_urls: list[str] = []
-            candidate_params: list[str] = []
-
-            try:
-                canonical_current, current_path, all_params, candidate_urls, obs = (
-                    await _navigate_and_extract_page(page, current, base_url, timeout_ms)
-                )
-                candidate_params = list(obs.get("params", []))
-                found = _add_found(found, current_path, all_params)
-                _seed_urls_into_queue(candidate_urls, seen, visited, queue, max(config.web.max_pages * 6, 64))
-                pages_list.append(_build_page_record(canonical_current, current_path, obs, candidate_params, candidate_urls))
-            except Exception:
-                errors.append(f"navigation_failed:{current}")
-
-            if canonical_current not in visited:
-                visited.append(canonical_current)
-
-            return _build_navigate_result(
-                queue, seen, visited, found, pages_list, errors, steps,
-                canonical_current, current_path, candidate_urls, candidate_params,
-            )
-
-        async def _node_llm_plan(state: _WebState) -> _WebState:
-            queue = list(state.get("queue", []))
-            seen = list(state.get("seen", []))
-            visited = list(state.get("visited", []))
-            found = dict(state.get("found", {}))
-
-            current_url = str(state.get("current_url", "")).strip()
-            current_path = str(state.get("current_path", "")).strip() or "/"
-
-            remaining = max(0, config.web.max_pages - len(visited))
-            if not current_url or remaining <= 0:
-                return {"queue": queue, "seen": seen, "visited": visited, "found": found}
-
-            llm_urls, llm_params = await _llm_select_next_urls(
-                config,
-                current_url=current_url,
-                visited_urls=visited,
-                candidate_urls=list(state.get("candidate_urls", [])),
-                candidate_params=list(state.get("candidate_params", [])),
-                remaining_budget=remaining,
-            )
-
-            found = _add_found(found, current_path, llm_params)
-            _enqueue_llm_urls(llm_urls, base_url, seen, visited, queue, max(config.web.max_pages * 8, 96))
-
-            return {
-                "queue": queue, "seen": seen, "visited": visited, "found": found,
-                "pages": list(state.get("pages", [])),
-                "requests": list(requests),
-                "errors": list(state.get("errors", [])),
-            }
-
-        def _route_continue(state: _WebState) -> str:
-            if int(state.get("steps", 0)) >= config.web.max_actions:
-                return "done"
-            if len(state.get("visited", [])) >= config.web.max_pages:
-                return "done"
-            if not state.get("queue"):
-                return "done"
-            return "again"
-
-        result = await _run_crawl_graph(
-            _node_navigate_extract, _node_llm_plan, _route_continue,
-            initial_queue, initial_seen,
-        )
+        result = await _crawl_with_browser(config, page, base_url, requests, initial_queue, initial_seen)
 
         await context.close()
         await browser.close()
