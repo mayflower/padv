@@ -1389,6 +1389,16 @@ class _ToolCtx:
         _emit_shared_progress(self.shared_context, role=self.role, status="activity", detail=detail, artifact_ref=relative, tool=tool_name)
 
 
+def _query_filtered_shared_list(ctx: _ToolCtx, context_key: str, tool_name: str, selector: str) -> str:
+    items = _shared_context_snapshot(ctx.shared_context, context_key, [])
+    if not isinstance(items, list):
+        return "[]"
+    token = str(selector or "").strip().lower()
+    filtered = _filter_shared_list_by_selector(items, token)
+    ctx.record_tool_use(tool_name, selector=token[:120], count=len(filtered))
+    return json.dumps(filtered, ensure_ascii=True)
+
+
 def _build_query_tools(ctx: _ToolCtx, tool: Any) -> list[Any]:
     """Build context-query tools (objectives, findings, hypotheses, etc.)."""
 
@@ -1425,46 +1435,22 @@ def _build_query_tools(ctx: _ToolCtx, tool: Any) -> list[Any]:
     @tool("list_hypotheses")
     def list_hypotheses(selector: str = "") -> str:
         """List current hypotheses filtered by objective, class, candidate or text selector."""
-        items = _shared_context_snapshot(ctx.shared_context, "hypotheses", [])
-        if not isinstance(items, list):
-            return "[]"
-        token = str(selector or "").strip().lower()
-        filtered = _filter_shared_list_by_selector(items, token)
-        ctx.record_tool_use("list_hypotheses", selector=token[:120], count=len(filtered))
-        return json.dumps(filtered, ensure_ascii=True)
+        return _query_filtered_shared_list(ctx, "hypotheses", "list_hypotheses", selector)
 
     @tool("list_refutations")
     def list_refutations(selector: str = "") -> str:
         """List current refutations filtered by hypothesis, severity or text selector."""
-        items = _shared_context_snapshot(ctx.shared_context, "refutations", [])
-        if not isinstance(items, list):
-            return "[]"
-        token = str(selector or "").strip().lower()
-        filtered = _filter_shared_list_by_selector(items, token)
-        ctx.record_tool_use("list_refutations", selector=token[:120], count=len(filtered))
-        return json.dumps(filtered, ensure_ascii=True)
+        return _query_filtered_shared_list(ctx, "refutations", "list_refutations", selector)
 
     @tool("list_experiment_attempts")
     def list_experiment_attempts(selector: str = "") -> str:
         """List current planned experiment attempts filtered by hypothesis or text selector."""
-        items = _shared_context_snapshot(ctx.shared_context, "experiment_board", [])
-        if not isinstance(items, list):
-            return "[]"
-        token = str(selector or "").strip().lower()
-        filtered = _filter_shared_list_by_selector(items, token)
-        ctx.record_tool_use("list_experiment_attempts", selector=token[:120], count=len(filtered))
-        return json.dumps(filtered, ensure_ascii=True)
+        return _query_filtered_shared_list(ctx, "experiment_board", "list_experiment_attempts", selector)
 
     @tool("list_task_delegations")
     def list_task_delegations(selector: str = "") -> str:
         """List recorded root task delegations filtered by subagent type or text selector."""
-        items = _shared_context_snapshot(ctx.shared_context, "delegations", [])
-        if not isinstance(items, list):
-            return "[]"
-        token = str(selector or "").strip().lower()
-        filtered = _filter_shared_list_by_selector(items, token)
-        ctx.record_tool_use("list_task_delegations", selector=token[:120], count=len(filtered))
-        return json.dumps(filtered, ensure_ascii=True)
+        return _query_filtered_shared_list(ctx, "delegations", "list_task_delegations", selector)
 
     result = [
         list_objectives, list_research_findings, list_hypotheses,

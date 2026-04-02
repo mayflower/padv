@@ -537,7 +537,7 @@ def _has_class_oracle_witness(
     return False
 
 
-def _derive_body_canary_flags(body: str, canary: str) -> set[str]:
+def _derive_body_canary_flags(body: str, canary: str) -> tuple[set[str], bool]:
     flags: set[str] = set()
     escaped = html.escape(canary, quote=True)
     has_raw_canary = canary in body
@@ -573,6 +573,30 @@ def _derive_header_flags(response: Any) -> set[str]:
     return set()
 
 
+def _check_authz_bypass_status(response: Any, anonymous_probe: Any) -> bool:
+    return (
+        _status_ok(int(response.status_code))
+        and _status_ok(int(anonymous_probe.status_code))
+        and not _looks_like_login(response)
+        and not _looks_like_login(anonymous_probe)
+    )
+
+
+def _check_idor_bypass(response: Any, anonymous_probe: Any, request_spec: dict[str, Any]) -> bool:
+    if not _request_has_id(request_spec):
+        return False
+    if not _status_ok(int(response.status_code)) or not _status_ok(int(anonymous_probe.status_code)):
+        return False
+    return (response.body or "") != (anonymous_probe.body or "")
+
+
+def _check_csrf_missing_token(response: Any, request_spec: dict[str, Any]) -> bool:
+    method = str(request_spec.get("method", "GET")).upper()
+    if method not in {"POST", "PUT", "PATCH", "DELETE"}:
+        return False
+    return not _request_has_token(request_spec) and _status_ok(int(response.status_code))
+
+
 def _derive_authz_probe_flags(
     candidate: Candidate,
     response: Any,
@@ -580,31 +604,19 @@ def _derive_authz_probe_flags(
     request_spec: dict[str, Any],
 ) -> set[str]:
     flags: set[str] = {"authz_pair_observed"}
-    auth_login_like = _looks_like_login(response)
-    anon_login_like = _looks_like_login(anonymous_probe)
 
-    if (
-        _status_ok(int(response.status_code))
-        and _status_ok(int(anonymous_probe.status_code))
-        and not auth_login_like
-        and not anon_login_like
-    ):
+    if _check_authz_bypass_status(response, anonymous_probe):
         flags.add("authz_bypass_status")
 
-    if candidate.vuln_class == "auth_and_session_failures" and _status_ok(int(anonymous_probe.status_code)):
-        if not anon_login_like:
+    if candidate.vuln_class == "auth_and_session_failures":
+        if _status_ok(int(anonymous_probe.status_code)) and not _looks_like_login(anonymous_probe):
             flags.add("auth_bypass")
 
-    if candidate.vuln_class == "idor_invariant_missing":
-        if _request_has_id(request_spec) and _status_ok(int(response.status_code)) and _status_ok(int(anonymous_probe.status_code)):
-            if (response.body or "") != (anonymous_probe.body or ""):
-                flags.add("idor_bypass")
+    if candidate.vuln_class == "idor_invariant_missing" and _check_idor_bypass(response, anonymous_probe, request_spec):
+        flags.add("idor_bypass")
 
-    if candidate.vuln_class == "csrf_invariant_missing":
-        method = str(request_spec.get("method", "GET")).upper()
-        if method in {"POST", "PUT", "PATCH", "DELETE"} and not _request_has_token(request_spec):
-            if _status_ok(int(response.status_code)):
-                flags.add("csrf_missing_token_acceptance")
+    if candidate.vuln_class == "csrf_invariant_missing" and _check_csrf_missing_token(response, request_spec):
+        flags.add("csrf_missing_token_acceptance")
 
     return flags
 
@@ -624,7 +636,7 @@ def _derive_session_fixation_flags(response: Any, cookie_jar: dict[str, str]) ->
     return flags
 
 
-def _annotate_runtime_evidence(
+def _collect_analysis_flags(
     runtime: RuntimeEvidence,
     response: Any,
     candidate: Candidate,
@@ -632,13 +644,8 @@ def _annotate_runtime_evidence(
     config: PadvConfig,
     request_spec: dict[str, Any],
     cookie_jar: dict[str, str],
-    elapsed_ms: int | None,
-    anonymous_probe: Any | None = None,
-) -> RuntimeEvidence:
-    runtime.http_status = int(response.status_code)
-    runtime.location = str(response.headers.get("Location", "") or response.headers.get("location", ""))
-    runtime.body_excerpt = (response.body or "")[:2000]
-
+    anonymous_probe: Any | None,
+) -> set[str]:
     flags = {x for x in runtime.analysis_flags if isinstance(x, str) and x}
     body = response.body or ""
 
@@ -657,7 +664,27 @@ def _annotate_runtime_evidence(
     if candidate.vuln_class == "session_fixation_invariant":
         flags |= _derive_session_fixation_flags(response, cookie_jar)
 
+    return flags
+
+
+def _annotate_runtime_evidence(
+    runtime: RuntimeEvidence,
+    response: Any,
+    candidate: Candidate,
+    plan: ValidationPlan,
+    config: PadvConfig,
+    request_spec: dict[str, Any],
+    cookie_jar: dict[str, str],
+    elapsed_ms: int | None,
+    anonymous_probe: Any | None = None,
+) -> RuntimeEvidence:
+    runtime.http_status = int(response.status_code)
+    runtime.location = str(response.headers.get("Location", "") or response.headers.get("location", ""))
+    runtime.body_excerpt = (response.body or "")[:2000]
+
+    flags = _collect_analysis_flags(runtime, response, candidate, plan, config, request_spec, cookie_jar, anonymous_probe)
     runtime.analysis_flags = sorted(flags)
+
     runtime.aux = dict(runtime.aux)
     if anonymous_probe is not None:
         runtime.aux["anonymous_status"] = int(anonymous_probe.status_code)
@@ -879,6 +906,51 @@ def _extract_cookie_jar(request_spec: dict[str, Any]) -> dict[str, str]:
     return {}
 
 
+def _execute_differential_request(
+    config: PadvConfig, candidate: Candidate, plan: ValidationPlan,
+    level_state: dict[str, Any], base_request: dict[str, Any], diff_idx: int,
+    positive_runs: list[RuntimeEvidence],
+    attempts: list[dict[str, Any]], seen_flags: set[str],
+) -> DifferentialPair | None:
+    unpriv_request = build_unprivileged_request(base_request, level_state)
+    req_id = new_request_id(candidate.candidate_id, "diff", diff_idx)
+    headers = _validation_headers(config, _oracle_functions(plan), req_id)
+    _merge_request_headers(headers, unpriv_request)
+    unpriv_cookie_jar = _extract_cookie_jar(unpriv_request)
+    try:
+        req_started = monotonic()
+        response = send_request(
+            url=_target_url(config.target.base_url, unpriv_request),
+            method=unpriv_request.get("method", "GET"), headers=headers,
+            timeout_seconds=config.target.request_timeout_seconds,
+            query=unpriv_request.get("query"),
+            body=unpriv_request.get("body", unpriv_request.get("body_text")), cookie_jar=unpriv_cookie_jar,
+        )
+        unpriv_runtime = parse_response_headers(req_id, response.headers, config.oracle)
+        unpriv_runtime = _annotate_runtime_evidence(
+            runtime=unpriv_runtime, response=response, candidate=candidate, plan=plan,
+            config=config, request_spec=unpriv_request, cookie_jar=unpriv_cookie_jar,
+            elapsed_ms=int((monotonic() - req_started) * 1000), anonymous_probe=None,
+        )
+        unpriv_runtime.aux = dict(unpriv_runtime.aux)
+        context = str(level_state.get("auth_context", "")).strip().casefold()
+        if not context:
+            context = "anonymous" if not unpriv_cookie_jar else "unprivileged"
+        unpriv_runtime.aux["auth_context"] = context
+        elapsed_ms = int((monotonic() - req_started) * 1000)
+        _record_attempt(attempts, seen_flags, phase="differential", idx=diff_idx, request_spec=unpriv_request, runtime=unpriv_runtime, elapsed_ms=elapsed_ms)
+        return compare_responses(positive_runs[0], unpriv_runtime, config)
+    except RequestError:
+        return None
+
+
+def _resolve_differential_levels(config: PadvConfig) -> list[str]:
+    levels = [x.strip() for x in config.differential.auth_levels if isinstance(x, str) and x.strip()]
+    if not levels:
+        levels = ["anonymous"]
+    return list(dict.fromkeys(levels))
+
+
 def _run_differential_phase(
     config: PadvConfig, candidate: Candidate, plan: ValidationPlan,
     positive_runs: list[RuntimeEvidence], auth_state: dict[str, Any],
@@ -892,46 +964,19 @@ def _run_differential_phase(
     if not positive_runs or not plan.positive_requests:
         return pairs, 0
     base_request = plan.positive_requests[0]
-    levels = [x.strip() for x in config.differential.auth_levels if isinstance(x, str) and x.strip()]
-    if not levels:
-        levels = ["anonymous"]
-    levels = list(dict.fromkeys(levels))
+    levels = _resolve_differential_levels(config)
     for diff_idx, level in enumerate(levels):
         if budget <= 0 or monotonic() >= candidate_deadline:
             break
         level_state = resolve_auth_state_for_level(auth_state, level)
         if level_state is None:
             continue
-        unpriv_request = build_unprivileged_request(base_request, level_state)
-        req_id = new_request_id(candidate.candidate_id, "diff", diff_idx)
-        headers = _validation_headers(config, _oracle_functions(plan), req_id)
-        _merge_request_headers(headers, unpriv_request)
-        unpriv_cookie_jar = _extract_cookie_jar(unpriv_request)
-        try:
-            req_started = monotonic()
-            response = send_request(
-                url=_target_url(config.target.base_url, unpriv_request),
-                method=unpriv_request.get("method", "GET"), headers=headers,
-                timeout_seconds=config.target.request_timeout_seconds,
-                query=unpriv_request.get("query"),
-                body=unpriv_request.get("body", unpriv_request.get("body_text")), cookie_jar=unpriv_cookie_jar,
-            )
-            unpriv_runtime = parse_response_headers(req_id, response.headers, config.oracle)
-            unpriv_runtime = _annotate_runtime_evidence(
-                runtime=unpriv_runtime, response=response, candidate=candidate, plan=plan,
-                config=config, request_spec=unpriv_request, cookie_jar=unpriv_cookie_jar,
-                elapsed_ms=int((monotonic() - req_started) * 1000), anonymous_probe=None,
-            )
-            unpriv_runtime.aux = dict(unpriv_runtime.aux)
-            context = str(level_state.get("auth_context", "")).strip().casefold()
-            if not context:
-                context = "anonymous" if not unpriv_cookie_jar else "unprivileged"
-            unpriv_runtime.aux["auth_context"] = context
-            elapsed_ms = int((monotonic() - req_started) * 1000)
-            _record_attempt(attempts, seen_flags, phase="differential", idx=diff_idx, request_spec=unpriv_request, runtime=unpriv_runtime, elapsed_ms=elapsed_ms)
-            pairs.append(compare_responses(positive_runs[0], unpriv_runtime, config))
-        except RequestError:
-            pass
+        pair = _execute_differential_request(
+            config, candidate, plan, level_state, base_request, diff_idx,
+            positive_runs, attempts, seen_flags,
+        )
+        if pair is not None:
+            pairs.append(pair)
         budget -= 1
         if config.sandbox.reset_cmd:
             sandbox_adapter.reset(config.sandbox)
@@ -1015,6 +1060,75 @@ def _build_planner_trace(
     }
 
 
+def _validate_single_candidate_runtime(
+    config: PadvConfig, store: EvidenceStore, run_id: str,
+    candidate: Candidate, plan: ValidationPlan,
+    candidate_static: list[StaticEvidence], evidence_signals: list[str],
+    cookie_jar: dict[str, str], auth_state: dict[str, Any],
+    planner_trace: dict[str, Any], discovery_trace: dict[str, Any],
+    artifact_refs: list[str], profile: Any,
+    request_budget_remaining: int, run_deadline: float,
+) -> tuple[EvidenceBundle, int]:
+    attempts: list[dict[str, Any]] = []
+    seen_flags: set[str] = set()
+    candidate_deadline = min(run_deadline, monotonic() + float(config.budgets.max_seconds_per_candidate))
+    total_cost = 0
+
+    positive_runs, repro_ids, pos_cost = _run_positive_phase(
+        config, candidate, plan, cookie_jar, request_budget_remaining, candidate_deadline, attempts, seen_flags,
+    )
+    total_cost += pos_cost
+
+    negative_runs, neg_cost = _run_negative_phase(
+        config, candidate, plan, cookie_jar, request_budget_remaining - total_cost, candidate_deadline, attempts, seen_flags,
+    )
+    total_cost += neg_cost
+
+    differential_pairs, diff_cost = _run_differential_phase(
+        config, candidate, plan, positive_runs, auth_state, request_budget_remaining - total_cost, candidate_deadline, attempts, seen_flags,
+    )
+    total_cost += diff_cost
+
+    gate_result = evaluate_candidate(
+        config=config, candidate=candidate, static_evidence=candidate_static,
+        positive_runs=positive_runs, negative_runs=negative_runs,
+        intercepts=_oracle_functions(plan), canary=plan.canary,
+        preconditions=_normalize_gate_preconditions(candidate, cookie_jar, config),
+        evidence_signals=evidence_signals, vuln_class=candidate.vuln_class,
+        differential_pairs=differential_pairs,
+    )
+
+    positive_export, negative_export, differential_export = _sanitize_exports(config, positive_runs, negative_runs, differential_pairs)
+
+    bundle = EvidenceBundle(
+        bundle_id=f"bundle-{run_id}-{candidate.candidate_id}",
+        created_at=utc_now_iso(), candidate=candidate, static_evidence=candidate_static,
+        positive_runtime=positive_export, negative_runtime=negative_export, repro_run_ids=repro_ids,
+        gate_result=gate_result,
+        limitations=[gate_result.reason] if gate_result.decision != "VALIDATED" else [],
+        differential_pairs=differential_export, artifact_refs=artifact_refs, discovery_trace=discovery_trace,
+        planner_trace=_build_planner_trace(_candidate_hypotheses(planner_trace, candidate.candidate_id), plan, attempts),
+        bundle_type=_bundle_type_for_decision(gate_result.decision),
+        validation_contract={
+            "profile": profile.to_dict(), "class_contract_id": plan.class_contract_id,
+            "validation_mode": plan.validation_mode,
+            "required_request_shape": list(profile.required_request_shape),
+            "required_witnesses": list(profile.required_witnesses),
+            "required_negative_controls": list(profile.required_negative_controls),
+        },
+        environment_facts=_environment_facts(candidate, auth_state, plan),
+    )
+    store.save_bundle(bundle)
+    return bundle, total_cost
+
+
+def _extract_auth_cookie_jar(auth_state: dict[str, Any]) -> dict[str, str]:
+    cookie_jar_raw = auth_state.get("cookies", {}) if isinstance(auth_state, dict) else {}
+    if not isinstance(cookie_jar_raw, dict):
+        return {}
+    return {str(k): str(v) for k, v in cookie_jar_raw.items() if str(k).strip()}
+
+
 def validate_candidates_runtime(
     config: PadvConfig,
     store: EvidenceStore,
@@ -1032,12 +1146,7 @@ def validate_candidates_runtime(
     discovery_trace = discovery_trace or {}
     artifact_refs = artifact_refs or []
     auth_state = auth_state or {}
-    cookie_jar_raw = auth_state.get("cookies", {}) if isinstance(auth_state, dict) else {}
-    cookie_jar = (
-        {str(k): str(v) for k, v in cookie_jar_raw.items() if str(k).strip()}
-        if isinstance(cookie_jar_raw, dict)
-        else {}
-    )
+    cookie_jar = _extract_auth_cookie_jar(auth_state)
 
     static_by_candidate: dict[str, list[StaticEvidence]] = {}
     for item in static_evidence:
@@ -1077,56 +1186,13 @@ def validate_candidates_runtime(
         if plan is None:
             raise RuntimeError(f"missing agent-generated validation plan for candidate: {candidate.candidate_id}")
 
-        attempts: list[dict[str, Any]] = []
-        seen_flags: set[str] = set()
-        candidate_deadline = min(run_deadline, monotonic() + float(config.budgets.max_seconds_per_candidate))
-
-        positive_runs, repro_ids, pos_cost = _run_positive_phase(
-            config, candidate, plan, cookie_jar, request_budget_remaining, candidate_deadline, attempts, seen_flags,
+        bundle, cost = _validate_single_candidate_runtime(
+            config, store, run_id, candidate, plan, candidate_static, evidence_signals,
+            cookie_jar, auth_state, planner_trace, discovery_trace, artifact_refs, profile,
+            request_budget_remaining, run_deadline,
         )
-        request_budget_remaining -= pos_cost
-
-        negative_runs, neg_cost = _run_negative_phase(
-            config, candidate, plan, cookie_jar, request_budget_remaining, candidate_deadline, attempts, seen_flags,
-        )
-        request_budget_remaining -= neg_cost
-
-        differential_pairs, diff_cost = _run_differential_phase(
-            config, candidate, plan, positive_runs, auth_state, request_budget_remaining, candidate_deadline, attempts, seen_flags,
-        )
-        request_budget_remaining -= diff_cost
-
-        gate_result = evaluate_candidate(
-            config=config, candidate=candidate, static_evidence=candidate_static,
-            positive_runs=positive_runs, negative_runs=negative_runs,
-            intercepts=_oracle_functions(plan), canary=plan.canary,
-            preconditions=_normalize_gate_preconditions(candidate, cookie_jar, config),
-            evidence_signals=evidence_signals, vuln_class=candidate.vuln_class,
-            differential_pairs=differential_pairs,
-        )
-        decisions[gate_result.decision] = decisions.get(gate_result.decision, 0) + 1
-
-        positive_export, negative_export, differential_export = _sanitize_exports(config, positive_runs, negative_runs, differential_pairs)
-
-        bundle = EvidenceBundle(
-            bundle_id=f"bundle-{run_id}-{candidate.candidate_id}",
-            created_at=utc_now_iso(), candidate=candidate, static_evidence=candidate_static,
-            positive_runtime=positive_export, negative_runtime=negative_export, repro_run_ids=repro_ids,
-            gate_result=gate_result,
-            limitations=[gate_result.reason] if gate_result.decision != "VALIDATED" else [],
-            differential_pairs=differential_export, artifact_refs=artifact_refs, discovery_trace=discovery_trace,
-            planner_trace=_build_planner_trace(_candidate_hypotheses(planner_trace, candidate.candidate_id), plan, attempts),
-            bundle_type=_bundle_type_for_decision(gate_result.decision),
-            validation_contract={
-                "profile": profile.to_dict(), "class_contract_id": plan.class_contract_id,
-                "validation_mode": plan.validation_mode,
-                "required_request_shape": list(profile.required_request_shape),
-                "required_witnesses": list(profile.required_witnesses),
-                "required_negative_controls": list(profile.required_negative_controls),
-            },
-            environment_facts=_environment_facts(candidate, auth_state, plan),
-        )
-        store.save_bundle(bundle)
+        request_budget_remaining -= cost
+        decisions[bundle.gate_result.decision] = decisions.get(bundle.gate_result.decision, 0) + 1
         bundles.append(bundle)
 
     return bundles, decisions

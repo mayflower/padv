@@ -285,19 +285,25 @@ def _normalize_autoload_path(raw: str) -> str | None:
     return normalized or None
 
 
+def _extract_psr_paths(mapping: dict[str, object]) -> set[str]:
+    paths: set[str] = set()
+    for value in mapping.values():
+        items = value if isinstance(value, list) else [value]
+        for item in items:
+            if not isinstance(item, str):
+                continue
+            path = _normalize_autoload_path(item)
+            if path:
+                paths.add(path)
+    return paths
+
+
 def _collect_psr_roots(autoload: dict[str, object]) -> set[str]:
     roots: set[str] = set()
     for field in ("psr-4", "psr-0"):
         mapping = autoload.get(field)
-        if not isinstance(mapping, dict):
-            continue
-        for value in mapping.values():
-            values = value if isinstance(value, list) else [value]
-            for item in values:
-                if isinstance(item, str):
-                    path = _normalize_autoload_path(item)
-                    if path:
-                        roots.add(path)
+        if isinstance(mapping, dict):
+            roots |= _extract_psr_paths(mapping)
     return roots
 
 
@@ -389,6 +395,32 @@ def _include_path_via_autoload_roots(
     return any(_path_matches_autoload_root(rel_path, root, entrypoint_dirs) for root in autoload_roots)
 
 
+def _is_within_staging(source: Path, staging_resolved: Path) -> bool:
+    try:
+        source.resolve().relative_to(staging_resolved)
+        return True
+    except ValueError:
+        return False
+
+
+def _should_include_source(
+    source: Path, repo_root: Path, staging_resolved: Path,
+    vendor_dir: str | None, autoload_roots: list[str], entrypoint_dirs: set[str],
+) -> bool:
+    if not source.is_file():
+        return False
+    if _is_within_staging(source, staging_resolved):
+        return False
+    if not _is_php_source_file(source):
+        return False
+    rel_path = source.relative_to(repo_root).as_posix()
+    if vendor_dir and (rel_path == vendor_dir or rel_path.startswith(f"{vendor_dir}/")):
+        return False
+    if not is_app_candidate_path(rel_path):
+        return False
+    return _include_path_via_autoload_roots(rel_path, autoload_roots, entrypoint_dirs)
+
+
 def _build_joern_parse_scope(repo_root: Path, staging_root: Path) -> Path:
     scoped_root = staging_root / "source"
     scoped_root.mkdir(parents=True, exist_ok=True)
@@ -399,23 +431,9 @@ def _build_joern_parse_scope(repo_root: Path, staging_root: Path) -> Path:
     staging_resolved = staging_root.resolve()
     copied = 0
     for source in repo_root.rglob("*"):
-        if not source.is_file():
-            continue
-        try:
-            source.resolve().relative_to(staging_resolved)
-            continue
-        except ValueError:
-            pass
-        if not _is_php_source_file(source):
+        if not _should_include_source(source, repo_root, staging_resolved, vendor_dir, autoload_roots, entrypoint_dirs):
             continue
         rel_path = source.relative_to(repo_root).as_posix()
-        if vendor_dir and (rel_path == vendor_dir or rel_path.startswith(f"{vendor_dir}/")):
-            continue
-        if not is_app_candidate_path(rel_path):
-            continue
-        if not _include_path_via_autoload_roots(rel_path, autoload_roots, entrypoint_dirs):
-            continue
-
         destination = scoped_root / rel_path
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(source, destination)

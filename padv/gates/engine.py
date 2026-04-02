@@ -406,6 +406,70 @@ def _evaluate_v3v4_legacy(
     return None
 
 
+def _prepare_class_flags(
+    class_key: str,
+    positive_runs: list[RuntimeEvidence],
+    negative_runs: list[RuntimeEvidence],
+    in_scope_positive_runs: list[RuntimeEvidence],
+    in_scope_negative_runs: list[RuntimeEvidence],
+    intercept_set: set[str],
+    canary: str,
+    config: PadvConfig,
+    differential_pairs: list[DifferentialPair] | None,
+) -> tuple[set[str], set[str]]:
+    positive_flags = _flag_set(positive_runs)
+    negative_flags = _flag_set(negative_runs)
+    if class_key in AUTHZ_VULN_CLASSES and differential_pairs:
+        if any(pair.response_equivalent for pair in differential_pairs):
+            positive_flags.add("authz_bypass_status")
+            positive_flags.add("authz_pair_observed")
+
+    derived_positive, derived_negative = _derived_class_flags(
+        class_key,
+        positive_runs=in_scope_positive_runs,
+        negative_runs=in_scope_negative_runs,
+        intercept_set=intercept_set,
+        canary=canary,
+        config=config,
+    )
+    positive_flags |= derived_positive
+    negative_flags |= derived_negative
+    return positive_flags, negative_flags
+
+
+def _evaluate_v3v4(
+    class_key: str,
+    positive_flags: set[str],
+    negative_flags: set[str],
+    in_scope_positive_runs: list[RuntimeEvidence],
+    in_scope_negative_runs: list[RuntimeEvidence],
+    intercept_set: set[str],
+    canary: str,
+    config: PadvConfig,
+    passed: list[str],
+) -> GateResult | None:
+    if class_key in _RUNTIME_VALIDATABLE_CLASSES:
+        rule = _CLASS_WITNESS_RULES.get(class_key)
+        if rule is None:
+            return GateResult("DROPPED", passed, "V3", "runtime witness rule missing for class")
+        return _evaluate_v3v4_runtime_class(rule, positive_flags, negative_flags, passed)
+    return _evaluate_v3v4_legacy(
+        in_scope_positive_runs, in_scope_negative_runs, intercept_set, canary, config, passed,
+    )
+
+
+def _evaluate_v5(
+    in_scope_positive_runs: list[RuntimeEvidence],
+    in_scope_negative_runs: list[RuntimeEvidence],
+    passed: list[str],
+) -> GateResult | None:
+    if len(in_scope_positive_runs) < 2 or len(in_scope_negative_runs) < 1:
+        return GateResult("DROPPED", passed, "V5", "insufficient repro runs")
+    if any(run.overflow or run.result_truncated for run in in_scope_positive_runs + in_scope_negative_runs):
+        return GateResult("DROPPED", passed, "V5", "runtime evidence truncated")
+    return None
+
+
 def evaluate_candidate(
     config: PadvConfig,
     static_evidence: list[StaticEvidence],
@@ -441,43 +505,23 @@ def evaluate_candidate(
         getattr(candidate, "canonical_class", "") or vuln_class or getattr(candidate, "vuln_class", "")
     )
     intercept_set = set(intercepts)
-    positive_flags = _flag_set(positive_runs)
-    negative_flags = _flag_set(negative_runs)
-    if class_key in AUTHZ_VULN_CLASSES and differential_pairs:
-        if any(pair.response_equivalent for pair in differential_pairs):
-            positive_flags.add("authz_bypass_status")
-            positive_flags.add("authz_pair_observed")
-
-    derived_positive, derived_negative = _derived_class_flags(
-        class_key,
-        positive_runs=in_scope_positive_runs,
-        negative_runs=in_scope_negative_runs,
-        intercept_set=intercept_set,
-        canary=canary,
-        config=config,
+    positive_flags, negative_flags = _prepare_class_flags(
+        class_key, positive_runs, negative_runs,
+        in_scope_positive_runs, in_scope_negative_runs,
+        intercept_set, canary, config, differential_pairs,
     )
-    positive_flags |= derived_positive
-    negative_flags |= derived_negative
 
-    if class_key in _RUNTIME_VALIDATABLE_CLASSES:
-        rule = _CLASS_WITNESS_RULES.get(class_key)
-        if rule is None:
-            return GateResult("DROPPED", passed, "V3", "runtime witness rule missing for class")
-        v3v4_fail = _evaluate_v3v4_runtime_class(rule, positive_flags, negative_flags, passed)
-        if v3v4_fail is not None:
-            return v3v4_fail
-    else:
-        # Legacy fallback for non-runtime classes and unknown classes only.
-        v3v4_fail = _evaluate_v3v4_legacy(
-            in_scope_positive_runs, in_scope_negative_runs, intercept_set, canary, config, passed,
-        )
-        if v3v4_fail is not None:
-            return v3v4_fail
+    v3v4_fail = _evaluate_v3v4(
+        class_key, positive_flags, negative_flags,
+        in_scope_positive_runs, in_scope_negative_runs,
+        intercept_set, canary, config, passed,
+    )
+    if v3v4_fail is not None:
+        return v3v4_fail
 
-    if len(in_scope_positive_runs) < 2 or len(in_scope_negative_runs) < 1:
-        return GateResult("DROPPED", passed, "V5", "insufficient repro runs")
-    if any(run.overflow or run.result_truncated for run in in_scope_positive_runs + in_scope_negative_runs):
-        return GateResult("DROPPED", passed, "V5", "runtime evidence truncated")
+    v5_fail = _evaluate_v5(in_scope_positive_runs, in_scope_negative_runs, passed)
+    if v5_fail is not None:
+        return v5_fail
     passed.append("V5")
 
     passed.append("V6")

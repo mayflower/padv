@@ -538,23 +538,37 @@ async def _discover_with_playwright_async(
 
         timeout_ms = max(1, int(config.web.request_timeout_seconds)) * 1000
 
+        def _unpack_navigate_state(state: _WebState) -> tuple[list, list, list, dict, list, list, int]:
+            return (
+                list(state.get("queue", [])),
+                list(state.get("seen", [])),
+                list(state.get("visited", [])),
+                dict(state.get("found", {})),
+                list(state.get("pages", [])),
+                list(state.get("errors", [])),
+                int(state.get("steps", 0)),
+            )
+
+        def _build_navigate_result(
+            queue: list, seen: list, visited: list, found: dict,
+            pages_list: list, errors: list, steps: int,
+            current_url: str, current_path: str,
+            candidate_urls: list[str], candidate_params: list[str],
+        ) -> _WebState:
+            return {
+                "queue": queue, "seen": seen, "visited": visited,
+                "found": found, "pages": pages_list, "requests": list(requests),
+                "errors": errors, "steps": steps, "current_url": current_url,
+                "current_path": current_path, "candidate_urls": candidate_urls,
+                "candidate_params": candidate_params,
+            }
+
         async def _node_navigate_extract(state: _WebState) -> _WebState:
-            queue = list(state.get("queue", []))
-            seen = list(state.get("seen", []))
-            visited = list(state.get("visited", []))
-            found = dict(state.get("found", {}))
-            pages_list = list(state.get("pages", []))
-            errors = list(state.get("errors", []))
-            steps = int(state.get("steps", 0))
+            queue, seen, visited, found, pages_list, errors, steps = _unpack_navigate_state(state)
 
             current = _pop_next_unvisited(queue, visited)
             if not current:
-                return {
-                    "queue": queue, "seen": seen, "visited": visited,
-                    "found": found, "pages": pages_list, "requests": list(requests),
-                    "errors": errors, "steps": steps, "current_url": "",
-                    "current_path": "", "candidate_urls": [], "candidate_params": [],
-                }
+                return _build_navigate_result(queue, seen, visited, found, pages_list, errors, steps, "", "", [], [])
 
             steps += 1
             canonical_current = current
@@ -576,13 +590,10 @@ async def _discover_with_playwright_async(
             if canonical_current not in visited:
                 visited.append(canonical_current)
 
-            return {
-                "queue": queue, "seen": seen, "visited": visited,
-                "found": found, "pages": pages_list, "requests": list(requests),
-                "errors": errors, "steps": steps, "current_url": canonical_current,
-                "current_path": current_path, "candidate_urls": candidate_urls,
-                "candidate_params": candidate_params,
-            }
+            return _build_navigate_result(
+                queue, seen, visited, found, pages_list, errors, steps,
+                canonical_current, current_path, candidate_urls, candidate_params,
+            )
 
         async def _node_llm_plan(state: _WebState) -> _WebState:
             queue = list(state.get("queue", []))

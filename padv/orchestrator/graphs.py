@@ -381,17 +381,17 @@ class _InvariantChecker:
     """Helper to validate stage invariants without deep nesting."""
 
     def __init__(self, state: GraphState, stage: str) -> None:
-        self._state = state
+        self.state = state
         self._stage = stage
 
     def expect_list(self, key: str) -> list[Any]:
-        value = self._state.get(key)
+        value = self.state.get(key)
         if not isinstance(value, list):
             raise _invariant_error(self._stage, f"{key} must be a list")
         return value
 
     def expect_dict(self, key: str) -> dict[str, Any]:
-        value = self._state.get(key)
+        value = self.state.get(key)
         if not isinstance(value, dict):
             raise _invariant_error(self._stage, f"{key} must be a dict")
         return value
@@ -419,21 +419,21 @@ def _assert_web_discovery_invariants(chk: _InvariantChecker, state: GraphState, 
         raise _invariant_error(stage, "web_error must be a string or null")
 
 
-def _assert_candidate_synthesis_invariants(chk: _InvariantChecker, state: GraphState, stage: str) -> None:
+def _assert_candidate_synthesis_invariants(chk: _InvariantChecker, stage: str) -> None:
     chk.expect_list("candidates")
     proposer = chk.expect_dict("planner_trace").get("proposer")
     if proposer is not None and not isinstance(proposer, dict):
         raise _invariant_error(stage, "planner_trace.proposer must be a dict")
 
 
-def _assert_skeptic_refine_invariants(chk: _InvariantChecker, state: GraphState, stage: str) -> None:
+def _assert_skeptic_refine_invariants(chk: _InvariantChecker, stage: str) -> None:
     chk.expect_list("candidates")
     skeptic = chk.expect_dict("planner_trace").get("skeptic")
     if skeptic is not None and not isinstance(skeptic, dict):
         raise _invariant_error(stage, "planner_trace.skeptic must be a dict")
 
 
-def _assert_objective_schedule_invariants(chk: _InvariantChecker, state: GraphState, stage: str) -> None:
+def _assert_objective_schedule_invariants(chk: _InvariantChecker, stage: str) -> None:
     selected = chk.expect_list("selected_candidates")
     chk.expect_list("selected_static")
     chk.expect_dict("objective_scores")
@@ -441,7 +441,7 @@ def _assert_objective_schedule_invariants(chk: _InvariantChecker, state: GraphSt
         raise _invariant_error(stage, "selected_candidates entries must be Candidate-like")
 
 
-def _assert_frontier_update_invariants(chk: _InvariantChecker, state: GraphState, stage: str) -> None:
+def _assert_frontier_update_invariants(chk: _InvariantChecker, stage: str) -> None:
     frontier = chk.expect_dict("frontier_state")
     if not isinstance(frontier.get("coverage"), dict):
         raise _invariant_error(stage, "frontier_state.coverage must be a dict")
@@ -466,6 +466,99 @@ def _assert_validation_plan_invariants(chk: _InvariantChecker, state: GraphState
         raise _invariant_error(stage, f"missing plans for candidates: {sorted(missing)}")
 
 
+def _assert_static_discovery_invariants(chk: _InvariantChecker, _stage: str) -> None:
+    chk.expect_list("candidates")
+    chk.expect_list("static_evidence")
+
+
+def _assert_auth_setup_invariants(chk: _InvariantChecker, _stage: str) -> None:
+    chk.expect_dict("auth_state")
+
+
+def _assert_discovery_summary_invariants(chk: _InvariantChecker, _stage: str) -> None:
+    chk.expect_dict("discovery_summary")
+
+
+def _assert_orient_invariants(chk: _InvariantChecker, _stage: str) -> None:
+    chk.expect_list("objective_queue")
+
+
+def _assert_select_objective_invariants(chk: _InvariantChecker, stage: str) -> None:
+    if chk.state.get("active_objective") is None:
+        raise _invariant_error(stage, "active_objective must be set")
+
+
+def _assert_reduce_research_invariants(chk: _InvariantChecker, _stage: str) -> None:
+    chk.expect_list("research_tasks")
+    chk.expect_list("research_findings")
+
+
+def _assert_hypothesis_board_update_invariants(chk: _InvariantChecker, _stage: str) -> None:
+    chk.expect_list("hypothesis_board")
+    chk.expect_list("candidates")
+
+
+def _assert_skeptic_challenge_invariants(chk: _InvariantChecker, _stage: str) -> None:
+    chk.expect_list("refutations")
+
+
+def _assert_experiment_plan_invariants(chk: _InvariantChecker, _stage: str) -> None:
+    chk.expect_dict("plans_by_candidate")
+
+
+def _assert_runtime_execute_invariants(chk: _InvariantChecker, _stage: str) -> None:
+    chk.expect_list("bundles")
+
+
+def _assert_evidence_reduce_invariants(chk: _InvariantChecker, _stage: str) -> None:
+    chk.expect_list("witness_bundles")
+
+
+def _assert_deterministic_gate_invariants(chk: _InvariantChecker, _stage: str) -> None:
+    chk.expect_list("gate_history")
+
+
+def _assert_runtime_validate_invariants(chk: _InvariantChecker, _stage: str) -> None:
+    chk.expect_list("bundles")
+    chk.expect_dict("decisions")
+
+
+def _assert_persist_invariants(chk: _InvariantChecker, _stage: str) -> None:
+    chk.expect_list("candidates")
+    chk.expect_list("static_evidence")
+
+
+def _noop_invariants(_chk: _InvariantChecker, _stage: str) -> None:
+    pass
+
+
+_STAGE_INVARIANT_DISPATCH: dict[str, Callable[[_InvariantChecker, str], None]] = {
+    "static_discovery": _assert_static_discovery_invariants,
+    "auth_setup": _assert_auth_setup_invariants,
+    "discovery_summary": _assert_discovery_summary_invariants,
+    "orient": _assert_orient_invariants,
+    "select_objective": _assert_select_objective_invariants,
+    "reduce_research": _assert_reduce_research_invariants,
+    "hypothesis_board_update": _assert_hypothesis_board_update_invariants,
+    "skeptic_challenge": _assert_skeptic_challenge_invariants,
+    "experiment_plan": _assert_experiment_plan_invariants,
+    "runtime_execute": _assert_runtime_execute_invariants,
+    "evidence_reduce": _assert_evidence_reduce_invariants,
+    "deterministic_gate": _assert_deterministic_gate_invariants,
+    "candidate_synthesis": _assert_candidate_synthesis_invariants,
+    "skeptic_refine": _assert_skeptic_refine_invariants,
+    "objective_schedule": _assert_objective_schedule_invariants,
+    "frontier_update": _assert_frontier_update_invariants,
+    "runtime_validate": _assert_runtime_validate_invariants,
+    "dedup_topk": _assert_runtime_validate_invariants,
+    "persist": _assert_persist_invariants,
+    "source_research": _noop_invariants,
+    "graph_research": _noop_invariants,
+    "web_research": _noop_invariants,
+    "continue_or_stop": _noop_invariants,
+}
+
+
 def _assert_stage_invariants(state: GraphState, stage: str) -> None:
     chk = _InvariantChecker(state, stage)
 
@@ -473,93 +566,17 @@ def _assert_stage_invariants(state: GraphState, stage: str) -> None:
         _assert_init_invariants(chk, state, stage)
         return
 
-    if stage == "static_discovery":
-        chk.expect_list("candidates")
-        chk.expect_list("static_evidence")
-        return
-
     if stage in {"web_discovery", "authenticated_web_discovery"}:
         _assert_web_discovery_invariants(chk, state, stage)
-        return
-
-    if stage == "auth_setup":
-        chk.expect_dict("auth_state")
-        return
-
-    if stage == "discovery_summary":
-        chk.expect_dict("discovery_summary")
-        return
-
-    if stage == "orient":
-        chk.expect_list("objective_queue")
-        return
-
-    if stage == "select_objective":
-        if state.get("active_objective") is None:
-            raise _invariant_error(stage, "active_objective must be set")
-        return
-
-    if stage in {"source_research", "graph_research", "web_research", "continue_or_stop"}:
-        return
-
-    if stage == "reduce_research":
-        chk.expect_list("research_tasks")
-        chk.expect_list("research_findings")
-        return
-
-    if stage == "hypothesis_board_update":
-        chk.expect_list("hypothesis_board")
-        chk.expect_list("candidates")
-        return
-
-    if stage == "skeptic_challenge":
-        chk.expect_list("refutations")
-        return
-
-    if stage == "experiment_plan":
-        chk.expect_dict("plans_by_candidate")
-        return
-
-    if stage == "runtime_execute":
-        chk.expect_list("bundles")
-        return
-
-    if stage == "evidence_reduce":
-        chk.expect_list("witness_bundles")
-        return
-
-    if stage == "deterministic_gate":
-        chk.expect_list("gate_history")
-        return
-
-    if stage == "candidate_synthesis":
-        _assert_candidate_synthesis_invariants(chk, state, stage)
-        return
-
-    if stage == "skeptic_refine":
-        _assert_skeptic_refine_invariants(chk, state, stage)
-        return
-
-    if stage == "objective_schedule":
-        _assert_objective_schedule_invariants(chk, state, stage)
-        return
-
-    if stage == "frontier_update":
-        _assert_frontier_update_invariants(chk, state, stage)
         return
 
     if stage == "validation_plan":
         _assert_validation_plan_invariants(chk, state, stage)
         return
 
-    if stage in {"runtime_validate", "dedup_topk"}:
-        chk.expect_list("bundles")
-        chk.expect_dict("decisions")
-        return
-
-    if stage == "persist":
-        chk.expect_list("candidates")
-        chk.expect_list("static_evidence")
+    handler = _STAGE_INVARIANT_DISPATCH.get(stage)
+    if handler is not None:
+        handler(chk, stage)
 
 
 def _stage_snapshot_payload(state: GraphState, stage: str) -> dict[str, Any]:
@@ -3035,7 +3052,7 @@ def _handle_graph_invoke_error(
     graph_config: dict[str, Any],
     thread_id: str,
 ) -> None:
-    """Save resume metadata for a failed or yielded graph invocation, then re-raise."""
+    """Save resume metadata for a failed or yielded graph invocation."""
     checkpoint_id, next_nodes = _latest_checkpoint_info(graph, graph_config)
     state["graph_checkpoint_id"] = checkpoint_id
     error_text = str(exc).strip() or exc.__class__.__name__
@@ -3062,7 +3079,6 @@ def _handle_graph_invoke_error(
             error=error_text,
         ),
     )
-    raise exc
 
 
 def _run_langgraph(state: GraphState, include_validation: bool) -> GraphState:
@@ -3092,6 +3108,7 @@ def _run_langgraph(state: GraphState, include_validation: bool) -> GraphState:
         result = graph.invoke(invoke_input, config=graph_config)
     except BaseException as exc:
         _handle_graph_invoke_error(exc, state, graph, graph_config, thread_id)
+        raise
 
     checkpoint_id, next_nodes = _latest_checkpoint_info(graph, graph_config)
     if isinstance(result, dict):
