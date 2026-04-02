@@ -18,9 +18,21 @@ class HttpResponse:
     body: str
 
 
-def _encode_body(body: dict[str, Any] | None) -> bytes | None:
+def _encode_body(body: Any, content_type: str | None) -> bytes | None:
     if body is None:
         return None
+    if isinstance(body, bytes):
+        return body
+    if isinstance(body, str):
+        return body.encode("utf-8")
+    if isinstance(body, dict):
+        normalized_content_type = (content_type or "").casefold()
+        if "application/x-www-form-urlencoded" in normalized_content_type:
+            return urllib.parse.urlencode(
+                {str(k): str(v) for k, v in body.items()},
+                doseq=True,
+            ).encode("utf-8")
+        return json.dumps(body, ensure_ascii=True).encode("utf-8")
     return json.dumps(body, ensure_ascii=True).encode("utf-8")
 
 
@@ -30,7 +42,7 @@ def send_request(
     headers: dict[str, str],
     timeout_seconds: int,
     query: dict[str, str] | None = None,
-    body: dict[str, Any] | None = None,
+    body: Any = None,
     cookie_jar: dict[str, str] | None = None,
 ) -> HttpResponse:
     full_url = url
@@ -42,7 +54,8 @@ def send_request(
         new_query = urllib.parse.urlencode(existing, doseq=True)
         full_url = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, new_query, parsed.fragment))
 
-    data = _encode_body(body)
+    content_type = next((v for k, v in headers.items() if k.casefold() == "content-type"), None)
+    data = _encode_body(body, content_type)
     req = urllib.request.Request(full_url, method=method.upper(), data=data)
     for key, value in headers.items():
         req.add_header(key, value)
@@ -54,7 +67,7 @@ def send_request(
         )
         if cookie_value:
             req.add_header("Cookie", cookie_value)
-    if data is not None:
+    if data is not None and content_type is None:
         req.add_header("Content-Type", "application/json")
 
     try:

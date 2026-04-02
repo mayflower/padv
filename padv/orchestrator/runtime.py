@@ -10,7 +10,22 @@ from padv.config.schema import PadvConfig
 from padv.dynamic.http.runner import RequestError, send_request
 from padv.dynamic.sandbox import adapter as sandbox_adapter
 from padv.gates.engine import evaluate_candidate
-from padv.models import Candidate, DifferentialPair, EvidenceBundle, RuntimeEvidence, StaticEvidence, ValidationPlan, utc_now_iso
+from padv.models import (
+    Candidate,
+    DifferentialPair,
+    EnvironmentFacts,
+    EvidenceBundle,
+    GateResult,
+    OracleEvidence,
+    RequestEvidence,
+    ResponseEvidence,
+    RuntimeCall,
+    RuntimeEvidence,
+    StaticEvidence,
+    ValidationPlan,
+    WitnessEvidence,
+    utc_now_iso,
+)
 from padv.oracle.morcilla import parse_response_headers, sanitized_runtime_evidence
 from padv.orchestrator.differential import (
     build_unprivileged_request,
@@ -19,6 +34,8 @@ from padv.orchestrator.differential import (
     resolve_auth_state_for_level,
 )
 from padv.store.evidence_store import EvidenceStore
+from padv.taxonomy import canonicalize_vuln_class
+from padv.validation.contracts import apply_validation_profile, is_runtime_validatable, profile_for_vuln_class
 
 
 _HTTP_SIGNAL_CLASSES = {
@@ -42,6 +59,71 @@ _AUTHZ_PROBE_CLASSES = {
 _ERROR_MARKERS = ("warning:", "notice:", "fatal error", "stack trace", "uncaught exception")
 _LOGIN_MARKERS = ("login", "sign in", "signin", "anmelden", "auth", "passwort", "password")
 _SQL_ERROR_MARKERS = ("sql syntax", "mysql", "mysqli", "pdoexception", "syntax error near", "postgresql", "sqlite", "ora-")
+_NONBLOCKING_PRECONDITION_EXACT = {
+    "runtime-oracle-not-applicable",
+    "auth-state-known",
+}
+_NONBLOCKING_PRECONDITION_PREFIXES = (
+    "content-type:",
+    "soapaction:",
+    "common payloads:",
+    "response includes",
+    "response must",
+    "response should",
+    "valid soap",
+    "shell metacharacters",
+    "sql injection in ",
+    "post request",
+    "get request",
+    "post or get request",
+    "request with ",
+    "request to ",
+)
+_NONBLOCKING_PRECONDITION_SUBSTRINGS = (
+    "security_level=",
+    "security level ",
+    "security_level in [",
+    "security level in [",
+    "must be at security level",
+    "default security level",
+    "security level must be",
+    "$lprotectagainst",
+    "$lusesafejsonparser",
+    "gusesafejsonparser",
+    "public endpoint accessibility",
+    "no session uid validation",
+    "no authentication check",
+    "no session validation",
+    "mysql connection active",
+    "database must be accessible",
+    "error reporting must be enabled",
+    "direct endpoint access via post or get",
+    "post or get request with ",
+    "none - unauthenticated access allowed",
+    "none - endpoint accessible without authentication",
+    "active php session",
+    "session_start()",
+    "php session must be initiated",
+    "no jwt token required",
+    "no special permissions",
+    "no username/password required",
+    "query must return ",
+    "satisfying precondition",
+    "for union-based:",
+    "for boolean-blind:",
+    "for error-based:",
+    "for special uuid:",
+    "for time-based:",
+)
+_AUTH_PRECONDITION_HINTS = (
+    "login",
+    "logged in",
+    "authenticated",
+    "session required",
+    "admin session",
+    "admin role",
+    "privileged",
+)
 
 _CLASS_ORACLE_WITNESS_FLAGS: dict[str, str] = {
     "sql_injection_boundary": "sql_sink_oracle_witness",
@@ -71,12 +153,260 @@ def new_request_id(candidate_id: str, phase: str, idx: int) -> str:
     return f"{candidate_id}-{phase}-{idx:02d}-{uuid.uuid4().hex[:6]}"
 
 
-def _validation_headers(config: PadvConfig, intercepts: list[str], correlation: str) -> dict[str, str]:
+def _validation_headers(config: PadvConfig, oracle_functions: list[str], correlation: str) -> dict[str, str]:
     return {
         config.oracle.request_key_header: config.oracle.api_key,
-        config.oracle.request_intercept_header: ", ".join(intercepts),
+        config.oracle.request_intercept_header: ", ".join(oracle_functions),
         config.oracle.request_correlation_header: correlation,
     }
+
+
+def _oracle_functions(plan: ValidationPlan) -> list[str]:
+    values = plan.oracle_functions or plan.intercepts
+    return [str(x).strip() for x in values if str(x).strip()]
+
+
+def _request_transport(request_spec: dict[str, Any]) -> str:
+    headers = request_spec.get("headers")
+    content_type = ""
+    if isinstance(headers, dict):
+        content_type = str(headers.get("Content-Type") or headers.get("content-type") or "").casefold()
+    if "multipart/form-data" in content_type:
+        return "multipart"
+    if "application/json" in content_type:
+        return "json"
+    if "xml" in content_type or (isinstance(request_spec.get("body_text"), str) and str(request_spec.get("body_text", "")).lstrip().startswith("<")):
+        return "xml"
+    if isinstance(request_spec.get("body"), dict):
+        return "form"
+    if isinstance(request_spec.get("query"), dict):
+        return "query"
+    return "query"
+
+
+def _request_evidence(request_id: str, request_spec: dict[str, Any], auth_context: str) -> RequestEvidence:
+    query = request_spec.get("query") if isinstance(request_spec.get("query"), dict) else {}
+    body = request_spec.get("body") if isinstance(request_spec.get("body"), dict) else {}
+    headers = request_spec.get("headers") if isinstance(request_spec.get("headers"), dict) else {}
+    placements: list[str] = []
+    if query:
+        placements.append("query")
+    if body:
+        placements.append("body")
+    if isinstance(request_spec.get("body_text"), str) and str(request_spec.get("body_text", "")).strip():
+        placements.append("body_text")
+    if headers:
+        placements.append("headers")
+    return RequestEvidence(
+        request_id=request_id,
+        method=str(request_spec.get("method", "GET")).upper(),
+        path=str(request_spec.get("path", "")),
+        transport=_request_transport(request_spec),
+        auth_context=auth_context,
+        query_keys=sorted(str(k) for k in query.keys()),
+        body_keys=sorted(str(k) for k in body.keys()),
+        header_keys=sorted(str(k) for k in headers.keys()),
+        payload_placements=placements,
+        request_summary=_request_summary(request_spec),
+    )
+
+
+def _display_arg(arg: str) -> str:
+    if len(arg) <= 64:
+        return arg
+    return arg[:24] + "..." + arg[-12:]
+
+
+def _oracle_evidence(runtime: RuntimeEvidence, plan: ValidationPlan, config: PadvConfig) -> list[OracleEvidence]:
+    intercepts = {x.strip().casefold() for x in _oracle_functions(plan)}
+    out: list[OracleEvidence] = []
+    for call in runtime.calls:
+        function = str(call.function or "").strip()
+        if intercepts and function.casefold() not in intercepts:
+            continue
+        full_args = [str(arg) for arg in call.args]
+        out.append(
+            OracleEvidence(
+                correlation_id=str(runtime.correlation or runtime.request_id),
+                function=function,
+                file=str(call.file or ""),
+                line=int(call.line or 0),
+                full_args=full_args,
+                display_args=[_display_arg(arg) for arg in full_args],
+                matched_canary=any(_contains_canary(arg, plan.canary, config) for arg in full_args),
+            )
+        )
+    return out
+
+
+def _response_evidence(response: Any, body_excerpt: str, elapsed_ms: int | None) -> ResponseEvidence:
+    headers = getattr(response, "headers", {}) or {}
+    content_type = ""
+    if isinstance(headers, dict):
+        content_type = str(headers.get("Content-Type") or headers.get("content-type") or "")
+    features: dict[str, Any] = {
+        "contains_json_object": body_excerpt.lstrip().startswith("{"),
+        "contains_xml": body_excerpt.lstrip().startswith("<"),
+    }
+    return ResponseEvidence(
+        status_code=int(getattr(response, "status_code", 0)) if getattr(response, "status_code", None) is not None else None,
+        location=str(headers.get("Location") or headers.get("location") or ""),
+        body_excerpt=body_excerpt,
+        content_type=content_type,
+        elapsed_ms=elapsed_ms,
+        parsed_features=features,
+    )
+
+
+def _witness_evidence(
+    *,
+    candidate: Candidate,
+    plan: ValidationPlan,
+    runtime: RuntimeEvidence,
+    request_spec: dict[str, Any],
+    response: Any,
+    config: PadvConfig,
+) -> WitnessEvidence:
+    flags = sorted({str(x).strip() for x in runtime.analysis_flags if str(x).strip()})
+    data: dict[str, Any] = {}
+    oracle_items = runtime.oracle_evidence
+    if candidate.canonical_class == "sql_injection_boundary":
+        data["sql_sink_hit"] = any(item.matched_canary for item in oracle_items)
+        data["sql_canary_arg_match"] = any(item.matched_canary for item in oracle_items)
+        body = runtime.body_excerpt.casefold()
+        data["sql_error_diff_candidate"] = any(marker in body for marker in _SQL_ERROR_MARKERS)
+    elif candidate.canonical_class == "command_injection_boundary":
+        data["command_sink_hit"] = any(item.matched_canary for item in oracle_items)
+        data["command_canary_arg_match"] = any(item.matched_canary for item in oracle_items)
+    elif candidate.canonical_class == "xss_output_boundary":
+        data["dom_execution"] = "xss_dom_witness" in {flag.casefold() for flag in flags}
+    elif candidate.canonical_class in {"ssrf", "outbound_request_influence"}:
+        data["outbound_url_arg_match"] = any(
+            "http://" in " ".join(item.full_args).casefold()
+            or "https://" in " ".join(item.full_args).casefold()
+            for item in oracle_items
+        )
+    elif candidate.canonical_class == "xxe_influence":
+        data["xxe_entity_witness"] = any("<!entity" in " ".join(item.full_args).casefold() for item in oracle_items)
+    return WitnessEvidence(class_name=candidate.canonical_class or candidate.vuln_class, witness_flags=flags, witness_data=data)
+
+
+def _environment_facts(
+    candidate: Candidate,
+    auth_state: dict[str, Any],
+    plan: ValidationPlan,
+) -> EnvironmentFacts:
+    cookies = auth_state.get("cookies", {}) if isinstance(auth_state, dict) else {}
+    identities: list[str] = []
+    if isinstance(auth_state, dict):
+        for key in ("username", "user", "identity", "role"):
+            value = auth_state.get(key)
+            if isinstance(value, str) and value.strip():
+                identities.append(value.strip())
+    reachable_paths = list(dict.fromkeys(str(x).strip() for x in candidate.web_path_hints if str(x).strip()))
+    security_level = ""
+    if isinstance(auth_state, dict):
+        for key in ("security_level", "security-level"):
+            value = auth_state.get(key)
+            if value is not None:
+                security_level = str(value).strip()
+                break
+    return EnvironmentFacts(
+        security_level=security_level,
+        session_state="observed-session" if isinstance(cookies, dict) and cookies else "anonymous",
+        authenticated_identities=identities,
+        database_initialized=None,
+        known_seed_data=[],
+        reachable_app_paths=reachable_paths,
+        role_prerequisites=list(plan.environment_requirements),
+        provenance={"auth_state_keys": sorted(str(k) for k in auth_state.keys())} if isinstance(auth_state, dict) else {},
+    )
+
+
+def _bundle_type_for_decision(decision: str) -> str:
+    mapping = {
+        "VALIDATED": "validated_exploit",
+        "CONFIRMED_ANALYSIS_FINDING": "confirmed_analysis_finding",
+        "DROPPED": "dropped",
+        "NEEDS_HUMAN_SETUP": "needs_human_setup",
+    }
+    return mapping.get(str(decision).strip(), "dropped")
+
+
+def _load_existing_bundle(store: EvidenceStore, run_id: str, candidate_id: str) -> EvidenceBundle | None:
+    payload = store.load_bundle(f"bundle-{run_id}-{candidate_id}")
+    if not isinstance(payload, dict):
+        return None
+    try:
+        candidate = Candidate(**payload["candidate"])
+        static_evidence = [StaticEvidence(**item) for item in payload.get("static_evidence", []) if isinstance(item, dict)]
+        def _runtime(item: dict[str, Any]) -> RuntimeEvidence:
+            calls = [RuntimeCall(**call) for call in item.get("calls", []) if isinstance(call, dict)]
+            oracle_evidence = [OracleEvidence(**entry) for entry in item.get("oracle_evidence", []) if isinstance(entry, dict)]
+            request_evidence = RequestEvidence(**item["request_evidence"]) if isinstance(item.get("request_evidence"), dict) else None
+            response_evidence = ResponseEvidence(**item["response_evidence"]) if isinstance(item.get("response_evidence"), dict) else None
+            witness_evidence = WitnessEvidence(**item["witness_evidence"]) if isinstance(item.get("witness_evidence"), dict) else None
+            return RuntimeEvidence(
+                request_id=str(item.get("request_id", "")),
+                status=str(item.get("status", "")),
+                call_count=int(item.get("call_count", 0)),
+                overflow=bool(item.get("overflow")),
+                arg_truncated=bool(item.get("arg_truncated")),
+                result_truncated=bool(item.get("result_truncated")),
+                correlation=item.get("correlation"),
+                calls=calls,
+                raw_headers=dict(item.get("raw_headers", {})) if isinstance(item.get("raw_headers"), dict) else {},
+                http_status=item.get("http_status"),
+                body_excerpt=str(item.get("body_excerpt", "")),
+                location=str(item.get("location", "")),
+                analysis_flags=[str(x) for x in item.get("analysis_flags", []) if str(x).strip()],
+                aux=dict(item.get("aux", {})) if isinstance(item.get("aux"), dict) else {},
+                oracle_evidence=oracle_evidence,
+                request_evidence=request_evidence,
+                response_evidence=response_evidence,
+                witness_evidence=witness_evidence,
+            )
+        positive_runtime = [_runtime(item) for item in payload.get("positive_runtime", []) if isinstance(item, dict)]
+        negative_runtime = [_runtime(item) for item in payload.get("negative_runtime", []) if isinstance(item, dict)]
+        differential_pairs = []
+        for item in payload.get("differential_pairs", []):
+            if not isinstance(item, dict):
+                continue
+            priv = item.get("privileged_run")
+            unpriv = item.get("unprivileged_run")
+            if not isinstance(priv, dict) or not isinstance(unpriv, dict):
+                continue
+            differential_pairs.append(
+                DifferentialPair(
+                    privileged_run=_runtime(priv),
+                    unprivileged_run=_runtime(unpriv),
+                    auth_diff=str(item.get("auth_diff", "")),
+                    response_equivalent=bool(item.get("response_equivalent")),
+                    equivalence_signals=[str(x) for x in item.get("equivalence_signals", []) if str(x).strip()],
+                )
+            )
+        gate_result = GateResult(**payload["gate_result"])
+        environment_facts = EnvironmentFacts(**payload["environment_facts"]) if isinstance(payload.get("environment_facts"), dict) else None
+        return EvidenceBundle(
+            bundle_id=str(payload.get("bundle_id", "")),
+            created_at=str(payload.get("created_at", "")),
+            candidate=candidate,
+            static_evidence=static_evidence,
+            positive_runtime=positive_runtime,
+            negative_runtime=negative_runtime,
+            repro_run_ids=[str(x) for x in payload.get("repro_run_ids", []) if str(x).strip()],
+            gate_result=gate_result,
+            limitations=[str(x) for x in payload.get("limitations", []) if str(x).strip()],
+            differential_pairs=differential_pairs,
+            artifact_refs=[str(x) for x in payload.get("artifact_refs", []) if str(x).strip()],
+            discovery_trace=dict(payload.get("discovery_trace", {})) if isinstance(payload.get("discovery_trace"), dict) else {},
+            planner_trace=dict(payload.get("planner_trace", {})) if isinstance(payload.get("planner_trace"), dict) else {},
+            bundle_type=str(payload.get("bundle_type", "validated_exploit")),
+            validation_contract=dict(payload.get("validation_contract", {})) if isinstance(payload.get("validation_contract"), dict) else {},
+            environment_facts=environment_facts,
+        )
+    except Exception:
+        return None
 
 
 def _target_url(base_url: str, request_spec: dict[str, Any]) -> str:
@@ -127,6 +457,42 @@ def _looks_like_login(response: Any) -> bool:
     return any(marker in body for marker in _LOGIN_MARKERS)
 
 
+def _normalize_gate_preconditions(
+    candidate: Candidate,
+    plan: ValidationPlan,
+    cookie_jar: dict[str, str],
+    config: PadvConfig,
+) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    raw_values = list(candidate.preconditions)
+    if candidate.auth_requirements and not cookie_jar:
+        raw_values.extend(candidate.auth_requirements)
+
+    for raw in raw_values:
+        value = str(raw).strip()
+        if not value:
+            continue
+        lowered = value.casefold()
+        if lowered in _NONBLOCKING_PRECONDITION_EXACT:
+            continue
+        if any(lowered.startswith(prefix) for prefix in _NONBLOCKING_PRECONDITION_PREFIXES):
+            continue
+        if any(fragment in lowered for fragment in _NONBLOCKING_PRECONDITION_SUBSTRINGS):
+            continue
+        if "web server" in lowered and "running" in lowered:
+            continue
+        if cookie_jar and any(hint in lowered for hint in _AUTH_PRECONDITION_HINTS):
+            continue
+        if not config.auth.enabled and ("anonymous" in lowered or "no auth" in lowered):
+            continue
+        if value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
 def _contains_canary(arg: str, canary: str, config: PadvConfig) -> bool:
     candidates = [arg]
     if config.canary.allow_url_decode:
@@ -143,10 +509,10 @@ def _has_class_oracle_witness(
     plan: ValidationPlan,
     config: PadvConfig,
 ) -> bool:
-    witness_flag = _CLASS_ORACLE_WITNESS_FLAGS.get(candidate.vuln_class)
+    witness_flag = _CLASS_ORACLE_WITNESS_FLAGS.get(canonicalize_vuln_class(candidate.vuln_class))
     if not witness_flag:
         return False
-    intercepts = {x.strip().casefold() for x in plan.intercepts if isinstance(x, str) and x.strip()}
+    intercepts = {x.strip().casefold() for x in _oracle_functions(plan)}
     for call in runtime.calls:
         function = str(call.function or "").strip().casefold()
         if intercepts and function not in intercepts:
@@ -165,6 +531,7 @@ def _annotate_runtime_evidence(
     config: PadvConfig,
     request_spec: dict[str, Any],
     cookie_jar: dict[str, str],
+    elapsed_ms: int | None,
     anonymous_probe: Any | None = None,
 ) -> RuntimeEvidence:
     runtime.http_status = int(response.status_code)
@@ -201,7 +568,7 @@ def _annotate_runtime_evidence(
     if "x-powered-by" in header_keys or "server" in header_keys:
         flags.add("info_disclosure_header")
 
-    witness_flag = _CLASS_ORACLE_WITNESS_FLAGS.get(candidate.vuln_class)
+    witness_flag = _CLASS_ORACLE_WITNESS_FLAGS.get(candidate.canonical_class or candidate.vuln_class)
     if witness_flag and _has_class_oracle_witness(runtime, candidate, plan, config):
         flags.add(witness_flag)
 
@@ -247,8 +614,20 @@ def _annotate_runtime_evidence(
         runtime.aux["anonymous_status"] = int(anonymous_probe.status_code)
         runtime.aux["anonymous_body_excerpt"] = (anonymous_probe.body or "")[:500]
 
-    if candidate.vuln_class in _HTTP_SIGNAL_CLASSES and runtime.status in {"inactive", "missing_intercept"}:
+    if (candidate.canonical_class or candidate.vuln_class) in _HTTP_SIGNAL_CLASSES and runtime.status in {"inactive", "missing_intercept"}:
         runtime.status = "http_observed"
+    auth_context = "authenticated" if cookie_jar else "anonymous"
+    runtime.request_evidence = _request_evidence(runtime.request_id, request_spec, auth_context)
+    runtime.response_evidence = _response_evidence(response, runtime.body_excerpt, elapsed_ms)
+    runtime.oracle_evidence = _oracle_evidence(runtime, plan, config)
+    runtime.witness_evidence = _witness_evidence(
+        candidate=candidate,
+        plan=plan,
+        runtime=runtime,
+        request_spec=request_spec,
+        response=response,
+        config=config,
+    )
     return runtime
 
 
@@ -286,6 +665,11 @@ def _request_summary(request_spec: dict[str, Any]) -> dict[str, Any]:
     body = request_spec.get("body")
     if isinstance(body, dict):
         summary["body_keys"] = sorted(str(k) for k in body.keys())
+    elif isinstance(request_spec.get("body_text"), str):
+        summary["body_mode"] = "text"
+    headers = request_spec.get("headers")
+    if isinstance(headers, dict):
+        summary["header_keys"] = sorted(str(k) for k in headers.keys())
     return summary
 
 
@@ -351,7 +735,7 @@ def validate_candidates_runtime(
     for item in static_evidence:
         static_by_candidate.setdefault(item.candidate_id, []).append(item)
 
-    decisions: dict[str, int] = {"VALIDATED": 0, "DROPPED": 0, "NEEDS_HUMAN_SETUP": 0}
+    decisions: dict[str, int] = {"VALIDATED": 0, "DROPPED": 0, "NEEDS_HUMAN_SETUP": 0, "CONFIRMED_ANALYSIS_FINDING": 0}
     bundles: list[EvidenceBundle] = []
     request_budget_remaining = config.budgets.max_requests
     run_deadline = monotonic() + float(config.budgets.max_run_seconds)
@@ -360,8 +744,66 @@ def validate_candidates_runtime(
         sandbox_adapter.reset(config.sandbox)
 
     for candidate in candidates:
+        candidate = apply_validation_profile(candidate)
+        profile = profile_for_vuln_class(candidate.canonical_class or candidate.vuln_class)
         if monotonic() >= run_deadline:
             break
+
+        existing_bundle = _load_existing_bundle(store, run_id, candidate.candidate_id)
+        if existing_bundle is not None:
+            decision = existing_bundle.gate_result.decision
+            decisions[decision] = decisions.get(decision, 0) + 1
+            bundles.append(existing_bundle)
+            continue
+
+        candidate_static = static_by_candidate.get(candidate.candidate_id, [])
+        query_signals = {
+            item.query_id.split("::", 1)[0].strip().lower()
+            for item in candidate_static
+            if isinstance(item.query_id, str) and item.query_id.strip()
+        }
+        candidate_signals = {x.strip().lower() for x in candidate.provenance if isinstance(x, str) and x.strip()}
+        if candidate.web_path_hints:
+            candidate_signals.add("web")
+        evidence_signals = sorted(query_signals | candidate_signals)
+
+        if not is_runtime_validatable(candidate):
+            gate_result = GateResult(
+                "CONFIRMED_ANALYSIS_FINDING",
+                ["A0"],
+                None,
+                "analysis-only candidate confirmed by static and research evidence",
+            )
+            bundle = EvidenceBundle(
+                bundle_id=f"bundle-{run_id}-{candidate.candidate_id}",
+                created_at=utc_now_iso(),
+                candidate=candidate,
+                static_evidence=candidate_static,
+                positive_runtime=[],
+                negative_runtime=[],
+                repro_run_ids=[],
+                gate_result=gate_result,
+                limitations=[],
+                differential_pairs=[],
+                artifact_refs=artifact_refs,
+                discovery_trace=discovery_trace,
+                planner_trace={
+                    "analysis_only": True,
+                    "evidence_signals": evidence_signals,
+                    "validation_mode": candidate.validation_mode,
+                },
+                bundle_type=_bundle_type_for_decision(gate_result.decision),
+                validation_contract={
+                    "profile": profile.to_dict(),
+                    "class_contract_id": profile.class_contract_id,
+                    "validation_mode": profile.validation_mode,
+                },
+                environment_facts=_environment_facts(candidate, auth_state, ValidationPlan(candidate.candidate_id, [], [], [], "")),
+            )
+            store.save_bundle(bundle)
+            decisions[gate_result.decision] = decisions.get(gate_result.decision, 0) + 1
+            bundles.append(bundle)
+            continue
 
         plan = plans_by_candidate.get(candidate.candidate_id)
         if plan is None:
@@ -384,7 +826,10 @@ def validate_candidates_runtime(
             if monotonic() >= candidate_deadline:
                 break
             req_id = new_request_id(candidate.candidate_id, "pos", idx)
-            headers = _validation_headers(config, plan.intercepts, req_id)
+            headers = _validation_headers(config, _oracle_functions(plan), req_id)
+            request_headers = request.get("headers")
+            if isinstance(request_headers, dict):
+                headers.update({str(k): str(v) for k, v in request_headers.items() if str(k).strip()})
             req_started = monotonic()
             try:
                 response = send_request(
@@ -393,7 +838,7 @@ def validate_candidates_runtime(
                     headers=headers,
                     timeout_seconds=config.target.request_timeout_seconds,
                     query=request.get("query"),
-                    body=request.get("body"),
+                    body=request.get("body", request.get("body_text")),
                     cookie_jar=cookie_jar,
                 )
                 runtime = parse_response_headers(req_id, response.headers, config.oracle)
@@ -411,7 +856,7 @@ def validate_candidates_runtime(
                             headers={},
                             timeout_seconds=config.target.request_timeout_seconds,
                             query=request.get("query"),
-                            body=request.get("body"),
+                            body=request.get("body", request.get("body_text")),
                             cookie_jar={},
                         )
                         request_budget_remaining -= 1
@@ -425,6 +870,7 @@ def validate_candidates_runtime(
                     config=config,
                     request_spec=request,
                     cookie_jar=cookie_jar,
+                    elapsed_ms=int((monotonic() - req_started) * 1000),
                     anonymous_probe=anonymous_probe,
                 )
                 runtime.aux = dict(runtime.aux)
@@ -464,7 +910,10 @@ def validate_candidates_runtime(
             if monotonic() >= candidate_deadline:
                 break
             req_id = new_request_id(candidate.candidate_id, "neg", idx)
-            headers = _validation_headers(config, plan.intercepts, req_id)
+            headers = _validation_headers(config, _oracle_functions(plan), req_id)
+            request_headers = request.get("headers")
+            if isinstance(request_headers, dict):
+                headers.update({str(k): str(v) for k, v in request_headers.items() if str(k).strip()})
             req_started = monotonic()
             try:
                 response = send_request(
@@ -473,7 +922,7 @@ def validate_candidates_runtime(
                     headers=headers,
                     timeout_seconds=config.target.request_timeout_seconds,
                     query=request.get("query"),
-                    body=request.get("body"),
+                    body=request.get("body", request.get("body_text")),
                     cookie_jar=cookie_jar,
                 )
                 runtime = parse_response_headers(req_id, response.headers, config.oracle)
@@ -485,6 +934,7 @@ def validate_candidates_runtime(
                     config=config,
                     request_spec=request,
                     cookie_jar=cookie_jar,
+                    elapsed_ms=int((monotonic() - req_started) * 1000),
                     anonymous_probe=None,
                 )
             except RequestError as exc:
@@ -531,7 +981,7 @@ def validate_candidates_runtime(
                     continue
                 unpriv_request = build_unprivileged_request(base_request, level_state)
                 req_id = new_request_id(candidate.candidate_id, "diff", diff_idx)
-                headers = _validation_headers(config, plan.intercepts, req_id)
+                headers = _validation_headers(config, _oracle_functions(plan), req_id)
                 override_headers = unpriv_request.get("headers")
                 if isinstance(override_headers, dict):
                     for key, value in override_headers.items():
@@ -549,7 +999,7 @@ def validate_candidates_runtime(
                         headers=headers,
                         timeout_seconds=config.target.request_timeout_seconds,
                         query=unpriv_request.get("query"),
-                        body=unpriv_request.get("body"),
+                        body=unpriv_request.get("body", unpriv_request.get("body_text")),
                         cookie_jar=unpriv_cookie_jar,
                     )
                     unpriv_runtime = parse_response_headers(req_id, response.headers, config.oracle)
@@ -561,6 +1011,7 @@ def validate_candidates_runtime(
                         config=config,
                         request_spec=unpriv_request,
                         cookie_jar=unpriv_cookie_jar,
+                        elapsed_ms=int((monotonic() - req_started) * 1000),
                         anonymous_probe=None,
                     )
                     unpriv_runtime.aux = dict(unpriv_runtime.aux)
@@ -585,28 +1036,22 @@ def validate_candidates_runtime(
                 if config.sandbox.reset_cmd:
                     sandbox_adapter.reset(config.sandbox)
 
-        candidate_static = static_by_candidate.get(candidate.candidate_id, [])
-        query_signals = {
-            item.query_id.split("::", 1)[0].strip().lower()
-            for item in candidate_static
-            if isinstance(item.query_id, str) and item.query_id.strip()
-        }
-        candidate_signals = {x.strip().lower() for x in candidate.provenance if isinstance(x, str) and x.strip()}
-        if candidate.web_path_hints:
-            candidate_signals.add("web")
-        evidence_signals = sorted(query_signals | candidate_signals)
+        environment_facts = _environment_facts(candidate, auth_state, plan)
 
         gate_result = evaluate_candidate(
             config=config,
+            candidate=candidate,
+            plan=plan,
             static_evidence=candidate_static,
             positive_runs=positive_runs,
             negative_runs=negative_runs,
-            intercepts=plan.intercepts,
+            intercepts=_oracle_functions(plan),
             canary=plan.canary,
-            preconditions=candidate.preconditions,
+            preconditions=_normalize_gate_preconditions(candidate, plan, cookie_jar, config),
             evidence_signals=evidence_signals,
             vuln_class=candidate.vuln_class,
             differential_pairs=differential_pairs,
+            environment_facts=environment_facts,
         )
         decisions[gate_result.decision] = decisions.get(gate_result.decision, 0) + 1
 
@@ -636,7 +1081,16 @@ def validate_candidates_runtime(
             "hypotheses": candidate_hypotheses,
             "validation_plan": {
                 "candidate_id": plan.candidate_id,
+                "validation_mode": plan.validation_mode,
+                "canonical_class": plan.canonical_class,
+                "class_contract_id": plan.class_contract_id,
+                "oracle_functions": list(_oracle_functions(plan)),
+                "request_expectations": list(plan.request_expectations),
+                "response_witnesses": list(plan.response_witnesses),
                 "intercepts": list(plan.intercepts),
+                "environment_requirements": list(plan.environment_requirements),
+                "requests": list(plan.requests or plan.positive_requests),
+                "negative_controls": list(plan.negative_controls or plan.negative_requests),
                 "strategy": plan.strategy,
                 "negative_control_strategy": plan.negative_control_strategy,
                 "positive_request_count": len(plan.positive_requests),
@@ -660,6 +1114,16 @@ def validate_candidates_runtime(
             artifact_refs=artifact_refs,
             discovery_trace=discovery_trace,
             planner_trace=candidate_planner_trace,
+            bundle_type=_bundle_type_for_decision(gate_result.decision),
+            validation_contract={
+                "profile": profile.to_dict(),
+                "class_contract_id": plan.class_contract_id,
+                "validation_mode": plan.validation_mode,
+                "required_request_shape": list(profile.required_request_shape),
+                "required_witnesses": list(profile.required_witnesses),
+                "required_negative_controls": list(profile.required_negative_controls),
+            },
+            environment_facts=environment_facts,
         )
         store.save_bundle(bundle)
         bundles.append(bundle)

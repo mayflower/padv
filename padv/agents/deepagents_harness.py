@@ -1,20 +1,48 @@
 from __future__ import annotations
 
+import copy
+import hashlib
+import inspect
 import json
 import os
 import re
+import shlex
+import sqlite3
+import subprocess
 import threading
+import traceback
+import urllib.parse
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from padv.agents.checkpoints import FileBackedMemorySaver
 from padv.analytics.failure_patterns import failure_penalty
 from padv.config.schema import PadvConfig
-from padv.models import Candidate, FailureAnalysis, ValidationPlan
+from padv.models import (
+    Candidate,
+    ExperimentAttempt,
+    FailureAnalysis,
+    Hypothesis,
+    ObjectiveScore,
+    Refutation,
+    ResearchFinding,
+    ResearchTask,
+    ValidationPlan,
+    WitnessBundle,
+)
+from padv.validation.contracts import apply_validation_profile, profile_for_vuln_class
+
+try:
+    from langchain.agents.middleware.types import AgentMiddleware  # type: ignore[import-not-found]
+except Exception:  # pragma: no cover - optional at import time
+    AgentMiddleware = object  # type: ignore[assignment,misc]
 
 
 _JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
+_JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL | re.IGNORECASE)
 _SEMANTIC_SIGNALS = frozenset({"joern", "scip"})
 _TRIAGE_FIELDS = (
     "reproducibility_gap",
@@ -28,12 +56,110 @@ class AgentExecutionError(RuntimeError):
     pass
 
 
+class AgentSoftYield(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        role: str,
+        category: str,
+        turn: int,
+        handoff_ref: str,
+        progress_ref: str = "",
+        response_ref: str = "",
+        last_response: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.role = str(role)
+        self.category = str(category)
+        self.turn = int(turn)
+        self.handoff_ref = str(handoff_ref)
+        self.progress_ref = str(progress_ref)
+        self.response_ref = str(response_ref)
+        self.last_response = dict(last_response or {})
+
+
+_INFLIGHT_HANDOFFS: dict[str, dict[str, Any]] = {}
+_INFLIGHT_HANDOFFS_LOCK = threading.Lock()
+
+
 @dataclass(slots=True)
 class AgentSession:
     agent: Any
     thread_id: str
     model: str
     repo_root: str | None
+    checkpoint_dir: str | None = None
+    role: str = "agent"
+    invoke_lock: threading.Lock = field(default_factory=threading.Lock)
+
+
+@dataclass(slots=True)
+class AgentRuntime:
+    root: AgentSession
+    subagents: dict[str, AgentSession]
+    shared_context: dict[str, Any]
+    checkpoint_dir: str
+    workspace_dir: str
+    model: str
+    repo_root: str | None
+    store: Any | None = None
+    prompts: dict[str, str] = field(default_factory=dict)
+
+
+class TaskDelegationTraceMiddleware(AgentMiddleware):
+    def __init__(self, *, shared_context: dict[str, Any], checkpoint_dir: str) -> None:
+        self._shared_context = shared_context
+        self._checkpoint_dir = checkpoint_dir
+
+    @property
+    def name(self) -> str:
+        return self.__class__.__name__
+
+    def wrap_tool_call(self, request: Any, handler: Any) -> Any:
+        result = handler(request)
+        tool_call = getattr(request, "tool_call", {}) or {}
+        if str(tool_call.get("name", "")).strip() != "task":
+            return result
+
+        args = tool_call.get("args", {})
+        if not isinstance(args, dict):
+            args = {}
+        payload = {
+            "role": "root",
+            "tool": "task",
+            "tool_call_id": str(tool_call.get("id", "")),
+            "subagent_type": str(args.get("subagent_type", "")),
+            "description": str(args.get("description", ""))[:2000],
+            "prompt": str(args.get("prompt", ""))[:4000],
+            "result_excerpt": str(getattr(result, "content", ""))[:2000],
+        }
+        self._record(payload)
+        return result
+
+    def _record(self, payload: dict[str, Any]) -> None:
+        artifact_id = uuid.uuid4().hex[:12]
+        path = _workspace_artifact_path(
+            self._checkpoint_dir,
+            role="root",
+            category="delegations",
+            artifact_id=artifact_id,
+        )
+        path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
+        relative = str(path.relative_to(_workspace_root(self._checkpoint_dir)))
+
+        _append_workspace_index_ref(self._shared_context, role="root", category="delegations", relative=relative)
+        _append_shared_context_list_item(self._shared_context, key="delegations", payload={"ref": relative, **payload})
+        subagent_type = str(payload.get("subagent_type", "")).strip() or "unknown"
+        _emit_shared_progress(
+            self._shared_context,
+            role="root",
+            status="delegated",
+            detail=f"task -> {subagent_type}",
+            artifact_ref=relative,
+            tool="task",
+            subagent_type=subagent_type,
+        )
 
 
 def _default_rank(candidates: list[Candidate], mode: str) -> list[Candidate]:
@@ -82,22 +208,87 @@ def _extract_text(result: dict[str, Any]) -> str:
 
 
 def _extract_json(text: str) -> dict[str, Any] | None:
-    if not text.strip():
+    def _repair_json_like_string(payload: str) -> str:
+        out: list[str] = []
+        in_string = False
+        i = 0
+        while i < len(payload):
+            char = payload[i]
+            if char == '"':
+                escaped = 0
+                j = i - 1
+                while j >= 0 and payload[j] == "\\":
+                    escaped += 1
+                    j -= 1
+                if escaped % 2 == 0:
+                    in_string = not in_string
+                out.append(char)
+                i += 1
+                continue
+            if in_string and char == "\\" and i + 1 < len(payload):
+                nxt = payload[i + 1]
+                if nxt in '"\\/bfnrtu':
+                    out.append(char)
+                    out.append(nxt)
+                    i += 2
+                    continue
+                if nxt == "'":
+                    out.append("'")
+                    i += 2
+                    continue
+                out.append("\\\\")
+                out.append(nxt)
+                i += 2
+                continue
+            out.append(char)
+            i += 1
+        return "".join(out)
+
+    def _attempt_parse(candidate: str) -> dict[str, Any] | None:
+        payload = str(candidate or "").strip()
+        if not payload:
+            return None
+        try:
+            data = json.loads(payload)
+            if isinstance(data, dict):
+                return data
+        except json.JSONDecodeError:
+            pass
+
+        # LLMs often emit JSON-looking payloads with markdown fences and
+        # non-JSON escapes like \' inside otherwise valid JSON strings.
+        repaired = _repair_json_like_string(payload)
+        if repaired != payload:
+            try:
+                data = json.loads(repaired)
+                if isinstance(data, dict):
+                    return data
+            except json.JSONDecodeError:
+                pass
+
+        decoder = json.JSONDecoder()
+        for idx, char in enumerate(payload):
+            if char != "{":
+                continue
+            for source in (payload[idx:], repaired[idx:] if repaired != payload else None):
+                if not source:
+                    continue
+                try:
+                    data, _end = decoder.raw_decode(source)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(data, dict):
+                    return data
         return None
-    try:
-        data = json.loads(text)
+
+    body = str(text or "").strip()
+    if not body:
+        return None
+    for candidate in [body, *[match.group(1) for match in _JSON_FENCE_RE.finditer(body)]]:
+        data = _attempt_parse(candidate)
         if isinstance(data, dict):
             return data
-    except json.JSONDecodeError:
-        pass
-    match = _JSON_BLOCK_RE.search(text)
-    if not match:
-        return None
-    try:
-        data = json.loads(match.group(0))
-    except json.JSONDecodeError:
-        return None
-    return data if isinstance(data, dict) else None
+    return None
 
 
 def _normalize_triage_entry(raw: Any) -> dict[str, str]:
@@ -178,6 +369,52 @@ def _resolve_model(config: PadvConfig) -> str:
     return f"{config.llm.provider}:{config.llm.model}"
 
 
+def _checkpoint_path(checkpoint_dir: str | Path, role: str, thread_id: str) -> Path:
+    base = Path(checkpoint_dir)
+    base.mkdir(parents=True, exist_ok=True)
+    return base / role / f"{thread_id}.pkl"
+
+
+def _workspace_root(checkpoint_dir: str | Path) -> Path:
+    root = Path(checkpoint_dir) / "workspace"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _workspace_artifact_path(
+    checkpoint_dir: str | Path,
+    *,
+    role: str,
+    category: str,
+    artifact_id: str,
+) -> Path:
+    root = _workspace_root(checkpoint_dir)
+    path = root / role / category / f"{artifact_id}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _persist_raw_agent_output(session: AgentSession, *, content: str, kind: str) -> str | None:
+    checkpoint_dir = str(session.checkpoint_dir or "").strip()
+    if not checkpoint_dir:
+        return None
+    path = _workspace_artifact_path(
+        checkpoint_dir,
+        role=session.role,
+        category="raw_outputs",
+        artifact_id=uuid.uuid4().hex[:12],
+    )
+    payload = {
+        "role": session.role,
+        "thread_id": session.thread_id,
+        "kind": kind,
+        "captured_at": datetime.now(tz=timezone.utc).isoformat(),
+        "content": str(content or "")[:24000],
+    }
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
+    return str(path.relative_to(_workspace_root(checkpoint_dir)))
+
+
 def ensure_agent_session(
     config: PadvConfig,
     *,
@@ -194,7 +431,6 @@ def ensure_agent_session(
 
     try:
         from deepagents import create_deep_agent  # type: ignore[import-not-found]
-        from langgraph.checkpoint.memory import InMemorySaver  # type: ignore[import-not-found]
     except Exception as exc:
         raise AgentExecutionError(f"deepagents/langgraph import failed: {exc}") from exc
 
@@ -211,13 +447,14 @@ def ensure_agent_session(
         "You are a strict security planning sub-agent for web exploitation discovery and validation. "
         "Return JSON only and avoid markdown."
     )
-    tools = _build_filesystem_tools(repo_root) if repo_root else []
+    tools = _build_filesystem_tools(repo_root) if repo_root and role != "root" else []
+    checkpointer = FileBackedMemorySaver(_checkpoint_path(Path(".padv") / "langgraph", "legacy", thread_id))
     try:
         agent = create_deep_agent(
             model=model,
             tools=tools,
             system_prompt=system_prompt,
-            checkpointer=InMemorySaver(),
+            checkpointer=checkpointer,
         )
     except Exception as exc:
         raise AgentExecutionError(f"deepagents agent creation failed: {exc}") from exc
@@ -225,6 +462,1850 @@ def ensure_agent_session(
     if isinstance(frontier_state, dict):
         frontier_state["agent_thread_id"] = thread_id
     return AgentSession(agent=agent, thread_id=thread_id, model=model, repo_root=repo_root)
+
+
+def _run_repo_command(repo_root: str | None, command: str) -> str:
+    if not repo_root:
+        return "repo root unavailable"
+    try:
+        proc = subprocess.run(
+            shlex.split(command),
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except Exception as exc:
+        return f"command failed: {exc}"
+    output = (proc.stdout or proc.stderr or "").strip()
+    return output[:12000]
+
+
+def _parse_json_list(raw: str | None) -> list[str]:
+    text = str(raw or "").strip()
+    if not text:
+        return []
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return [text]
+    if isinstance(parsed, list):
+        return [str(item).strip() for item in parsed if str(item).strip()]
+    return [str(parsed).strip()] if str(parsed).strip() else []
+
+
+def _workspace_index_refs(shared_context: dict[str, Any], *, role: str, category: str) -> list[str]:
+    workspace_index = _shared_context_snapshot(shared_context, "workspace_index", {})
+    if not isinstance(workspace_index, dict):
+        return []
+    role_index = workspace_index.get(role, {})
+    if not isinstance(role_index, dict):
+        return []
+    refs = role_index.get(category, [])
+    if not isinstance(refs, list):
+        return []
+    return [str(item) for item in refs if isinstance(item, str)]
+
+
+def _tool_usage_entries(shared_context: dict[str, Any], *, role: str) -> list[dict[str, Any]]:
+    tool_usage = _shared_context_snapshot(shared_context, "tool_usage", {})
+    if not isinstance(tool_usage, dict):
+        return []
+    entries = tool_usage.get(role, [])
+    if not isinstance(entries, list):
+        return []
+    return [item for item in entries if isinstance(item, dict)]
+
+
+def _shared_context_lock(shared_context: dict[str, Any]) -> threading.RLock:
+    lock = shared_context.get("__lock__")
+    if lock is not None:
+        return lock
+    new_lock: threading.RLock = threading.RLock()
+    shared_context["__lock__"] = new_lock
+    return new_lock
+
+
+def _now_iso() -> str:
+    return datetime.now(tz=timezone.utc).isoformat()
+
+
+def _progress_callback(shared_context: dict[str, Any]) -> Any:
+    callback = shared_context.get("__progress_callback__")
+    return callback if callable(callback) else None
+
+
+def _active_progress_step(shared_context: dict[str, Any], *, role: str) -> str:
+    active = shared_context.get("__active_categories__")
+    if isinstance(active, dict):
+        category = str(active.get(role, "")).strip()
+        if category:
+            return category
+    return f"{role}_agent"
+
+
+def _set_active_progress_category(shared_context: dict[str, Any], *, role: str, category: str | None) -> str | None:
+    with _shared_context_lock(shared_context):
+        active = shared_context.setdefault("__active_categories__", {})
+        if not isinstance(active, dict):
+            return None
+        previous_raw = active.get(role)
+        previous = str(previous_raw).strip() if isinstance(previous_raw, str) and str(previous_raw).strip() else None
+        if category:
+            active[role] = str(category).strip()
+        else:
+            active.pop(role, None)
+        return previous
+
+
+def _emit_shared_progress(
+    shared_context: dict[str, Any],
+    *,
+    role: str,
+    status: str,
+    detail: str | None = None,
+    step: str | None = None,
+    **extra: Any,
+) -> None:
+    callback = _progress_callback(shared_context)
+    if callback is None:
+        return
+    payload: dict[str, Any] = {
+        "ts": _now_iso(),
+        "step": step or _active_progress_step(shared_context, role=role),
+        "status": status,
+        "role": role,
+    }
+    if detail:
+        payload["detail"] = detail
+    for key, value in extra.items():
+        if value is None:
+            continue
+        payload[key] = value
+    try:
+        callback(payload)
+    except Exception:
+        return
+
+
+def _handoff_cache_db_path(checkpoint_dir: str | None) -> Path | None:
+    path = str(checkpoint_dir or "").strip()
+    if not path:
+        return None
+    root = Path(path)
+    if root.name.startswith(("analyze-", "run-", "validate-")) and root.parent:
+        root = root.parent
+    root.mkdir(parents=True, exist_ok=True)
+    return root / "handoff_cache.sqlite"
+
+
+def _ensure_handoff_cache_db(db_path: Path) -> None:
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS handoff_exact_cache (
+                cache_key TEXT PRIMARY KEY,
+                response_json TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+
+
+def _handoff_cache_key(
+    session: AgentSession,
+    *,
+    category: str,
+    envelope: dict[str, Any],
+    response_contract: str,
+    workspace_role: str,
+    delegated_role: str | None,
+) -> str:
+    def _normalize_cache_value(value: Any) -> Any:
+        if isinstance(value, dict):
+            normalized: dict[str, Any] = {}
+            for key, item in value.items():
+                if key in {"agent_threads", "__lock__"}:
+                    continue
+                if key in {"thread_id", "updated_at", "created_at"}:
+                    continue
+                normalized[key] = _normalize_cache_value(item)
+            return normalized
+        if isinstance(value, list):
+            return [_normalize_cache_value(item) for item in value]
+        return value
+
+    payload = {
+        "role": session.role,
+        "model": session.model,
+        "repo_root": str(session.repo_root or ""),
+        "category": category,
+        "workspace_role": workspace_role,
+        "delegated_role": delegated_role or "",
+        "response_contract": response_contract,
+        "envelope": _normalize_cache_value(envelope),
+    }
+    serialized = json.dumps(payload, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _load_handoff_cache(checkpoint_dir: str | None, cache_key: str) -> dict[str, Any] | None:
+    db_path = _handoff_cache_db_path(checkpoint_dir)
+    if db_path is None or not db_path.exists():
+        return None
+    _ensure_handoff_cache_db(db_path)
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT response_json FROM handoff_exact_cache WHERE cache_key = ?",
+            (cache_key,),
+        ).fetchone()
+    if row is None:
+        return None
+    try:
+        payload = json.loads(str(row[0]))
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _store_handoff_cache(checkpoint_dir: str | None, cache_key: str, payload: dict[str, Any]) -> None:
+    db_path = _handoff_cache_db_path(checkpoint_dir)
+    if db_path is None:
+        return
+    _ensure_handoff_cache_db(db_path)
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO handoff_exact_cache (cache_key, response_json, created_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(cache_key) DO UPDATE SET
+                response_json = excluded.response_json,
+                created_at = excluded.created_at
+            """,
+            (
+                cache_key,
+                json.dumps(payload, ensure_ascii=True, sort_keys=True),
+                datetime.now(tz=timezone.utc).isoformat(),
+            ),
+        )
+        conn.commit()
+
+
+def _acquire_inflight_handoff(cache_key: str) -> tuple[dict[str, Any], bool]:
+    with _INFLIGHT_HANDOFFS_LOCK:
+        entry = _INFLIGHT_HANDOFFS.get(cache_key)
+        if entry is not None:
+            return entry, False
+        entry = {"event": threading.Event(), "result": None, "error": None}
+        _INFLIGHT_HANDOFFS[cache_key] = entry
+        return entry, True
+
+
+def _resolve_inflight_handoff(cache_key: str, *, result: dict[str, Any] | None = None, error: Exception | None = None) -> None:
+    with _INFLIGHT_HANDOFFS_LOCK:
+        entry = _INFLIGHT_HANDOFFS.pop(cache_key, None)
+    if entry is None:
+        return
+    entry["result"] = result
+    entry["error"] = error
+    entry["event"].set()
+
+
+def _shared_context_snapshot(shared_context: dict[str, Any], key: str, default: Any) -> Any:
+    with _shared_context_lock(shared_context):
+        value = shared_context.get(key, default)
+        try:
+            return copy.deepcopy(value)
+        except Exception:
+            return value
+
+
+def _clone_shared_context(shared_context: dict[str, Any]) -> dict[str, Any]:
+    with _shared_context_lock(shared_context):
+        cloned: dict[str, Any] = {}
+        for key, value in shared_context.items():
+            if key == "__lock__":
+                continue
+            try:
+                cloned[key] = copy.deepcopy(value)
+            except Exception:
+                cloned[key] = value
+    cloned["__lock__"] = threading.RLock()
+    return cloned
+
+
+def _append_workspace_index_ref(shared_context: dict[str, Any], *, role: str, category: str, relative: str) -> None:
+    with _shared_context_lock(shared_context):
+        workspace_index = shared_context.setdefault("workspace_index", {})
+        if not isinstance(workspace_index, dict):
+            return
+        workspace_index.setdefault(role, {})
+        role_index = workspace_index.get(role)
+        if not isinstance(role_index, dict):
+            return
+        role_index.setdefault(category, [])
+        refs = role_index.get(category)
+        if isinstance(refs, list):
+            refs.append(relative)
+
+
+def _append_shared_context_entry(shared_context: dict[str, Any], *, key: str, role: str, payload: dict[str, Any]) -> None:
+    with _shared_context_lock(shared_context):
+        mapping = shared_context.setdefault(key, {})
+        if not isinstance(mapping, dict):
+            return
+        mapping.setdefault(role, [])
+        entries = mapping.get(role)
+        if isinstance(entries, list):
+            entries.append(payload)
+
+
+def _append_shared_context_list_item(shared_context: dict[str, Any], *, key: str, payload: dict[str, Any]) -> None:
+    with _shared_context_lock(shared_context):
+        entries = shared_context.setdefault(key, [])
+        if isinstance(entries, list):
+            entries.append(payload)
+
+
+def _research_context_delta(shared_context: dict[str, Any], *, role: str) -> dict[str, Any]:
+    workspace_index = _shared_context_snapshot(shared_context, "workspace_index", {})
+    tool_usage = _shared_context_snapshot(shared_context, "tool_usage", {})
+    worklog = _shared_context_snapshot(shared_context, "worklog", {})
+    workspace_role = workspace_index.get(role, {}) if isinstance(workspace_index, dict) else {}
+    tool_role = tool_usage.get(role, []) if isinstance(tool_usage, dict) else []
+    worklog_role = worklog.get(role, []) if isinstance(worklog, dict) else []
+    return {
+        "workspace_index": {
+            role: workspace_role,
+        },
+        "tool_usage": {
+            role: tool_role,
+        },
+        "worklog": {
+            role: worklog_role,
+        },
+    }
+
+
+def merge_agent_runtime_context_delta(runtime: AgentRuntime, delta: dict[str, Any]) -> None:
+    if not isinstance(delta, dict) or not delta:
+        return
+    with _shared_context_lock(runtime.shared_context):
+        workspace_index_delta = delta.get("workspace_index", {})
+        if isinstance(workspace_index_delta, dict):
+            workspace_index = runtime.shared_context.setdefault("workspace_index", {})
+            if isinstance(workspace_index, dict):
+                for role, categories in workspace_index_delta.items():
+                    if not isinstance(categories, dict):
+                        continue
+                    workspace_index.setdefault(role, {})
+                    role_index = workspace_index.get(role)
+                    if not isinstance(role_index, dict):
+                        continue
+                    for category, refs in categories.items():
+                        if not isinstance(refs, list):
+                            continue
+                        role_index.setdefault(category, [])
+                        target_refs = role_index.get(category)
+                        if not isinstance(target_refs, list):
+                            continue
+                        for ref in refs:
+                            text = str(ref).strip()
+                            if text and text not in target_refs:
+                                target_refs.append(text)
+
+        for key in ("tool_usage", "worklog"):
+            key_delta = delta.get(key, {})
+            if not isinstance(key_delta, dict):
+                continue
+            target = runtime.shared_context.setdefault(key, {})
+            if not isinstance(target, dict):
+                continue
+            for role, entries in key_delta.items():
+                if not isinstance(entries, list):
+                    continue
+                target.setdefault(role, [])
+                dest = target.get(role)
+                if not isinstance(dest, list):
+                    continue
+                seen_refs = {
+                    str(item.get("ref", "")).strip()
+                    for item in dest
+                    if isinstance(item, dict)
+                }
+                for entry in entries:
+                    if not isinstance(entry, dict):
+                        continue
+                    ref = str(entry.get("ref", "")).strip()
+                    if ref and ref in seen_refs:
+                        continue
+                    dest.append(entry)
+                    if ref:
+                        seen_refs.add(ref)
+
+
+def clone_runtime_for_parallel_role(runtime: AgentRuntime, config: PadvConfig, *, role: str) -> AgentRuntime:
+    prompts = getattr(runtime, "prompts", {})
+    if not isinstance(prompts, dict) or role not in prompts:
+        return runtime
+    shared_context = _clone_shared_context(runtime.shared_context)
+    shared_context["__delta__"] = {}
+    session = _create_agent_session(
+        config,
+        role=role,
+        system_prompt=prompts[role],
+        repo_root=runtime.repo_root,
+        shared_context=shared_context,
+        frontier_state=None,
+        checkpoint_dir=runtime.checkpoint_dir,
+        store=runtime.store,
+        backend=_build_backend_factory(runtime.repo_root, runtime.workspace_dir),
+        name=f"padv-{role}-subagent",
+    )
+    return AgentRuntime(
+        root=runtime.root,
+        subagents={role: session},
+        shared_context=shared_context,
+        checkpoint_dir=runtime.checkpoint_dir,
+        workspace_dir=runtime.workspace_dir,
+        model=runtime.model,
+        repo_root=runtime.repo_root,
+        store=runtime.store,
+        prompts=prompts,
+    )
+
+
+def finalize_parallel_role_runtime(runtime: AgentRuntime, *, role: str) -> dict[str, Any]:
+    if not isinstance(getattr(runtime, "shared_context", None), dict):
+        return {}
+    delta = _research_context_delta(runtime.shared_context, role=role)
+    runtime.shared_context["__delta__"] = delta
+    return delta
+
+
+def _compact_frontier_state(frontier_state: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(frontier_state, dict):
+        return {}
+
+    def _compact_mapping(records: dict[str, Any], limit: int) -> dict[str, Any]:
+        if not isinstance(records, dict):
+            return {}
+        compact: dict[str, Any] = {}
+        for key in list(records.keys())[:limit]:
+            value = records.get(key)
+            if isinstance(value, dict):
+                compact[str(key)] = {
+                    "candidate_id": str(value.get("candidate_id", "")),
+                    "completed_clean": bool(value.get("completed_clean")),
+                    "last_iteration": int(value.get("last_iteration", 0) or 0),
+                }
+            else:
+                compact[str(key)] = value
+        return compact
+
+    def _compact_events(items: Any, limit: int) -> list[dict[str, Any]]:
+        if not isinstance(items, list):
+            return []
+        compact: list[dict[str, Any]] = []
+        for item in items[-limit:]:
+            if not isinstance(item, dict):
+                continue
+            compact.append(
+                {
+                    "candidate_id": str(item.get("candidate_id", "")),
+                    "vuln_class": str(item.get("vuln_class", "")),
+                    "iteration": int(item.get("iteration", 0) or 0),
+                    "decision": str(item.get("decision", item.get("status", ""))),
+                    "phase": str(item.get("phase", "")),
+                    "score": float(item.get("score", 0.0) or 0.0) if isinstance(item.get("score", 0.0), (int, float)) else 0.0,
+                }
+            )
+        return compact
+
+    def _compact_failed_paths(items: Any, limit: int, max_reason: int) -> list[dict[str, Any]]:
+        if not isinstance(items, list):
+            return []
+        compact: list[dict[str, Any]] = []
+        for item in items[-limit:]:
+            if not isinstance(item, dict):
+                continue
+            reason = str(item.get("reason", "")).strip()
+            if len(reason) > max_reason:
+                reason = reason[: max_reason - 3].rstrip() + "..."
+            compact.append(
+                {
+                    "path": str(item.get("path", "")).strip(),
+                    "iteration": int(item.get("iteration", 0) or 0),
+                    "reason": reason,
+                }
+            )
+        return compact
+
+    coverage = frontier_state.get("coverage", {})
+    runtime_coverage = frontier_state.get("runtime_coverage", {})
+    return {
+        "version": int(frontier_state.get("version", 0) or 0),
+        "updated_at": str(frontier_state.get("updated_at", "")),
+        "iteration": int(frontier_state.get("iteration", 0) or 0),
+        "stagnation_rounds": int(frontier_state.get("stagnation_rounds", 0) or 0),
+        "failed_paths_count": len(frontier_state.get("failed_paths", []))
+        if isinstance(frontier_state.get("failed_paths", []), list)
+        else 0,
+        "coverage": {
+            "files": list(coverage.get("files", []))[-10:] if isinstance(coverage, dict) else [],
+            "classes": list(coverage.get("classes", []))[-10:] if isinstance(coverage, dict) else [],
+            "signals": list(coverage.get("signals", []))[-10:] if isinstance(coverage, dict) else [],
+            "sinks": list(coverage.get("sinks", []))[-10:] if isinstance(coverage, dict) else [],
+            "web_paths": list(coverage.get("web_paths", []))[-10:] if isinstance(coverage, dict) else [],
+        },
+        "runtime_coverage": {
+            "flags": list(runtime_coverage.get("flags", []))[-10:] if isinstance(runtime_coverage, dict) else [],
+            "classes": list(runtime_coverage.get("classes", []))[-10:] if isinstance(runtime_coverage, dict) else [],
+        },
+        "failed_paths": _compact_failed_paths(frontier_state.get("failed_paths", []), 8, 240),
+        "hypotheses_count": len(frontier_state.get("hypotheses", []))
+        if isinstance(frontier_state.get("hypotheses", []), list)
+        else 0,
+        "history_count": len(frontier_state.get("history", []))
+        if isinstance(frontier_state.get("history", []), list)
+        else 0,
+        "attempt_history_count": len(frontier_state.get("attempt_history", []))
+        if isinstance(frontier_state.get("attempt_history", []), list)
+        else 0,
+        "candidate_resume_size": len(frontier_state.get("candidate_resume", {}))
+        if isinstance(frontier_state.get("candidate_resume", {}), dict)
+        else 0,
+    }
+
+
+def _compact_research_frontier_state(frontier_state: dict[str, Any] | None) -> dict[str, Any]:
+    compact = _compact_frontier_state(frontier_state)
+    if not compact:
+        return {}
+    compact.pop("failed_paths", None)
+    compact.pop("history_count", None)
+    compact.pop("attempt_history_count", None)
+    compact.pop("candidate_resume_size", None)
+    coverage = compact.get("coverage")
+    if isinstance(coverage, dict):
+        compact["coverage"] = {
+            "files": list(coverage.get("files", []))[-6:],
+            "classes": list(coverage.get("classes", []))[-6:],
+            "signals": list(coverage.get("signals", []))[-6:],
+            "sinks": list(coverage.get("sinks", []))[-4:],
+            "web_paths": list(coverage.get("web_paths", []))[-6:],
+        }
+    runtime_coverage = compact.get("runtime_coverage")
+    if isinstance(runtime_coverage, dict):
+        compact["runtime_coverage"] = {
+            "flags": list(runtime_coverage.get("flags", []))[-6:],
+            "classes": list(runtime_coverage.get("classes", []))[-6:],
+        }
+    return compact
+
+
+def _compact_research_findings(findings: list[ResearchFinding], *, limit: int = 12) -> list[dict[str, Any]]:
+    compact: list[dict[str, Any]] = []
+    for item in findings[:limit]:
+        compact.append(
+            {
+                "finding_id": item.finding_id,
+                "objective_id": item.objective_id,
+                "channel": item.channel,
+                "title": item.title[:140],
+                "summary": item.summary[:400],
+                "evidence_refs": list(item.evidence_refs)[:6],
+                "file_refs": list(item.file_refs)[:4],
+                "web_paths": list(item.web_paths)[:4],
+                "params": list(item.params)[:4],
+                "sink_refs": list(item.sink_refs)[:4],
+                "metadata_keys": sorted(item.metadata.keys())[:6] if isinstance(item.metadata, dict) else [],
+            }
+        )
+    return compact
+
+
+def _compact_hypotheses(hypotheses: list[Hypothesis], *, limit: int = 6) -> list[dict[str, Any]]:
+    compact: list[dict[str, Any]] = []
+    for item in hypotheses[:limit]:
+        compact.append(
+            {
+                "hypothesis_id": item.hypothesis_id,
+                "objective_id": item.objective_id,
+                "vuln_class": item.vuln_class,
+                "title": item.title[:140],
+                "rationale": item.rationale[:160],
+                "evidence_refs": list(item.evidence_refs)[:4],
+                "confidence": item.confidence,
+                "status": item.status,
+                "auth_requirements": list(item.auth_requirements)[:3],
+                "web_path_hints": list(item.web_path_hints)[:3],
+                "preconditions": list(item.preconditions)[:3],
+                "candidate": {
+                    "candidate_id": item.candidate.candidate_id,
+                    "vuln_class": item.candidate.vuln_class,
+                    "title": item.candidate.title[:140],
+                    "file_path": item.candidate.file_path,
+                    "line": item.candidate.line,
+                    "sink": item.candidate.sink[:180],
+                    "confidence": item.candidate.confidence,
+                    "expected_intercepts": list(item.candidate.expected_intercepts)[:4],
+                    "evidence_refs": list(item.candidate.evidence_refs)[:4],
+                },
+            }
+        )
+    return compact
+
+
+_ENVIRONMENTAL_SKEPTIC_TOKENS = (
+    "security_level",
+    "security level",
+    "auth-state-known",
+    "default configuration",
+    "deployment configuration",
+    ".htaccess",
+    "rfc1918",
+    "localhost",
+    "internal network",
+    "network barrier",
+    "network access",
+    "session state",
+    "php session",
+)
+
+
+def _is_environmental_skeptic_text(value: str) -> bool:
+    text = str(value or "").strip().lower()
+    if not text:
+        return False
+    return any(token in text for token in _ENVIRONMENTAL_SKEPTIC_TOKENS)
+
+
+def _compact_hypotheses_for_skeptic(hypotheses: list[Hypothesis], *, limit: int = 3) -> list[dict[str, Any]]:
+    compact = _compact_hypotheses(hypotheses, limit=limit)
+    for item in compact:
+        auth_requirements = [
+            value for value in item.get("auth_requirements", []) if not _is_environmental_skeptic_text(str(value))
+        ]
+        preconditions = [
+            value for value in item.get("preconditions", []) if not _is_environmental_skeptic_text(str(value))
+        ]
+        item["auth_requirements"] = auth_requirements[:2]
+        item["preconditions"] = preconditions[:2]
+        item["environment_constraints_tracked_elsewhere"] = True
+        item["skeptic_focus"] = "exploit-invalidating objections only"
+    return compact
+
+
+def _handoff_work_guidance(role: str, category: str) -> str:
+    if category in {"source_research", "graph_research", "web_research"}:
+        return (
+            f"Your role is {role} research. Inspect repo/shared context, record concrete intermediate findings with "
+            "`write_agent_worklog`. Do not jump straight to a summary without first externalizing your intermediate work. "
+            "When you finalize, return only the strongest few executable findings; do not spend tokens on a long task ledger."
+        )
+    if category == "skeptic_challenge":
+        return (
+            "Actively try to disprove the current hypotheses, but keep the scope tight. Focus on exploit-invalidating "
+            "objections grounded in sanitization, parser behavior, request shaping, sink reachability, or authorization "
+            "logic. Do not spend the turn re-checking deployment or environment preconditions such as security level, "
+            "network placement, default configuration, or session setup; runtime and gates track those separately unless "
+            "they make every exploit variant impossible. Record the strongest objections with `write_agent_worklog`, and "
+            "then finalize. Return at most 3 material refutations; do not write one note per hypothesis if the weaker "
+            "claims add little information. If the remaining hypotheses have no strong objection, finalize with fewer or "
+            "zero refutations instead of continuing."
+        )
+    if category == "experiment_plan":
+        return (
+            "Build the runtime plan incrementally, but keep the scope tight. Focus on the strongest 2-3 surviving "
+            "hypotheses, persist planning checkpoints with `write_agent_worklog`, and then finalize. Return at most 3 "
+            "concrete validation plans with explicit positive/negative controls; do not spend turns on a general "
+            "strategy essay once the requests and witness goals are clear."
+        )
+    if category in {"orient", "select_objective", "continue_or_stop"}:
+        return (
+            "Use the shared objective/frontier tools to justify the next move. Start from the aggregate discovery "
+            "summary tools before drilling into raw candidate or evidence records. Prefer a backlog that spans "
+            "materially distinct vulnerability families present in discovery instead of collapsing to a top-4 shortlist. "
+            "Return only the strongest primary objectives you can defend; deterministic backfill will preserve wider "
+            "coverage after your ranking. Do not block orient or selection on unresolved deployment/reachability "
+            "questions; capture those uncertainties in the objective rationale and let later research/skeptic phases "
+            "test them explicitly. Persist a short worklog note if you change direction or stop due to lack of "
+            "information gain."
+        )
+    return "Use the workspace and shared-state tools before concluding, and persist meaningful intermediate work."
+
+
+def _handoff_turn_checklist(category: str, turn: int) -> list[str]:
+    if category in {"source_research", "graph_research", "web_research"}:
+        if turn == 1:
+            return [
+                "inspect candidate seeds and semantic evidence",
+                "persist at least one worklog note for a concrete lead",
+                "continue if a sink/path question remains open",
+            ]
+        return [
+            "review the latest worklog and unresolved questions",
+            "tighten findings to executable/request-relevant evidence",
+            "finalize only if at least one concrete finding is ready",
+        ]
+    if category == "skeptic_challenge":
+        if turn == 1:
+            return [
+                "inspect current hypotheses and prior refutations",
+                "persist only the strongest 1-3 objections in the worklog",
+                "finalize once the strongest objections are explicit",
+            ]
+        return [
+            "review only unresolved high-value objections",
+            "drop low-value objections that do not materially change exploitability",
+            "finalize after explicit refutation reasoning for the strongest objections",
+        ]
+    if category == "experiment_plan":
+        if turn == 1:
+            return [
+                "review only the strongest 2-3 surviving hypotheses and runtime history",
+                "persist a worklog checkpoint for the strongest witness strategies",
+                "finalize once positive and negative controls are explicit for the strongest plans",
+            ]
+        return [
+            "drop lower-value plans that do not materially improve validation coverage",
+            "ensure requests, oracle functions, and witness goals align for the remaining plans",
+            "finalize with the strongest 1-3 concrete plans",
+        ]
+    if category in {"orient", "select_objective", "continue_or_stop"}:
+        if turn == 1:
+            return [
+                "review objectives/frontier state",
+                "persist a supervisor worklog checkpoint with the current decision framing",
+                "continue if competing priorities or stop conditions remain unresolved",
+            ]
+        return [
+            "review the prior supervisor worklog checkpoint",
+            "justify the next decision against frontier history and expected information gain",
+            "encode unresolved deployment or reachability questions in the rationale instead of stalling",
+            "finalize only after the decision rationale is explicit and externally inspectable",
+        ]
+    return ["review latest context", "use tools before concluding"]
+
+
+def _build_shared_context_tools(shared_context: dict[str, Any], repo_root: str | None, *, role: str) -> list[Any]:
+    try:
+        from langchain_core.tools import tool  # type: ignore[import-not-found]
+    except Exception as exc:
+        raise AgentExecutionError(f"langchain_core tools import failed: {exc}") from exc
+
+    tools = _build_filesystem_tools(repo_root) if repo_root and role != "root" else []
+    workspace_dir = Path(str(shared_context.get("workspace_dir") or "")).resolve() if shared_context.get("workspace_dir") else None
+
+    def _safe_workspace_path(rel_path: str) -> Path | None:
+        if workspace_dir is None:
+            return None
+        try:
+            candidate = (workspace_dir / rel_path).resolve()
+        except Exception:
+            return None
+        if workspace_dir == candidate or workspace_dir in candidate.parents:
+            return candidate
+        return None
+
+    def _list_workspace(prefix: str = "") -> str:
+        if workspace_dir is None or not workspace_dir.exists():
+            return "[]"
+        base = _safe_workspace_path(prefix.strip()) if prefix.strip() else workspace_dir
+        if base is None or not base.exists():
+            return "[]"
+        if base.is_file():
+            return json.dumps([str(base.relative_to(workspace_dir))], ensure_ascii=True)
+        items = sorted(
+            str(path.relative_to(workspace_dir))
+            for path in base.rglob("*.json")
+        )
+        return json.dumps(items[:500], ensure_ascii=True)
+
+    def _write_role_workspace(category: str, payload: dict[str, Any]) -> str:
+        if workspace_dir is None:
+            return "workspace unavailable"
+        artifact_id = uuid.uuid4().hex[:12]
+        path = workspace_dir / role / category / f"{artifact_id}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
+        relative = str(path.relative_to(workspace_dir))
+        _append_workspace_index_ref(shared_context, role=role, category=category, relative=relative)
+        return relative
+
+    def _record_tool_use(tool_name: str, **metadata: Any) -> None:
+        payload = {
+            "role": role,
+            "tool": str(tool_name),
+            **metadata,
+        }
+        relative = _write_role_workspace("tool_calls", payload)
+        _append_shared_context_entry(shared_context, key="tool_usage", role=role, payload={"ref": relative, **payload})
+        detail = f"tool {tool_name}"
+        summary_bits: list[str] = []
+        if "count" in metadata:
+            summary_bits.append(f"count={metadata['count']}")
+        if "selector" in metadata and str(metadata["selector"]).strip():
+            summary_bits.append(f"selector={str(metadata['selector'])[:80]}")
+        if "prefix" in metadata and str(metadata["prefix"]).strip():
+            summary_bits.append(f"prefix={str(metadata['prefix'])[:80]}")
+        if "path" in metadata and str(metadata["path"]).strip():
+            summary_bits.append(f"path={str(metadata['path'])[:80]}")
+        if summary_bits:
+            detail += " | " + ", ".join(summary_bits)
+        _emit_shared_progress(
+            shared_context,
+            role=role,
+            status="activity",
+            detail=detail,
+            artifact_ref=relative,
+            tool=tool_name,
+        )
+
+    @tool("search_repo_text")
+    def search_repo_text(pattern: str) -> str:
+        """Search the repo with ripgrep and return matching lines."""
+        token = str(pattern or "").strip()
+        if not token or not repo_root:
+            return "search unavailable"
+        _record_tool_use("search_repo_text", pattern=token[:240])
+        return _run_repo_command(repo_root, f"rg -n --hidden --glob '!vendor' --glob '!node_modules' {shlex.quote(token)} .")
+
+    @tool("list_objectives")
+    def list_objectives(_: str = "") -> str:
+        """List current objective queue."""
+        payload = _shared_context_snapshot(shared_context, "objective_queue", [])
+        _record_tool_use("list_objectives", count=min(len(payload), 50) if isinstance(payload, list) else 0)
+        return json.dumps(payload[:50], ensure_ascii=True)
+
+    @tool("list_research_findings")
+    def list_research_findings(channel: str = "") -> str:
+        """List current research findings, optionally filtered by channel."""
+        findings = _shared_context_snapshot(shared_context, "research_findings", [])
+        if not isinstance(findings, list):
+            return "[]"
+        wanted = str(channel or "").strip().lower()
+        filtered = []
+        for item in findings:
+            if not isinstance(item, dict):
+                continue
+            if wanted and str(item.get("channel", "")).strip().lower() != wanted:
+                continue
+            filtered.append(item)
+        _record_tool_use("list_research_findings", channel=wanted, count=min(len(filtered), 100))
+        return json.dumps(filtered[:100], ensure_ascii=True)
+
+    @tool("list_hypotheses")
+    def list_hypotheses(selector: str = "") -> str:
+        """List current hypotheses filtered by objective, class, candidate or text selector."""
+        hypotheses = _shared_context_snapshot(shared_context, "hypotheses", [])
+        if not isinstance(hypotheses, list):
+            return "[]"
+        token = str(selector or "").strip().lower()
+        filtered = []
+        for item in hypotheses:
+            if not isinstance(item, dict):
+                continue
+            haystack = json.dumps(item, ensure_ascii=True).lower()
+            if token and token not in haystack:
+                continue
+            filtered.append(item)
+        _record_tool_use("list_hypotheses", selector=token[:120], count=min(len(filtered), 100))
+        return json.dumps(filtered[:100], ensure_ascii=True)
+
+    @tool("list_refutations")
+    def list_refutations(selector: str = "") -> str:
+        """List current refutations filtered by hypothesis, severity or text selector."""
+        refutations = _shared_context_snapshot(shared_context, "refutations", [])
+        if not isinstance(refutations, list):
+            return "[]"
+        token = str(selector or "").strip().lower()
+        filtered = []
+        for item in refutations:
+            if not isinstance(item, dict):
+                continue
+            haystack = json.dumps(item, ensure_ascii=True).lower()
+            if token and token not in haystack:
+                continue
+            filtered.append(item)
+        _record_tool_use("list_refutations", selector=token[:120], count=min(len(filtered), 100))
+        return json.dumps(filtered[:100], ensure_ascii=True)
+
+    @tool("list_experiment_attempts")
+    def list_experiment_attempts(selector: str = "") -> str:
+        """List current planned experiment attempts filtered by hypothesis or text selector."""
+        attempts = _shared_context_snapshot(shared_context, "experiment_board", [])
+        if not isinstance(attempts, list):
+            return "[]"
+        token = str(selector or "").strip().lower()
+        filtered = []
+        for item in attempts:
+            if not isinstance(item, dict):
+                continue
+            haystack = json.dumps(item, ensure_ascii=True).lower()
+            if token and token not in haystack:
+                continue
+            filtered.append(item)
+        _record_tool_use("list_experiment_attempts", selector=token[:120], count=min(len(filtered), 100))
+        return json.dumps(filtered[:100], ensure_ascii=True)
+
+    @tool("list_task_delegations")
+    def list_task_delegations(selector: str = "") -> str:
+        """List recorded root task delegations filtered by subagent type or text selector."""
+        delegations = _shared_context_snapshot(shared_context, "delegations", [])
+        if not isinstance(delegations, list):
+            return "[]"
+        token = str(selector or "").strip().lower()
+        filtered = []
+        for item in delegations:
+            if not isinstance(item, dict):
+                continue
+            haystack = json.dumps(item, ensure_ascii=True).lower()
+            if token and token not in haystack:
+                continue
+            filtered.append(item)
+        _record_tool_use("list_task_delegations", selector=token[:120], count=min(len(filtered), 100))
+        return json.dumps(filtered[:100], ensure_ascii=True)
+
+    @tool("lookup_semantic_evidence")
+    def lookup_semantic_evidence(selector: str = "") -> str:
+        """Return semantic evidence refs and snippets for SCIP/Joern selectors."""
+        token = str(selector or "").strip().lower()
+        evidence = _shared_context_snapshot(shared_context, "static_evidence", [])
+        if not isinstance(evidence, list):
+            return "[]"
+        filtered = []
+        for item in evidence:
+            if not isinstance(item, dict):
+                continue
+            haystack = " ".join(
+                [
+                    str(item.get("candidate_id", "")),
+                    str(item.get("query_id", "")),
+                    str(item.get("file_path", "")),
+                    str(item.get("snippet", "")),
+                ]
+            ).lower()
+            if token and token not in haystack:
+                continue
+            filtered.append(item)
+        _record_tool_use("lookup_semantic_evidence", selector=token[:120], count=min(len(filtered), 100))
+        return json.dumps(filtered[:100], ensure_ascii=True)
+
+    @tool("summarize_semantic_evidence")
+    def summarize_semantic_evidence(_: str = "") -> str:
+        """Return aggregate counts and representative samples across all semantic evidence."""
+        evidence = _shared_context_snapshot(shared_context, "static_evidence", [])
+        if not isinstance(evidence, list):
+            return "{}"
+        by_class: dict[str, dict[str, Any]] = {}
+        total = 0
+        for item in evidence:
+            if not isinstance(item, dict):
+                continue
+            total += 1
+            query_id = str(item.get("query_id", "")).strip()
+            vuln_class = query_id.split("::", 1)[-1] if "::" in query_id else query_id or "unknown"
+            bucket = by_class.setdefault(
+                vuln_class,
+                {
+                    "count": 0,
+                    "query_ids": [],
+                    "sample_files": [],
+                    "sample_candidate_ids": [],
+                },
+            )
+            bucket["count"] += 1
+            file_path = str(item.get("file_path", "")).strip()
+            candidate_id = str(item.get("candidate_id", "")).strip()
+            if query_id and query_id not in bucket["query_ids"] and len(bucket["query_ids"]) < 5:
+                bucket["query_ids"].append(query_id)
+            if file_path and file_path not in bucket["sample_files"] and len(bucket["sample_files"]) < 5:
+                bucket["sample_files"].append(file_path)
+            if candidate_id and candidate_id not in bucket["sample_candidate_ids"] and len(bucket["sample_candidate_ids"]) < 5:
+                bucket["sample_candidate_ids"].append(candidate_id)
+        summary = {"total": total, "classes": {key: by_class[key] for key in sorted(by_class.keys())}}
+        _record_tool_use("summarize_semantic_evidence", class_count=len(by_class), total=total)
+        return json.dumps(summary, ensure_ascii=True)
+
+    @tool("lookup_candidate_seeds")
+    def lookup_candidate_seeds(selector: str = "") -> str:
+        """Return candidate seed records filtered by selector."""
+        token = str(selector or "").strip().lower()
+        candidates = _shared_context_snapshot(shared_context, "candidate_seeds", [])
+        if not isinstance(candidates, list):
+            return "[]"
+        filtered = []
+        for item in candidates:
+            if not isinstance(item, dict):
+                continue
+            haystack = " ".join(
+                [
+                    str(item.get("candidate_id", "")),
+                    str(item.get("vuln_class", "")),
+                    str(item.get("file_path", "")),
+                    str(item.get("sink", "")),
+                ]
+            ).lower()
+            if token and token not in haystack:
+                continue
+            filtered.append(item)
+        _record_tool_use("lookup_candidate_seeds", selector=token[:120], count=min(len(filtered), 100))
+        return json.dumps(filtered[:100], ensure_ascii=True)
+
+    @tool("summarize_candidate_seeds")
+    def summarize_candidate_seeds(_: str = "") -> str:
+        """Return aggregate counts and representative samples across all candidate seeds."""
+        candidates = _shared_context_snapshot(shared_context, "candidate_seeds", [])
+        if not isinstance(candidates, list):
+            return "{}"
+        by_class: dict[str, dict[str, Any]] = {}
+        total = 0
+        for item in candidates:
+            if not isinstance(item, dict):
+                continue
+            total += 1
+            vuln_class = str(item.get("vuln_class", "")).strip() or "unknown"
+            bucket = by_class.setdefault(
+                vuln_class,
+                {
+                    "count": 0,
+                    "sample_candidate_ids": [],
+                    "sample_files": [],
+                    "sample_sinks": [],
+                },
+            )
+            bucket["count"] += 1
+            candidate_id = str(item.get("candidate_id", "")).strip()
+            file_path = str(item.get("file_path", "")).strip()
+            sink = str(item.get("sink", "")).strip()
+            if candidate_id and candidate_id not in bucket["sample_candidate_ids"] and len(bucket["sample_candidate_ids"]) < 5:
+                bucket["sample_candidate_ids"].append(candidate_id)
+            if file_path and file_path not in bucket["sample_files"] and len(bucket["sample_files"]) < 5:
+                bucket["sample_files"].append(file_path)
+            if sink and sink not in bucket["sample_sinks"] and len(bucket["sample_sinks"]) < 5:
+                bucket["sample_sinks"].append(sink)
+        summary = {"total": total, "classes": {key: by_class[key] for key in sorted(by_class.keys())}}
+        _record_tool_use("summarize_candidate_seeds", class_count=len(by_class), total=total)
+        return json.dumps(summary, ensure_ascii=True)
+
+    @tool("lookup_web_state")
+    def lookup_web_state(selector: str = "") -> str:
+        """Return Playwright-derived web artifacts, hints, auth contexts and discovery artifacts."""
+        token = str(selector or "").strip().lower()
+        payload = {
+            "web_hints": _shared_context_snapshot(shared_context, "web_hints", {}),
+            "web_artifacts": _shared_context_snapshot(shared_context, "web_artifacts", {}),
+            "auth_contexts": _shared_context_snapshot(shared_context, "auth_contexts", {}),
+            "artifact_index": _shared_context_snapshot(shared_context, "artifact_index", {}),
+        }
+        if not token:
+            _record_tool_use("lookup_web_state", selector="", keys=sorted(payload.keys()))
+            return json.dumps(payload, ensure_ascii=True)
+        narrowed: dict[str, Any] = {}
+        for key, value in payload.items():
+            text = json.dumps(value, ensure_ascii=True).lower()
+            if token in text or token in key.lower():
+                narrowed[key] = value
+        _record_tool_use("lookup_web_state", selector=token[:120], keys=sorted(narrowed.keys()))
+        return json.dumps(narrowed, ensure_ascii=True)
+
+    @tool("lookup_playwright_artifacts")
+    def lookup_playwright_artifacts(selector: str = "") -> str:
+        """Return persisted Playwright-discovered pages and requests filtered by selector."""
+        token = str(selector or "").strip().lower()
+        artifacts = _shared_context_snapshot(shared_context, "web_artifacts", {})
+        if not isinstance(artifacts, dict):
+            return "{}"
+        payload = {
+            "pages": artifacts.get("pages", []),
+            "requests": artifacts.get("requests", []),
+            "visited_urls": artifacts.get("visited_urls", []),
+            "errors": artifacts.get("errors", []),
+        }
+        if not token:
+            _record_tool_use("lookup_playwright_artifacts", selector="", keys=sorted(payload.keys()))
+            return json.dumps(payload, ensure_ascii=True)
+        narrowed: dict[str, Any] = {}
+        for key, value in payload.items():
+            text = json.dumps(value, ensure_ascii=True).lower()
+            if token in text or token in key.lower():
+                narrowed[key] = value
+        _record_tool_use("lookup_playwright_artifacts", selector=token[:120], keys=sorted(narrowed.keys()))
+        return json.dumps(narrowed, ensure_ascii=True)
+
+    @tool("lookup_runtime_history")
+    def lookup_runtime_history(selector: str = "") -> str:
+        """Return runtime history and witness bundles."""
+        token = str(selector or "").strip().lower()
+        payload = {
+            "runtime_history": _shared_context_snapshot(shared_context, "runtime_history", []),
+            "witness_bundles": _shared_context_snapshot(shared_context, "witness_bundles", []),
+            "gate_history": _shared_context_snapshot(shared_context, "gate_history", []),
+        }
+        if not token:
+            _record_tool_use("lookup_runtime_history", selector="", keys=sorted(payload.keys()))
+            return json.dumps(payload, ensure_ascii=True)
+        narrowed: dict[str, Any] = {}
+        for key, value in payload.items():
+            text = json.dumps(value, ensure_ascii=True).lower()
+            if token in text or token in key.lower():
+                narrowed[key] = value
+        _record_tool_use("lookup_runtime_history", selector=token[:120], keys=sorted(narrowed.keys()))
+        return json.dumps(narrowed, ensure_ascii=True)
+
+    @tool("list_agent_workspace")
+    def list_agent_workspace(prefix: str = "") -> str:
+        """List persisted agent workspace artifacts by relative prefix."""
+        _record_tool_use("list_agent_workspace", prefix=str(prefix or "")[:240])
+        return _list_workspace(prefix)
+
+    @tool("read_agent_workspace")
+    def read_agent_workspace(path: str) -> str:
+        """Read a persisted agent workspace artifact by relative path."""
+        _record_tool_use("read_agent_workspace", path=str(path or "")[:240])
+        target = _safe_workspace_path(path)
+        if target is None or not target.exists() or not target.is_file():
+            return "invalid workspace path"
+        try:
+            return target.read_text(encoding="utf-8", errors="ignore")[:24000]
+        except OSError:
+            return "workspace read failed"
+
+    @tool("list_role_workspace")
+    def list_role_workspace(category: str = "") -> str:
+        """List persisted workspace artifacts for the current agent role."""
+        prefix = role if not str(category or "").strip() else f"{role}/{str(category).strip().strip('/')}"
+        _record_tool_use("list_role_workspace", category=str(category or "")[:120], prefix=prefix[:240])
+        return _list_workspace(prefix)
+
+    @tool("write_agent_worklog")
+    def write_agent_worklog(category: str, summary: str, details: str = "", refs_json: str = "[]") -> str:
+        """Persist a role-local worklog note with optional evidence refs."""
+        note_category = str(category or "").strip() or "general"
+        payload = {
+            "role": role,
+            "category": note_category,
+            "summary": str(summary or "").strip(),
+            "details": str(details or "").strip(),
+            "refs": _parse_json_list(refs_json),
+        }
+        relative = _write_role_workspace("worklog", payload)
+        _append_shared_context_entry(shared_context, key="worklog", role=role, payload={"ref": relative, **payload})
+        summary_text = str(payload.get("summary", "")).strip()
+        _emit_shared_progress(
+            shared_context,
+            role=role,
+            status="worklog",
+            detail=f"{note_category}: {summary_text[:120]}".strip(": "),
+            artifact_ref=relative,
+            category=note_category,
+        )
+        return relative
+
+    shared_tools = [
+        list_objectives,
+        list_research_findings,
+        list_hypotheses,
+        list_refutations,
+        list_experiment_attempts,
+        list_task_delegations,
+        summarize_semantic_evidence,
+        lookup_semantic_evidence,
+        summarize_candidate_seeds,
+        lookup_candidate_seeds,
+        lookup_web_state,
+        lookup_playwright_artifacts,
+        lookup_runtime_history,
+        list_agent_workspace,
+        read_agent_workspace,
+        list_role_workspace,
+        write_agent_worklog,
+    ]
+    if role != "root":
+        shared_tools = [search_repo_text, *shared_tools]
+    return tools + shared_tools
+
+
+def _agent_thread_id(frontier_state: dict[str, Any] | None, *, role: str, prefix: str) -> str:
+    threads = frontier_state.get("agent_threads", {}) if isinstance(frontier_state, dict) else {}
+    if isinstance(threads, dict):
+        existing = threads.get(role)
+        if isinstance(existing, str) and existing.strip():
+            return existing.strip()
+    return f"{prefix}-{role}-{uuid.uuid4().hex[:10]}"
+
+
+def _persist_agent_thread_id(frontier_state: dict[str, Any] | None, *, role: str, thread_id: str) -> None:
+    if not isinstance(frontier_state, dict):
+        return
+    threads = frontier_state.setdefault("agent_threads", {})
+    if isinstance(threads, dict):
+        threads[role] = thread_id
+
+
+def _shared_backend_root(repo_root: str | None, workspace_dir: str | None) -> str | None:
+    paths = [str(Path(path).resolve()) for path in (repo_root, workspace_dir) if isinstance(path, str) and path.strip()]
+    if not paths:
+        return None
+    try:
+        return str(Path(os.path.commonpath(paths)))
+    except ValueError:
+        return str(Path(paths[0]))
+
+
+def _memory_store_namespace() -> tuple[str, ...]:
+    return ("padv", "deepagents", "memories")
+
+
+
+def _build_backend_factory(repo_root: str | None, workspace_dir: str | None):
+    try:
+        from deepagents.backends import CompositeBackend, FilesystemBackend, StoreBackend  # type: ignore[import-not-found]
+    except Exception as exc:
+        raise AgentExecutionError(f"deepagents backend import failed: {exc}") from exc
+
+    backend_root = _shared_backend_root(repo_root, workspace_dir) or str(Path.cwd())
+
+    def _factory(runtime: Any) -> Any:
+        return CompositeBackend(
+            default=FilesystemBackend(root_dir=backend_root, virtual_mode=True),
+            routes={
+                "/memories/": StoreBackend(
+                    runtime,
+                    namespace=lambda _ctx: _memory_store_namespace(),
+                )
+            },
+        )
+
+    return _factory
+
+
+def _build_workspace_backend_factory(workspace_dir: str | None):
+    try:
+        from deepagents.backends import CompositeBackend, FilesystemBackend, StoreBackend  # type: ignore[import-not-found]
+    except Exception as exc:
+        raise AgentExecutionError(f"deepagents backend import failed: {exc}") from exc
+
+    backend_root = str(Path(workspace_dir).resolve()) if isinstance(workspace_dir, str) and workspace_dir.strip() else str(Path.cwd())
+
+    def _factory(runtime: Any) -> Any:
+        return CompositeBackend(
+            default=FilesystemBackend(root_dir=backend_root, virtual_mode=True),
+            routes={
+                "/memories/": StoreBackend(
+                    runtime,
+                    namespace=lambda _ctx: _memory_store_namespace(),
+                )
+            },
+        )
+
+    return _factory
+
+
+def _create_persistent_store(checkpoint_dir: str) -> Any:
+    try:
+        from langgraph.store.sqlite import SqliteStore  # type: ignore[import-not-found]
+    except Exception as exc:
+        raise AgentExecutionError(f"langgraph sqlite store import failed: {exc}") from exc
+
+    db_path = Path(checkpoint_dir) / "memories.sqlite"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(
+        str(db_path),
+        check_same_thread=False,
+        isolation_level=None,
+    )
+    store = SqliteStore(conn)
+    store.setup()
+    return store
+
+
+def _memory_sources_for_role(role: str) -> list[str]:
+    safe_role = re.sub(r"[^a-z0-9_-]+", "-", str(role).strip().lower()) or "agent"
+    return [
+        "/memories/padv/shared.md",
+        f"/memories/padv/{safe_role}.md",
+    ]
+
+
+def _subagent_descriptions() -> dict[str, str]:
+    return {
+        "source": "Investigate source files, entrypoints, request variables, routes, and executable PHP paths.",
+        "graph": "Investigate SCIP and Joern evidence, callsites, dataflow relationships, and authorization gates.",
+        "web": "Investigate reachable web flows, forms, sessions, and parameter propagation using discovered browser state.",
+        "exploit": "Synthesize exploit hypotheses, witness expectations, and runtime preconditions from combined evidence.",
+        "skeptic": "Actively refute exploit hypotheses with sanitization, reachability, and auth-barrier objections.",
+        "experiment": "Turn surviving hypotheses into deterministic runtime experiments with positive and negative controls.",
+    }
+
+
+
+def _memory_store_put(store: Any, *, path: str, content: str) -> None:
+    namespace = _memory_store_namespace()
+    payload = {
+        "content": str(content).splitlines(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "modified_at": datetime.now(timezone.utc).isoformat(),
+    }
+    existing = store.get(namespace, path)
+    if existing is not None and isinstance(getattr(existing, "value", None), dict):
+        created_at = existing.value.get("created_at")
+        if isinstance(created_at, str) and created_at.strip():
+            payload["created_at"] = created_at
+    store.put(namespace, path, payload)
+
+
+
+def _render_shared_memory(*, repo_root: str | None, workspace_dir: str | None) -> str:
+    lines = [
+        "# padv Shared Memory",
+        "",
+        "This agent run analyzes PHP web applications using LangGraph + DeepAgents.",
+        "Use filesystem, SCIP/Joern, web, and runtime tools instead of guessing.",
+        "Deterministic validation decisions come only from the external gate engine.",
+        "",
+        f"Repository root: {repo_root or '(unavailable)'}",
+        f"Workspace dir: {workspace_dir or '(unavailable)'}",
+    ]
+    return "\n".join(lines).strip() + "\n"
+
+
+
+def _render_role_memory(*, role: str, system_prompt: str) -> str:
+    lines = [
+        f"# padv Role Memory: {role}",
+        "",
+        f"Role: {role}",
+        "Prefer tool use and persisted artifacts over unsupported assumptions.",
+        "Keep outputs compact and evidence-linked.",
+        "",
+        "System prompt:",
+        system_prompt.strip(),
+    ]
+    return "\n".join(lines).strip() + "\n"
+
+
+
+def _seed_agent_memories(
+    store: Any,
+    *,
+    repo_root: str | None,
+    workspace_dir: str | None,
+    prompts: dict[str, str],
+) -> None:
+    _memory_store_put(
+        store,
+        path="/memories/padv/shared.md",
+        content=_render_shared_memory(repo_root=repo_root, workspace_dir=workspace_dir),
+    )
+    for role, prompt in prompts.items():
+        safe_role = re.sub(r"[^a-z0-9_-]+", "-", str(role).strip().lower()) or "agent"
+        _memory_store_put(
+            store,
+            path=f"/memories/padv/{safe_role}.md",
+            content=_render_role_memory(role=role, system_prompt=prompt),
+        )
+
+
+def _subagent_specs(
+    *,
+    prompts: dict[str, str],
+    shared_context: dict[str, Any],
+    repo_root: str | None,
+    model: str,
+) -> list[dict[str, Any]]:
+    descriptions = _subagent_descriptions()
+    specs: list[dict[str, Any]] = []
+    for role, description in descriptions.items():
+        specs.append(
+            {
+                "name": role,
+                "description": description,
+                "system_prompt": prompts[role],
+                "tools": _build_shared_context_tools(shared_context, repo_root, role=role),
+                "model": model,
+            }
+        )
+    return specs
+
+
+def _compiled_subagent_sessions(
+    config: PadvConfig,
+    *,
+    prompts: dict[str, str],
+    shared_context: dict[str, Any],
+    repo_root: str | None,
+    store: Any,
+    workspace_dir: str,
+    checkpoint_dir: str,
+) -> dict[str, AgentSession]:
+    backend_factory = _build_backend_factory(repo_root, workspace_dir)
+    sessions: dict[str, AgentSession] = {}
+    for role in _subagent_descriptions():
+        sessions[role] = _create_agent_session(
+            config,
+            role=role,
+            system_prompt=prompts[role],
+            repo_root=repo_root,
+            shared_context=shared_context,
+            frontier_state=None,
+            checkpoint_dir=checkpoint_dir,
+            store=store,
+            backend=backend_factory,
+            name=f"padv-{role}-subagent",
+        )
+    return sessions
+
+
+def _runtime_subagent_specs(sessions: dict[str, AgentSession]) -> list[dict[str, Any]]:
+    descriptions = _subagent_descriptions()
+    specs: list[dict[str, Any]] = []
+    for role, description in descriptions.items():
+        session = sessions.get(role)
+        if session is None:
+            continue
+        specs.append(
+            {
+                "name": role,
+                "description": description,
+                "runnable": session.agent,
+            }
+        )
+    return specs
+
+
+def _agent_middleware_for_role(
+    *,
+    role: str,
+    shared_context: dict[str, Any],
+    checkpoint_dir: str,
+) -> list[Any]:
+    if role != "root":
+        return []
+    return [TaskDelegationTraceMiddleware(shared_context=shared_context, checkpoint_dir=checkpoint_dir)]
+
+
+def _create_agent_session(
+    config: PadvConfig,
+    *,
+    role: str,
+    system_prompt: str,
+    repo_root: str | None,
+    shared_context: dict[str, Any],
+    frontier_state: dict[str, Any] | None,
+    checkpoint_dir: str,
+    store: Any | None = None,
+    backend: Any | None = None,
+    subagents: list[dict[str, Any]] | None = None,
+    name: str | None = None,
+) -> AgentSession:
+    api_key = os.environ.get(config.llm.api_key_env)
+    if not api_key:
+        raise AgentExecutionError(f"missing API key env var: {config.llm.api_key_env}")
+    try:
+        from deepagents import create_deep_agent  # type: ignore[import-not-found]
+    except Exception as exc:
+        raise AgentExecutionError(f"deepagents/langgraph import failed: {exc}") from exc
+
+    model = _resolve_model(config)
+    thread_id = _agent_thread_id(frontier_state, role=role, prefix=config.agent.thread_prefix)
+    tools = _build_shared_context_tools(shared_context, repo_root, role=role)
+    checkpointer = FileBackedMemorySaver(_checkpoint_path(checkpoint_dir, role, thread_id))
+    middleware = _agent_middleware_for_role(role=role, shared_context=shared_context, checkpoint_dir=checkpoint_dir)
+    try:
+        agent = create_deep_agent(
+            model=model,
+            tools=tools,
+            system_prompt=system_prompt,
+            checkpointer=checkpointer,
+            middleware=middleware,
+            store=store,
+            backend=backend,
+            subagents=subagents,
+            memory=_memory_sources_for_role(role),
+            name=name or f"padv-{role}",
+        )
+    except Exception as exc:
+        raise AgentExecutionError(f"deepagents agent creation failed: {exc}") from exc
+    _persist_agent_thread_id(frontier_state, role=role, thread_id=thread_id)
+    return AgentSession(
+        agent=agent,
+        thread_id=thread_id,
+        model=model,
+        repo_root=repo_root,
+        checkpoint_dir=checkpoint_dir,
+        role=role,
+    )
+
+
+def ensure_agent_runtime(
+    config: PadvConfig,
+    *,
+    frontier_state: dict[str, Any] | None = None,
+    repo_root: str | None = None,
+    checkpoint_dir: str = "",
+    runtime: AgentRuntime | None = None,
+) -> AgentRuntime:
+    if runtime is not None:
+        return runtime
+
+    shared_context: dict[str, Any] = {
+        "__lock__": threading.RLock(),
+        "__active_categories__": {},
+        "objective_queue": [],
+        "research_findings": [],
+        "hypotheses": [],
+        "refutations": [],
+        "experiment_board": [],
+        "static_evidence": [],
+        "candidate_seeds": [],
+        "web_hints": {},
+        "web_artifacts": {},
+        "auth_contexts": {},
+        "artifact_index": {},
+        "worklog": {},
+        "delegations": [],
+        "runtime_history": [],
+        "witness_bundles": [],
+        "gate_history": [],
+    }
+    prompts = {
+        "root": (
+            "You are the root agent for a PHP web exploit discovery system. "
+            "Drive objectives, delegate to subagents, and reason over persistent frontier state. "
+            "Use tools before concluding. Return strict JSON only."
+        ),
+        "source": (
+            "You are the source research subagent. Reconstruct executable entrypoints, request variables, "
+            "routes, and code-level context from the repository. Use tools extensively and return strict JSON only."
+        ),
+        "graph": (
+            "You are the graph research subagent. Investigate SCIP and Joern evidence, callsites, dataflows, "
+            "and authorization gates. Use tools and return strict JSON only."
+        ),
+        "web": (
+            "You are the web research subagent. Investigate reachable flows, forms, session transitions, "
+            "parameters, and request behavior using persisted Playwright-derived pages, forms, and request artifacts. "
+            "Use those artifacts directly instead of inferring flows only from source code. Return strict JSON only."
+        ),
+        "exploit": (
+            "You are the exploit research subagent. Combine evidence into exploit hypotheses with concrete witnesses, "
+            "preconditions and runtime expectations. Use tools when needed. Return strict JSON only."
+        ),
+        "skeptic": (
+            "You are the skeptic subagent. Actively refute exploit hypotheses using exploit-invalidating alternate "
+            "explanations grounded in code, parsing, sanitization, request structure, reachability of the vulnerable sink, "
+            "or authorization logic. Do not spend the turn re-litigating environment/setup constraints like security level, "
+            "session initialization, network placement, or default deployment configuration unless they prove the exploit is "
+            "impossible across all realistic runtime states. Use tools before concluding. Return strict JSON only."
+        ),
+        "experiment": (
+            "You are the experiment subagent. Convert surviving hypotheses into deterministic runtime plans with "
+            "positive requests, negative controls and witness goals. Use tools when needed. Return strict JSON only."
+        ),
+    }
+    resolved_checkpoint_dir = checkpoint_dir or str(Path(".padv") / "langgraph")
+    workspace_dir = str(_workspace_root(resolved_checkpoint_dir))
+    shared_context["workspace_dir"] = workspace_dir
+    shared_context["workspace_index"] = {}
+    memory_store = _create_persistent_store(resolved_checkpoint_dir)
+    _seed_agent_memories(
+        memory_store,
+        repo_root=repo_root,
+        workspace_dir=workspace_dir,
+        prompts=prompts,
+    )
+    workspace_backend_factory = _build_workspace_backend_factory(workspace_dir)
+    subagent_sessions = _compiled_subagent_sessions(
+        config,
+        prompts=prompts,
+        shared_context=shared_context,
+        repo_root=repo_root,
+        store=memory_store,
+        workspace_dir=workspace_dir,
+        checkpoint_dir=resolved_checkpoint_dir,
+    )
+    root_subagents = _runtime_subagent_specs(subagent_sessions)
+    root_session = _create_agent_session(
+        config,
+        role="root",
+        system_prompt=prompts["root"],
+        repo_root=repo_root,
+        shared_context=shared_context,
+        frontier_state=frontier_state,
+        checkpoint_dir=resolved_checkpoint_dir,
+        store=memory_store,
+        backend=workspace_backend_factory,
+        subagents=root_subagents,
+        name="padv-root",
+    )
+    return AgentRuntime(
+        root=root_session,
+        subagents=subagent_sessions,
+        shared_context=shared_context,
+        checkpoint_dir=resolved_checkpoint_dir,
+        workspace_dir=workspace_dir,
+        model=root_session.model,
+        repo_root=repo_root,
+        store=memory_store,
+        prompts=prompts,
+    )
+
+
+def update_agent_runtime_context(runtime: AgentRuntime, **payload: Any) -> None:
+    with _shared_context_lock(runtime.shared_context):
+        for key, value in payload.items():
+            try:
+                runtime.shared_context[key] = copy.deepcopy(value)
+            except Exception:
+                runtime.shared_context[key] = value
+
+
+def _write_workspace_json(runtime: AgentRuntime, *, role: str, category: str, payload: dict[str, Any]) -> str:
+    artifact_id = uuid.uuid4().hex[:12]
+    path = _workspace_artifact_path(
+        runtime.checkpoint_dir,
+        role=role,
+        category=category,
+        artifact_id=artifact_id,
+    )
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
+    relative = str(path.relative_to(Path(runtime.workspace_dir)))
+    _append_workspace_index_ref(runtime.shared_context, role=role, category=category, relative=relative)
+    return relative
+
+
+def _invoke_agent_handoff(
+    runtime: AgentRuntime,
+    session: AgentSession,
+    config: PadvConfig,
+    *,
+    category: str,
+    envelope: dict[str, Any],
+    response_contract: str,
+    workspace_role: str | None = None,
+    delegated_role: str | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    artifact_role = workspace_role or session.role
+    cache_key = _handoff_cache_key(
+        session,
+        category=category,
+        envelope=envelope,
+        response_contract=response_contract,
+        workspace_role=artifact_role,
+        delegated_role=delegated_role,
+    )
+    handoff_payload = {
+        "role": artifact_role,
+        "invocation_role": session.role,
+        "delegated_role": delegated_role,
+        "thread_id": session.thread_id,
+        "category": category,
+        "response_contract": response_contract,
+        "envelope": envelope,
+    }
+    handoff_ref = _write_workspace_json(runtime, role=artifact_role, category="handoffs", payload=handoff_payload)
+    category_guidance = _handoff_work_guidance(artifact_role, category)
+    handoff_timeout_seconds = _handoff_timeout_seconds(category, config)
+
+    def _cached_return(parsed: dict[str, Any], *, cache_source: str) -> tuple[dict[str, Any], dict[str, Any]]:
+        response_ref = _write_workspace_json(
+            runtime,
+            role=artifact_role,
+            category="responses",
+            payload={
+                "handoff_ref": handoff_ref,
+                "category": category,
+                "turn": 0,
+                "invocation_role": session.role,
+                "delegated_role": delegated_role,
+                "cache_key": cache_key,
+                "cache_hit": True,
+                "cache_source": cache_source,
+                "response": parsed,
+            },
+        )
+        return parsed, {
+            "handoff_ref": handoff_ref,
+            "response_ref": response_ref,
+            "response_refs": [response_ref],
+            "progress_refs": [],
+            "turns": 1,
+            "invocation_role": session.role,
+            "workspace_role": artifact_role,
+            "delegated_role": delegated_role,
+            "worklog_refs": _workspace_index_refs(runtime.shared_context, role=artifact_role, category="worklog"),
+            "tool_refs": _workspace_index_refs(runtime.shared_context, role=artifact_role, category="tool_calls"),
+            "delegation_refs": _workspace_index_refs(runtime.shared_context, role="root", category="delegations"),
+            "cache_hit": True,
+            "cache_source": cache_source,
+            "cache_key": cache_key,
+        }
+
+    cached = _load_handoff_cache(runtime.checkpoint_dir, cache_key)
+    if cached is not None:
+        _emit_shared_progress(
+            runtime.shared_context,
+            role=artifact_role,
+            status="cache_hit",
+            detail=f"{category} sqlite-exact",
+            step=category,
+            handoff_ref=handoff_ref,
+            cache_source="sqlite-exact",
+        )
+        return _cached_return(cached, cache_source="sqlite-exact")
+
+    inflight_entry, is_leader = _acquire_inflight_handoff(cache_key)
+    if not is_leader:
+        inflight_entry["event"].wait()
+        if inflight_entry.get("error") is not None:
+            error = inflight_entry["error"]
+            if isinstance(error, Exception):
+                raise error
+            raise AgentExecutionError(str(error))
+        result = inflight_entry.get("result")
+        if isinstance(result, dict):
+            return _cached_return(result, cache_source="inflight-dedup")
+        raise AgentExecutionError(f"{session.role} identical handoff dedup wait ended without result")
+
+    previous_active_category = _set_active_progress_category(runtime.shared_context, role=artifact_role, category=category)
+    try:
+        _emit_shared_progress(
+            runtime.shared_context,
+            role=artifact_role,
+            status="start",
+            detail=f"handoff {category}",
+            step=category,
+            handoff_ref=handoff_ref,
+            invocation_role=session.role,
+            delegated_role=delegated_role,
+        )
+        recent_worklog_refs = _workspace_index_refs(runtime.shared_context, role=artifact_role, category="worklog")[-5:]
+        recent_tool_refs = _workspace_index_refs(runtime.shared_context, role=artifact_role, category="tool_calls")[-5:]
+        if delegated_role:
+            prompt = (
+                "You are the root supervisor. "
+                f"You must delegate this task via the task tool using subagent_type='{delegated_role}'. "
+                "Do not solve it directly from the root context. "
+                f"Tell the delegated subagent to inspect the handoff artifact at '{handoff_ref}'. "
+                f"The delegated subagent owns workspace role '{artifact_role}'. "
+                f"Recent worklog refs for delegated role '{artifact_role}': {json.dumps(recent_worklog_refs, ensure_ascii=True)}. "
+                f"Recent tool-call refs for delegated role '{artifact_role}': {json.dumps(recent_tool_refs, ensure_ascii=True)}. "
+                f"{category_guidance} "
+                f"Return only the delegated subagent's strict JSON matching this response contract: {response_contract}"
+            )
+        else:
+            prompt = (
+                f"You are continuing the durable {session.role} agent workspace. "
+                f"Use the workspace tools to inspect the handoff artifact at '{handoff_ref}'. "
+                f"Recent worklog refs for your role: {json.dumps(recent_worklog_refs, ensure_ascii=True)}. "
+                f"Recent tool-call refs for your role: {json.dumps(recent_tool_refs, ensure_ascii=True)}. "
+                f"{category_guidance} "
+                "Use repo and shared-state tools before concluding. "
+                f"Return strict JSON matching this response contract: {response_contract}"
+            )
+        parsed = _invoke_agent_session_with_timeout(
+            session,
+            prompt,
+            config,
+            timeout_seconds=handoff_timeout_seconds,
+        )
+        response_ref = _write_workspace_json(
+            runtime,
+            role=artifact_role,
+            category="responses",
+            payload={
+                "handoff_ref": handoff_ref,
+                "category": category,
+                "turn": 1,
+                "invocation_role": session.role,
+                "delegated_role": delegated_role,
+                "cache_key": cache_key,
+                "cache_hit": False,
+                "response": parsed,
+            },
+        )
+        status = str(parsed.get("status", "")).strip().lower()
+        if status == "continue":
+            raise AgentExecutionError(
+                f"{session.role} returned non-final continue response for {category}; "
+                "DeepAgents handoffs must return a final structured result"
+            )
+        current_worklog_refs = _workspace_index_refs(runtime.shared_context, role=artifact_role, category="worklog")
+        current_tool_refs = _workspace_index_refs(runtime.shared_context, role=artifact_role, category="tool_calls")
+        current_delegation_refs = _workspace_index_refs(runtime.shared_context, role="root", category="delegations")
+        _emit_shared_progress(
+            runtime.shared_context,
+            role=artifact_role,
+            status="response",
+            detail="turn=1 final",
+            step=category,
+            handoff_ref=handoff_ref,
+            response_ref=response_ref,
+            turn=1,
+            invocation_role=session.role,
+            delegated_role=delegated_role,
+        )
+        _store_handoff_cache(runtime.checkpoint_dir, cache_key, parsed)
+        meta = {
+            "handoff_ref": handoff_ref,
+            "response_ref": response_ref,
+            "response_refs": [response_ref],
+            "progress_refs": [],
+            "turns": 1,
+            "invocation_role": session.role,
+            "workspace_role": artifact_role,
+            "delegated_role": delegated_role,
+            "worklog_refs": current_worklog_refs,
+            "tool_refs": current_tool_refs,
+            "delegation_refs": current_delegation_refs,
+            "cache_hit": False,
+            "cache_source": "",
+            "cache_key": cache_key,
+        }
+        _resolve_inflight_handoff(cache_key, result=parsed)
+        return parsed, meta
+    except Exception as exc:
+        _emit_shared_progress(
+            runtime.shared_context,
+            role=artifact_role,
+            status="error",
+            detail=str(exc),
+            step=category,
+            handoff_ref=handoff_ref,
+            invocation_role=session.role,
+            delegated_role=delegated_role,
+        )
+        _resolve_inflight_handoff(cache_key, error=exc if isinstance(exc, Exception) else AgentExecutionError(str(exc)))
+        raise
+    finally:
+        _set_active_progress_category(runtime.shared_context, role=artifact_role, category=previous_active_category)
+
+
+def _handoff_timeout_seconds(category: str, config: PadvConfig) -> int | None:
+    del category, config
+    return None
+
+
+def _invoke_agent_session_with_timeout(
+    session: AgentSession,
+    prompt: str,
+    config: PadvConfig,
+    *,
+    timeout_seconds: int | None,
+) -> dict[str, Any]:
+    fn = invoke_agent_session_json
+    try:
+        parameters = inspect.signature(fn).parameters
+    except (TypeError, ValueError):  # pragma: no cover - defensive for mocks
+        parameters = {}
+    if "timeout_seconds" in parameters:
+        return fn(session, prompt, config, timeout_seconds=timeout_seconds)
+    return fn(session, prompt, config)
 
 
 def _invoke_deepagent_json(
@@ -241,49 +2322,410 @@ def _invoke_deepagent_json(
         repo_root=repo_root,
         session=session,
     )
-    timeout_seconds = max(1, int(config.llm.timeout_seconds))
     max_attempts = 2
     last_error: Exception | None = None
 
     for _attempt in range(1, max_attempts + 1):
-        def _invoke() -> Any:
-            return active_session.agent.invoke(
-                {"messages": [{"role": "user", "content": prompt}]},
-                config={"configurable": {"thread_id": active_session.thread_id}},
-            )
-
-        result_box: dict[str, Any] = {}
-        error_box: dict[str, BaseException] = {}
-
-        def _runner() -> None:
-            try:
-                result_box["value"] = _invoke()
-            except BaseException as exc:  # pragma: no cover - defensive for third-party stack
-                error_box["error"] = exc
-
-        thread = threading.Thread(target=_runner, daemon=True, name="padv-deepagent-invoke")
-        thread.start()
-        thread.join(timeout_seconds)
-
         try:
-            if thread.is_alive():
-                raise TimeoutError(f"deepagents invocation timed out after {timeout_seconds}s")
-            if "error" in error_box:
-                raise error_box["error"]
-            result = result_box.get("value")
+            invoke_lock = getattr(active_session, "invoke_lock", None)
+            if invoke_lock is None:
+                result = active_session.agent.invoke(
+                    {"messages": [{"role": "user", "content": prompt}]},
+                    config={"configurable": {"thread_id": active_session.thread_id}},
+                )
+            else:
+                with invoke_lock:
+                    result = active_session.agent.invoke(
+                        {"messages": [{"role": "user", "content": prompt}]},
+                        config={"configurable": {"thread_id": active_session.thread_id}},
+                    )
             content = _extract_text(result if isinstance(result, dict) else {})
             parsed = _extract_json(content)
             if parsed is None:
-                raise AgentExecutionError("deepagents returned non-JSON response")
+                raw_ref = _persist_raw_agent_output(active_session, content=content, kind="non_json_response")
+                detail = f"deepagents returned non-JSON response"
+                if raw_ref:
+                    detail += f" (raw_ref={raw_ref})"
+                raise AgentExecutionError(detail)
             return parsed
-        except TimeoutError as exc:
-            last_error = AgentExecutionError(str(exc))
         except Exception as exc:
             last_error = AgentExecutionError(f"deepagents invocation failed: {exc}")
 
     if last_error is not None:
         raise last_error
     raise AgentExecutionError("deepagents invocation failed")
+
+
+def invoke_agent_session_json(
+    session: AgentSession,
+    prompt: str,
+    config: PadvConfig,
+    timeout_seconds: int | None = None,
+) -> dict[str, Any]:
+    del timeout_seconds
+    max_attempts = 2
+    last_error: Exception | None = None
+
+    for _attempt in range(1, max_attempts + 1):
+        try:
+            with session.invoke_lock:
+                result = session.agent.invoke(
+                    {"messages": [{"role": "user", "content": prompt}]},
+                    config={"configurable": {"thread_id": session.thread_id}},
+                )
+            content = _extract_text(result if isinstance(result, dict) else {})
+            parsed = _extract_json(content)
+            if parsed is None:
+                raw_ref = _persist_raw_agent_output(session, content=content, kind="non_json_response")
+                detail = f"{session.role} returned non-JSON response"
+                if raw_ref:
+                    detail += f" (raw_ref={raw_ref})"
+                raise AgentExecutionError(detail)
+            return parsed
+        except TimeoutError as exc:
+            last_error = AgentExecutionError(str(exc))
+        except Exception as exc:
+            if isinstance(exc, AgentExecutionError):
+                last_error = exc
+                continue
+            raw_ref = _persist_raw_agent_output(
+                session,
+                content=json.dumps(
+                    {
+                        "role": session.role,
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                        "traceback": traceback.format_exc()[:24000],
+                    },
+                    ensure_ascii=True,
+                    indent=2,
+                ),
+                kind="invoke_exception",
+            )
+            detail = f"{session.role} invocation failed: {exc}"
+            if raw_ref:
+                detail += f" (raw_ref={raw_ref})"
+            last_error = AgentExecutionError(detail)
+    if last_error is not None:
+        raise last_error
+    raise AgentExecutionError(f"{session.role} invocation failed")
+
+
+def _normalize_objectives(raw: Any) -> list[ObjectiveScore]:
+    if not isinstance(raw, list):
+        return []
+    out: list[ObjectiveScore] = []
+    for idx, item in enumerate(raw, start=1):
+        if not isinstance(item, dict):
+            continue
+        objective_id = str(item.get("objective_id", "")).strip() or f"obj-{idx:03d}"
+        title = str(item.get("title", "")).strip() or objective_id
+        rationale = str(item.get("rationale", "")).strip() or "agent objective"
+        score = item.get("expected_info_gain", 0.0)
+        priority = item.get("priority", score)
+        try:
+            expected_info_gain = float(score)
+        except Exception:
+            expected_info_gain = 0.0
+        try:
+            normalized_priority = float(priority)
+        except Exception:
+            normalized_priority = expected_info_gain
+        channels = [
+            str(x).strip()
+            for x in item.get("channels", [])
+            if isinstance(x, (str, int, float)) and str(x).strip()
+        ]
+        related_ids = [
+            str(x).strip()
+            for x in item.get("related_hypothesis_ids", [])
+            if isinstance(x, (str, int, float)) and str(x).strip()
+        ]
+        out.append(
+            ObjectiveScore(
+                objective_id=objective_id,
+                title=title,
+                rationale=rationale,
+                expected_info_gain=expected_info_gain,
+                priority=normalized_priority,
+                channels=channels,
+                related_hypothesis_ids=related_ids,
+            )
+        )
+    return out
+
+
+def _limit_primary_objectives(objectives: list[ObjectiveScore], limit: int = 6) -> list[ObjectiveScore]:
+    if limit <= 0 or len(objectives) <= limit:
+        return objectives
+    ranked = sorted(
+        objectives,
+        key=lambda item: (-float(item.priority), -float(item.expected_info_gain), item.objective_id),
+    )
+    return ranked[:limit]
+
+
+def _normalize_research_tasks(raw: Any, *, objective_id: str, channel: str) -> list[ResearchTask]:
+    if not isinstance(raw, list):
+        return []
+    out: list[ResearchTask] = []
+    for idx, item in enumerate(raw, start=1):
+        if not isinstance(item, dict):
+            continue
+        out.append(
+            ResearchTask(
+                task_id=str(item.get("task_id", "")).strip() or f"{channel}-task-{objective_id}-{idx:03d}",
+                objective_id=objective_id,
+                channel=channel,
+                target_ref=str(item.get("target_ref", "")).strip() or str(item.get("file_path", "")).strip() or objective_id,
+                prompt=str(item.get("prompt", "")).strip() or str(item.get("summary", "")).strip() or "research task",
+                status=str(item.get("status", "")).strip() or "done",
+                metadata={k: v for k, v in item.items() if k not in {"task_id", "target_ref", "prompt", "status"}},
+            )
+        )
+    return out
+
+
+def _normalize_research_findings(raw: Any, *, objective_id: str, channel: str) -> list[ResearchFinding]:
+    if not isinstance(raw, list):
+        return []
+    out: list[ResearchFinding] = []
+    for idx, item in enumerate(raw, start=1):
+        if not isinstance(item, dict):
+            continue
+        evidence_refs = [
+            str(x).strip()
+            for x in item.get("evidence_refs", [])
+            if isinstance(x, (str, int, float)) and str(x).strip()
+        ]
+        file_refs = [
+            str(x).strip()
+            for x in item.get("file_refs", [])
+            if isinstance(x, (str, int, float)) and str(x).strip()
+        ]
+        web_paths = [
+            str(x).strip()
+            for x in item.get("web_paths", [])
+            if isinstance(x, (str, int, float)) and str(x).strip()
+        ]
+        params = [
+            str(x).strip()
+            for x in item.get("params", [])
+            if isinstance(x, (str, int, float)) and str(x).strip()
+        ]
+        sink_refs = [
+            str(x).strip()
+            for x in item.get("sink_refs", [])
+            if isinstance(x, (str, int, float)) and str(x).strip()
+        ]
+        out.append(
+            ResearchFinding(
+                finding_id=str(item.get("finding_id", "")).strip() or f"{channel}-finding-{objective_id}-{idx:03d}",
+                objective_id=objective_id,
+                channel=channel,
+                title=str(item.get("title", "")).strip() or f"{channel} finding",
+                summary=str(item.get("summary", "")).strip() or str(item.get("title", "")).strip() or "research finding",
+                evidence_refs=evidence_refs,
+                file_refs=file_refs,
+                web_paths=web_paths,
+                params=params,
+                sink_refs=sink_refs,
+                metadata={k: v for k, v in item.items() if k not in {"finding_id", "title", "summary", "evidence_refs", "file_refs", "web_paths", "params", "sink_refs"}},
+            )
+        )
+    return out
+
+
+def _normalize_stringish_list(raw: Any) -> list[str]:
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        if isinstance(item, (str, int, float)):
+            value = str(item).strip()
+        elif isinstance(item, (dict, list)):
+            try:
+                value = json.dumps(item, ensure_ascii=True, sort_keys=True)
+            except Exception:
+                value = str(item).strip()
+        else:
+            continue
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
+def _candidate_from_hypothesis_item(item: dict[str, Any], idx: int) -> Candidate:
+    def _canonical_candidate_id(current_id: str, refs: list[str]) -> str:
+        token = str(current_id).strip()
+        ref_ids = [
+            str(ref).strip()
+            for ref in refs
+            if isinstance(ref, (str, int, float)) and re.match(r"^(cand|scip)-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)?$", str(ref).strip())
+        ]
+        if not token:
+            return ref_ids[0] if ref_ids else token
+        if token in ref_ids:
+            return token
+        for ref_id in ref_ids:
+            if token.startswith(f"{ref_id}-"):
+                return ref_id
+        return ref_ids[0] if ref_ids else token
+
+    candidate_payload = item.get("candidate")
+    if isinstance(candidate_payload, dict):
+        try:
+            candidate = Candidate(**candidate_payload)
+            candidate.expected_intercepts = _normalize_stringish_list(candidate.expected_intercepts)
+            candidate.provenance = _normalize_stringish_list(candidate.provenance)
+            candidate.evidence_refs = _normalize_stringish_list(candidate.evidence_refs)
+            candidate.auth_requirements = _normalize_stringish_list(candidate.auth_requirements)
+            candidate.web_path_hints = _normalize_stringish_list(candidate.web_path_hints)
+            candidate.preconditions = _normalize_stringish_list(candidate.preconditions)
+            candidate.candidate_id = _canonical_candidate_id(candidate.candidate_id, candidate.evidence_refs)
+            return candidate
+        except TypeError:
+            pass
+    candidate_id = str(item.get("candidate_id", "")).strip() or f"cand-{idx:05d}"
+    vuln_class = str(item.get("vuln_class", "")).strip() or "unknown"
+    file_path = str(item.get("file_path", "")).strip() or "unknown.php"
+    line_value = item.get("line", 1)
+    try:
+        line = int(line_value)
+    except Exception:
+        line = 1
+    sink = str(item.get("sink", "")).strip() or "unknown"
+    confidence_value = item.get("confidence", 0.0)
+    try:
+        confidence = float(confidence_value)
+    except Exception:
+        confidence = 0.0
+    expected_intercepts = [
+        *_normalize_stringish_list(item.get("expected_intercepts", []))
+    ] or ([sink] if sink else [])
+    evidence_refs = _normalize_stringish_list(item.get("evidence_refs", []))
+    return Candidate(
+        candidate_id=_canonical_candidate_id(candidate_id, evidence_refs),
+        vuln_class=vuln_class,
+        title=str(item.get("title", "")).strip() or vuln_class,
+        file_path=file_path,
+        line=line,
+        sink=sink,
+        expected_intercepts=expected_intercepts,
+        notes=str(item.get("notes", "")).strip(),
+        provenance=_normalize_stringish_list(item.get("provenance", [])),
+        evidence_refs=evidence_refs,
+        confidence=confidence,
+        auth_requirements=_normalize_stringish_list(item.get("auth_requirements", [])),
+        web_path_hints=_normalize_stringish_list(item.get("web_path_hints", [])),
+        preconditions=_normalize_stringish_list(item.get("preconditions", [])),
+    )
+
+
+def _normalize_hypotheses(raw: Any) -> list[Hypothesis]:
+    if isinstance(raw, dict):
+        if isinstance(raw.get("hypotheses"), list):
+            raw = raw.get("hypotheses")
+        elif isinstance(raw.get("hypothesis"), dict):
+            raw = [raw.get("hypothesis")]
+        elif {"hypothesis_id", "objective_id", "vuln_class", "title", "rationale"} & set(raw.keys()):
+            raw = [raw]
+        else:
+            return []
+    if not isinstance(raw, list):
+        return []
+    out: list[Hypothesis] = []
+    for idx, item in enumerate(raw, start=1):
+        if not isinstance(item, dict):
+            continue
+        candidate = _candidate_from_hypothesis_item(item, idx)
+        out.append(
+            Hypothesis(
+                hypothesis_id=str(item.get("hypothesis_id", "")).strip() or f"hyp-{idx:05d}",
+                objective_id=str(item.get("objective_id", "")).strip() or "objective-unknown",
+                vuln_class=str(item.get("vuln_class", "")).strip() or candidate.vuln_class,
+                title=str(item.get("title", "")).strip() or candidate.title,
+                rationale=str(item.get("rationale", "")).strip() or "agentic hypothesis",
+                evidence_refs=_normalize_stringish_list(item.get("evidence_refs", [])) or list(candidate.evidence_refs),
+                candidate=candidate,
+                status=str(item.get("status", "")).strip() or "active",
+                confidence=float(item.get("confidence", candidate.confidence or 0.0)),
+                auth_requirements=list(candidate.auth_requirements),
+                preconditions=list(candidate.preconditions),
+                web_path_hints=list(candidate.web_path_hints),
+                metadata={k: v for k, v in item.items() if k not in {"hypothesis_id", "objective_id", "vuln_class", "title", "rationale", "evidence_refs", "candidate", "candidate_id", "status", "confidence"}},
+            )
+        )
+    return out
+
+
+def _normalize_refutations(raw: Any) -> list[Refutation]:
+    if not isinstance(raw, list):
+        return []
+    out: list[Refutation] = []
+    for idx, item in enumerate(raw, start=1):
+        if not isinstance(item, dict):
+            continue
+        out.append(
+            Refutation(
+                refutation_id=str(item.get("refutation_id", "")).strip() or f"ref-{idx:05d}",
+                hypothesis_id=str(item.get("hypothesis_id", "")).strip() or "unknown",
+                title=str(item.get("title", "")).strip() or "refutation",
+                summary=str(item.get("summary", "")).strip() or "skeptic refutation",
+                evidence_refs=[
+                    str(x).strip()
+                    for x in item.get("evidence_refs", [])
+                    if isinstance(x, (str, int, float)) and str(x).strip()
+                ],
+                severity=str(item.get("severity", "")).strip() or "medium",
+                metadata={k: v for k, v in item.items() if k not in {"refutation_id", "hypothesis_id", "title", "summary", "evidence_refs", "severity"}},
+            )
+        )
+    return out
+
+
+def _normalize_experiment_attempts(raw: Any, config: PadvConfig) -> tuple[dict[str, ValidationPlan], list[ExperimentAttempt]]:
+    plans: dict[str, ValidationPlan] = {}
+    attempts: list[ExperimentAttempt] = []
+    if isinstance(raw, dict):
+        if isinstance(raw.get("plans"), list):
+            raw = raw.get("plans")
+        elif {"candidate_id", "vuln_class", "title", "file_path", "sink"} & set(raw.keys()):
+            raw = [raw]
+        else:
+            return plans, attempts
+    if not isinstance(raw, list):
+        return plans, attempts
+    for idx, item in enumerate(raw, start=1):
+        if not isinstance(item, dict):
+            continue
+        candidate = _candidate_from_hypothesis_item(item, idx)
+        plan = _normalize_validation_plan_response(candidate, item, config)
+        plans[candidate.candidate_id] = plan
+        attempts.append(
+            ExperimentAttempt(
+                attempt_id=str(item.get("attempt_id", "")).strip() or f"exp-{idx:05d}",
+                hypothesis_id=str(item.get("hypothesis_id", "")).strip() or candidate.candidate_id,
+                plan_id=str(item.get("plan_id", "")).strip() or plan.candidate_id,
+                request_refs=[
+                    str(x).strip()
+                    for x in item.get("request_refs", [])
+                    if isinstance(x, (str, int, float)) and str(x).strip()
+                ],
+                witness_goal=str(item.get("witness_goal", "")).strip() or plan.strategy,
+                status=str(item.get("status", "")).strip() or "planned",
+                analysis_flags=[
+                    str(x).strip()
+                    for x in item.get("analysis_flags", [])
+                    if isinstance(x, (str, int, float)) and str(x).strip()
+                ],
+                metadata={k: v for k, v in item.items() if k not in {"attempt_id", "hypothesis_id", "plan_id", "request_refs", "witness_goal", "status", "analysis_flags"}},
+            )
+        )
+    return plans, attempts
 
 
 def rank_candidates_with_deepagents(
@@ -675,29 +3117,189 @@ def _normalize_validation_plan_response(
     response: dict[str, Any],
     config: PadvConfig,
 ) -> ValidationPlan:
+    candidate = apply_validation_profile(candidate)
+    profile = profile_for_vuln_class(candidate.canonical_class or candidate.vuln_class)
     intercepts = response.get("intercepts")
+    oracle_functions_raw = response.get("oracle_functions")
+    request_expectations_raw = response.get("request_expectations")
+    response_witnesses_raw = response.get("response_witnesses")
     pos = response.get("positive_requests")
     neg = response.get("negative_requests")
-    if not isinstance(intercepts, list) or not isinstance(pos, list) or not isinstance(neg, list):
+    if not isinstance(pos, list) or not isinstance(neg, list):
         raise AgentExecutionError("deepagents plan response missing required list fields")
 
-    normalized_intercepts = sorted({str(x) for x in intercepts if str(x).strip()})
-    if not normalized_intercepts:
-        normalized_intercepts = sorted(
-            {
-                str(x)
-                for x in (
-                    candidate.expected_intercepts
-                    or ([candidate.sink] if candidate.sink else [])
-                )
-                if str(x).strip()
-            }
+    def _normalize_string_list(value: Any) -> list[str]:
+        if not isinstance(value, list):
+            return []
+        return [str(x).strip() for x in value if str(x).strip()]
+
+    def _normalize_oracle_function(value: str) -> str:
+        token = str(value).strip().replace("->", "::")
+        if not token:
+            return ""
+        match = re.match(r"^([A-Za-z_][A-Za-z0-9_:]*)\s*(?:\(\s*\))?$", token)
+        if match:
+            return match.group(1)
+        match = re.match(r"^([A-Za-z_][A-Za-z0-9_:]*)\s*\(", token)
+        if match:
+            return match.group(1)
+        return ""
+
+    def _extract_path_hint(value: str, method: str | None = None) -> str:
+        text = str(value).strip()
+        if not text:
+            return ""
+        lowered = text.casefold()
+        if method:
+            method_lower = method.casefold()
+            match = re.search(rf"\b{re.escape(method_lower)}\b(?:\s+request\b.*?\bto\b|\s+)(/[A-Za-z0-9_./?&=%:-]+)", lowered)
+            if match:
+                return match.group(1)
+        match = re.search(r"\b(?:get|post|put|patch|delete|head|options)\b(?:\s+request\b.*?\bto\b|\s+)(/[A-Za-z0-9_./?&=%:-]+)", lowered)
+        if match:
+            return match.group(1)
+        if text.startswith("/"):
+            return text
+        return ""
+
+    def _preferred_request_path(method: str) -> str:
+        candidates: list[str] = []
+        if candidate.entrypoint_hint:
+            candidates.append(str(candidate.entrypoint_hint))
+        candidates.extend(str(x) for x in candidate.web_path_hints if str(x).strip())
+        candidates.extend(request_expectations)
+        for raw in candidates:
+            hint = _extract_path_hint(raw, method)
+            if hint and hint != "/":
+                return hint
+        return "/"
+
+    def _split_intercepts(values: list[str]) -> tuple[list[str], list[str], list[str]]:
+        oracle_functions: list[str] = []
+        request_expectations: list[str] = []
+        response_witnesses: list[str] = []
+        for raw in values:
+            item = str(raw).strip()
+            lowered = item.casefold()
+            if not item:
+                continue
+            if re.match(r"^(get|post|put|patch|delete|head|options)\s+/", lowered):
+                request_expectations.append(item)
+                continue
+            if lowered.startswith("content-type:") or lowered.startswith("soapaction:") or lowered.startswith("cookie:"):
+                request_expectations.append(item)
+                continue
+            if lowered.startswith("http "):
+                response_witnesses.append(item)
+                continue
+            if "<" in item and ">" in item:
+                if any(marker in lowered for marker in ("<output", "<pre", "<script", "<html", "<body")):
+                    response_witnesses.append(item)
+                else:
+                    request_expectations.append(item)
+                continue
+            if "/" in item and " " not in item and item.startswith("/"):
+                request_expectations.append(item)
+                continue
+            if "=" in item and " " not in item and not item.startswith("uid=") and not item.startswith("www-data"):
+                request_expectations.append(item)
+                continue
+            if any(marker in lowered for marker in ("uid=", "www-data", "root:x", "phpinfo", "fatal error", "warning:", "notice:")):
+                response_witnesses.append(item)
+                continue
+            oracle_functions.append(_normalize_oracle_function(item))
+        return (
+            sorted(dict.fromkeys(x for x in oracle_functions if x)),
+            sorted(dict.fromkeys(x for x in request_expectations if x)),
+            sorted(dict.fromkeys(x for x in response_witnesses if x)),
         )
-    if not normalized_intercepts:
-        normalized_intercepts = ["unknown"]
+
+    original_intercepts = _normalize_string_list(intercepts)
+    allowed_oracle_functions = sorted(
+        {
+            normalized
+            for raw in [*(candidate.expected_intercepts or []), candidate.sink]
+            if raw is not None
+            if (normalized := _normalize_oracle_function(str(raw).strip()))
+        }
+    )
+    oracle_functions = sorted(
+        dict.fromkeys(
+            normalized
+            for normalized in (_normalize_oracle_function(x) for x in _normalize_string_list(oracle_functions_raw))
+            if normalized
+        )
+    )
+    request_expectations = sorted(dict.fromkeys(_normalize_string_list(request_expectations_raw)))
+    response_witnesses = sorted(dict.fromkeys(_normalize_string_list(response_witnesses_raw)))
+
+    if original_intercepts and (not oracle_functions or not request_expectations or not response_witnesses):
+        split_oracle, split_request, split_response = _split_intercepts(original_intercepts)
+        if not oracle_functions:
+            oracle_functions = split_oracle
+        if not request_expectations:
+            request_expectations = split_request
+        if not response_witnesses:
+            response_witnesses = split_response
+
+    if allowed_oracle_functions:
+        oracle_functions = [item for item in oracle_functions if item in allowed_oracle_functions]
+
+    if not oracle_functions:
+        oracle_functions = list(allowed_oracle_functions)
+    if not oracle_functions:
+        oracle_functions = ["unknown"]
+
+    normalized_intercepts = sorted(
+        dict.fromkeys(
+            [
+                *original_intercepts,
+                *oracle_functions,
+                *request_expectations,
+                *response_witnesses,
+            ]
+        )
+    )
     canary = f"padv-{candidate.candidate_id}-{uuid.uuid4().hex[:10]}"
 
     allowed_methods = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
+    reserved_query_keys = {
+        config.canary.parameter_name.casefold(),
+        "page",
+        "popUpNotificationCode".casefold(),
+        "security_level",
+        "security-level",
+        "phpsessid",
+        "wsdl",
+    }
+
+    def _inject_canary_value(value: str, canary_value: str) -> str:
+        stripped = str(value)
+        if canary_value in stripped:
+            return stripped
+        return f"{stripped} {canary_value}".strip()
+
+    def _inject_canary_into_mapping(mapping: dict[str, str], canary_value: str) -> dict[str, str]:
+        mutated = {str(k): str(v) for k, v in mapping.items()}
+        injected = False
+        for key in list(mutated.keys()):
+            if key.casefold() in reserved_query_keys:
+                continue
+            mutated[key] = _inject_canary_value(mutated[key], canary_value)
+            injected = True
+        if not injected:
+            mutated[config.canary.parameter_name] = canary_value
+        return mutated
+
+    def _inject_canary_into_xml(body_text: str, canary_value: str) -> str:
+        def _replace(match: re.Match[str]) -> str:
+            opening, content, closing = match.group(1), match.group(2), match.group(3)
+            content = content.strip()
+            if not content or canary_value in content:
+                return match.group(0)
+            return f"{opening}{_inject_canary_value(content, canary_value)}{closing}"
+
+        return re.sub(r"(<([A-Za-z0-9:_-]+)[^>]*>)([^<]+)(</\\2>)", _replace, body_text)
 
     def _normalize_request(req: dict[str, Any], canary_value: str) -> dict[str, Any]:
         method_raw = req.get("method")
@@ -708,40 +3310,129 @@ def _normalize_validation_plan_response(
         path_raw = req.get("path")
         path = str(path_raw).strip() if path_raw is not None else ""
         if not path:
-            path = "/"
+            path = _preferred_request_path(method)
         if not path.startswith("/"):
             path = "/" + path
 
         query = req.get("query")
+        if not isinstance(query, dict):
+            query = req.get("params")
         if isinstance(query, dict):
-            q = {str(k): str(v) for k, v in query.items()}
+            q = _inject_canary_into_mapping({str(k): str(v) for k, v in query.items()}, canary_value)
         else:
-            q = {}
-        q[config.canary.parameter_name] = canary_value
+            q = {config.canary.parameter_name: canary_value}
 
         body = req.get("body")
+        headers = req.get("headers")
         normalized: dict[str, Any] = {"method": method, "path": path, "query": q}
+        if isinstance(headers, dict):
+            normalized["headers"] = {str(k): str(v) for k, v in headers.items() if str(k).strip()}
         if body is not None:
             if isinstance(body, dict):
-                normalized["body"] = {str(k): str(v) for k, v in body.items()}
+                normalized["body"] = _inject_canary_into_mapping({str(k): str(v) for k, v in body.items()}, canary_value)
             elif isinstance(body, str):
+                body_str = body.strip()
                 parsed: object | None = None
                 try:
-                    parsed = json.loads(body)
+                    parsed = json.loads(body_str)
                 except json.JSONDecodeError:
                     parsed = None
                 if isinstance(parsed, dict):
-                    normalized["body"] = {str(k): str(v) for k, v in parsed.items()}
+                    normalized["body"] = _inject_canary_into_mapping(
+                        {str(k): str(v) for k, v in parsed.items()},
+                        canary_value,
+                    )
+                    normalized.setdefault("headers", {})
+                    normalized["headers"].setdefault("Content-Type", "application/json")
+                elif "=" in body_str and not body_str.startswith("<"):
+                    form_pairs = urllib.parse.parse_qsl(body_str, keep_blank_values=True)
+                    if form_pairs:
+                        normalized["body"] = _inject_canary_into_mapping(dict(form_pairs), canary_value)
+                        normalized.setdefault("headers", {})
+                        normalized["headers"].setdefault("Content-Type", "application/x-www-form-urlencoded")
+                    else:
+                        normalized["body_text"] = _inject_canary_value(body_str, canary_value)
                 else:
-                    normalized["body"] = {"value": body}
+                    normalized["body_text"] = (
+                        _inject_canary_into_xml(body_str, canary_value)
+                        if body_str.startswith("<")
+                        else _inject_canary_value(body_str, canary_value)
+                    )
+                    normalized.setdefault("headers", {})
+                    if body_str.startswith("<"):
+                        normalized["headers"].setdefault("Content-Type", "text/xml")
             else:
-                normalized["body"] = {"value": str(body)}
+                normalized["body_text"] = _inject_canary_value(str(body), canary_value)
         return normalized
 
-    positive_requests = [_normalize_request(req, canary) for req in pos if isinstance(req, dict)]
+    def _request_transport(req: dict[str, Any]) -> str:
+        headers = req.get("headers")
+        content_type = ""
+        if isinstance(headers, dict):
+            content_type = str(
+                headers.get("Content-Type")
+                or headers.get("content-type")
+                or ""
+            ).casefold()
+        if "multipart/form-data" in content_type:
+            return "multipart"
+        if "application/json" in content_type:
+            return "json"
+        if "xml" in content_type or isinstance(req.get("body_text"), str) and str(req.get("body_text", "")).lstrip().startswith("<"):
+            return "xml"
+        if isinstance(req.get("body"), dict):
+            return "form"
+        if isinstance(req.get("query"), dict) and req.get("query"):
+            return "query"
+        return "query"
+
+    def _neutralize_control(req: dict[str, Any], label: str) -> dict[str, Any]:
+        clone = copy.deepcopy(req)
+        marker = f"padv-negative-{label}"
+        if isinstance(clone.get("query"), dict):
+            clone["query"] = {
+                str(k): ("1" if str(v).strip() else marker)
+                for k, v in clone["query"].items()
+            }
+            if clone["query"]:
+                first = next(iter(clone["query"]))
+                clone["query"][first] = marker if profile.canonical_class == "xss_output_boundary" else "1"
+        if isinstance(clone.get("body"), dict):
+            clone["body"] = {
+                str(k): ("1" if str(v).strip() else marker)
+                for k, v in clone["body"].items()
+            }
+            if clone["body"]:
+                first = next(iter(clone["body"]))
+                clone["body"][first] = marker if profile.canonical_class == "xss_output_boundary" else "1"
+        if isinstance(clone.get("body_text"), str):
+            raw = str(clone["body_text"])
+            if profile.canonical_class == "xxe_influence":
+                clone["body_text"] = re.sub(r"<!DOCTYPE.*?>", "", raw, flags=re.IGNORECASE | re.DOTALL)
+                clone["body_text"] = re.sub(r"<!ENTITY.*?>", "", str(clone["body_text"]), flags=re.IGNORECASE | re.DOTALL)
+            elif profile.canonical_class == "command_injection_boundary":
+                clone["body_text"] = re.sub(r"[;&|`$><]", "", raw)
+            elif profile.canonical_class == "sql_injection_boundary":
+                clone["body_text"] = re.sub(r"(?i)(union|select|sleep|and|or|--|#|')", "", raw)
+            else:
+                clone["body_text"] = marker
+        return clone
+
+    def _filter_requests(items: list[dict[str, Any]], *, control: bool) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for idx, item in enumerate(items):
+            normalized = _normalize_request(item, "padv-negative-control" if control else canary)
+            if profile.allowed_transports:
+                transport = _request_transport(normalized)
+                if transport not in profile.allowed_transports:
+                    continue
+            out.append(normalized)
+        return out
+
+    positive_requests = _filter_requests([req for req in pos if isinstance(req, dict)], control=False)
     if not positive_requests:
-        positive_requests = [{"method": "GET", "path": "/", "query": {config.canary.parameter_name: canary}}]
-    while len(positive_requests) < 3:
+        positive_requests = [{"method": "GET", "path": _preferred_request_path("GET"), "query": {config.canary.parameter_name: canary}}]
+    while len(positive_requests) < max(3, profile.min_positive_requests):
         clone = dict(positive_requests[-1])
         clone_query = dict(clone.get("query", {}))
         clone_query[f"{config.canary.parameter_name}_step"] = str(len(positive_requests) + 1)
@@ -749,21 +3440,32 @@ def _normalize_validation_plan_response(
         positive_requests.append(clone)
     positive_requests = positive_requests[:3]
 
-    negative_requests = [_normalize_request(req, "padv-negative-control") for req in neg if isinstance(req, dict)]
+    negative_requests = _filter_requests([req for req in neg if isinstance(req, dict)], control=True)
     if not negative_requests:
-        negative_requests = [
-            {
-                "method": "GET",
-                "path": "/",
-                "query": {config.canary.parameter_name: "padv-negative-control"},
-            }
-        ]
+        negative_requests = [_neutralize_control(positive_requests[0], "control-0")]
+    while len(negative_requests) < max(1, profile.min_negative_controls):
+        negative_requests.append(_neutralize_control(positive_requests[min(len(negative_requests), len(positive_requests) - 1)], f"control-{len(negative_requests)}"))
+
+    environment_requirements = sorted(
+        dict.fromkeys(
+            [str(x).strip() for x in [*candidate.preconditions, *candidate.auth_requirements] if str(x).strip()]
+        )
+    )
 
     return ValidationPlan(
         candidate_id=candidate.candidate_id,
+        oracle_functions=oracle_functions,
+        request_expectations=request_expectations,
+        response_witnesses=response_witnesses,
         intercepts=normalized_intercepts,
         positive_requests=positive_requests,
         negative_requests=negative_requests,
+        validation_mode=profile.validation_mode,
+        canonical_class=profile.canonical_class,
+        class_contract_id=profile.class_contract_id,
+        environment_requirements=environment_requirements,
+        requests=list(positive_requests),
+        negative_controls=list(negative_requests),
         canary=canary,
         strategy=str(response.get("strategy", "deepagents-plan")),
         negative_control_strategy=str(response.get("negative_control_strategy", "canary-mismatch")),
@@ -788,9 +3490,9 @@ def make_validation_plan_with_deepagents(
     )
     prompt = (
         "Create a strict HTTP validation plan for this PHP candidate. "
-        "Need exactly 3 positive and at least 1 negative request, deterministic canary injection, and compact intercept set. "
+        "Need exactly 3 positive and at least 1 negative request, deterministic canary injection, and a clean separation between oracle functions, request expectations, and response witnesses. "
         "Prioritize reachable paths from web_path_hints and exploit-relevant parameters. "
-        'Return JSON: {"intercepts":[...], "positive_requests":[...], "negative_requests":[...], '
+        'Return JSON: {"oracle_functions":[...], "request_expectations":[...], "response_witnesses":[...], "intercepts":[...], "positive_requests":[...], "negative_requests":[...], '
         '"strategy":"...", "negative_control_strategy":"...", "plan_notes":[...]} '
         f"{class_hint} "
         f"Candidate: {json.dumps(candidate.to_dict(), ensure_ascii=True)} "
@@ -842,9 +3544,9 @@ def make_validation_plans_with_deepagents(
         prompt = (
             "Create strict HTTP validation plans for each listed PHP web-security candidate. "
             "Each plan needs exactly 3 positive and at least 1 negative request, deterministic canary injection, "
-            "and compact intercept set. "
+            "and a clean separation between oracle functions, request expectations, and response witnesses. "
             "Prioritize reachable paths from web_path_hints and exploit-relevant parameters. "
-            'Return JSON: {"plans":[{"candidate_id":"...","intercepts":[...],"positive_requests":[...],'
+            'Return JSON: {"plans":[{"candidate_id":"...","oracle_functions":[...],"request_expectations":[...],"response_witnesses":[...],"intercepts":[...],"positive_requests":[...],'
             '"negative_requests":[...],"strategy":"...","negative_control_strategy":"...","plan_notes":[...]}],'
             '"notes":[...]}. '
             f"{class_hint} "
@@ -898,3 +3600,268 @@ def make_validation_plans_with_deepagents(
         "batches": batches_trace,
     }
     return plans, trace
+
+
+def orient_root_agent(
+    runtime: AgentRuntime,
+    config: PadvConfig,
+    *,
+    frontier_state: dict[str, Any],
+    discovery_trace: dict[str, Any],
+    run_validation: bool,
+) -> tuple[list[ObjectiveScore], dict[str, Any]]:
+    parsed, handoff_meta = _invoke_agent_handoff(
+        runtime,
+        runtime.root,
+        config,
+        category="orient",
+        envelope={
+            "run_validation": bool(run_validation),
+            "discovery_trace": discovery_trace,
+            "frontier_state": _compact_frontier_state(frontier_state),
+        },
+        response_contract='{"objectives":[{"objective_id":"...","title":"...","rationale":"...","expected_info_gain":0.0,"priority":0.0,"channels":["source","graph","web"],"related_hypothesis_ids":[...]}],"notes":[...]}',
+    )
+    objectives = _limit_primary_objectives(_normalize_objectives(parsed.get("objectives", [])))
+    if not objectives:
+        raise AgentExecutionError("root agent returned zero objectives")
+    return objectives, {"engine": "deepagents", "notes": parsed.get("notes", []), "objective_ids": [o.objective_id for o in objectives], **handoff_meta}
+
+
+def select_objective_with_root_agent(
+    runtime: AgentRuntime,
+    config: PadvConfig,
+    *,
+    objective_queue: list[ObjectiveScore],
+    frontier_state: dict[str, Any],
+) -> tuple[ObjectiveScore, dict[str, Any]]:
+    parsed, handoff_meta = _invoke_agent_handoff(
+        runtime,
+        runtime.root,
+        config,
+        category="select_objective",
+        envelope={
+            "objective_queue": [o.to_dict() for o in objective_queue],
+            "frontier_state": _compact_frontier_state(frontier_state),
+        },
+        response_contract='{"objective_id":"...","notes":[...]}',
+    )
+    selected_id = str(parsed.get("objective_id", "")).strip()
+    selected = next((item for item in objective_queue if item.objective_id == selected_id), None)
+    if selected is None:
+        raise AgentExecutionError(f"root agent selected unknown objective: {selected_id}")
+    return selected, {"engine": "deepagents", "selected_objective_id": selected.objective_id, "notes": parsed.get("notes", []), **handoff_meta}
+
+
+def run_research_subagent(
+    runtime: AgentRuntime,
+    role: str,
+    config: PadvConfig,
+    *,
+    objective: ObjectiveScore,
+    frontier_state: dict[str, Any],
+) -> tuple[list[ResearchTask], list[ResearchFinding], dict[str, Any]]:
+    session = runtime.subagents.get(role, runtime.root)
+    parsed, handoff_meta = _invoke_agent_handoff(
+        runtime,
+        session,
+        config,
+        category=f"{role}_research",
+        envelope={
+            "objective": objective.to_dict(),
+            "frontier_state": _compact_research_frontier_state(frontier_state),
+        },
+        response_contract='{"findings":[{"finding_id":"...","title":"...","summary":"...","evidence_refs":[...],"file_refs":[...],"web_paths":[...],"params":[...],"sink_refs":[...]}],"notes":[...]}',
+        workspace_role=role,
+    )
+    tasks = _normalize_research_tasks(parsed.get("tasks", []), objective_id=objective.objective_id, channel=role)
+    findings = _normalize_research_findings(parsed.get("findings", []), objective_id=objective.objective_id, channel=role)
+    return tasks, findings, {"engine": "deepagents", "role": role, "notes": parsed.get("notes", []), "task_ids": [t.task_id for t in tasks], "finding_ids": [f.finding_id for f in findings], **handoff_meta}
+
+
+def synthesize_hypotheses_with_subagent(
+    runtime: AgentRuntime,
+    config: PadvConfig,
+    *,
+    objective: ObjectiveScore,
+    findings: list[ResearchFinding],
+    frontier_state: dict[str, Any],
+) -> tuple[list[Hypothesis], dict[str, Any]]:
+    if not findings:
+        return [], {"engine": "deepagents", "reason": "no-findings", "hypothesis_ids": []}
+    parsed, handoff_meta = _invoke_agent_handoff(
+        runtime,
+        runtime.subagents.get("exploit", runtime.root),
+        config,
+        category="hypothesis_synthesis",
+        envelope={
+            "objective": objective.to_dict(),
+            "research_findings": _compact_research_findings(findings),
+            "frontier_state": _compact_frontier_state(frontier_state),
+        },
+        response_contract='{"hypotheses":[{"hypothesis_id":"...","objective_id":"...","vuln_class":"...","title":"...","rationale":"...","evidence_refs":[...],"candidate":{"candidate_id":"...","vuln_class":"...","title":"...","file_path":"...","line":1,"sink":"...","expected_intercepts":[...],"notes":"...","provenance":[...],"evidence_refs":[...],"confidence":0.0,"auth_requirements":[...],"web_path_hints":[...],"preconditions":[...]},"confidence":0.0,"status":"active"}],"notes":[...]}',
+        workspace_role="exploit",
+    )
+    hypotheses = _normalize_hypotheses(parsed.get("hypotheses", []))
+    if findings and not hypotheses:
+        raise AgentExecutionError("exploit subagent returned zero hypotheses")
+    return hypotheses, {"engine": "deepagents", "notes": parsed.get("notes", []), "hypothesis_ids": [h.hypothesis_id for h in hypotheses], **handoff_meta}
+
+
+def challenge_hypotheses_with_subagent(
+    runtime: AgentRuntime,
+    config: PadvConfig,
+    *,
+    hypotheses: list[Hypothesis],
+    frontier_state: dict[str, Any],
+) -> tuple[list[Refutation], dict[str, Any]]:
+    prioritized_hypotheses = sorted(
+        hypotheses,
+        key=lambda item: float(item.confidence or 0.0),
+        reverse=True,
+    )[:3]
+    if not prioritized_hypotheses:
+        return [], {"engine": "deepagents", "reason": "no-hypotheses", "refutation_ids": []}
+    try:
+        parsed, handoff_meta = _invoke_agent_handoff(
+            runtime,
+            runtime.subagents.get("skeptic", runtime.root),
+            config,
+            category="skeptic_challenge",
+            envelope={
+                "hypotheses": _compact_hypotheses_for_skeptic(prioritized_hypotheses, limit=3),
+                "skeptic_scope": {
+                    "focus": "exploit-invalidating objections only",
+                    "defer_environmental_constraints": True,
+                },
+            },
+            response_contract='{"refutations":[{"refutation_id":"...","hypothesis_id":"...","title":"...","summary":"...","evidence_refs":[...],"severity":"low|medium|high"}],"notes":[...]}',
+            workspace_role="skeptic",
+        )
+        refutations = [
+            item
+            for item in _normalize_refutations(parsed.get("refutations", []))
+            if not _is_environmental_skeptic_text(f"{item.title} {item.summary}")
+        ]
+        return refutations, {"engine": "deepagents", "notes": parsed.get("notes", []), "refutation_ids": [r.refutation_id for r in refutations], **handoff_meta}
+    except AgentExecutionError as exc:
+        return [], {
+            "engine": "deepagents-fallback",
+            "notes": [],
+            "refutation_ids": [],
+            "fallback_error": str(exc),
+            "fallback_reason": "skeptic-timeout-or-agent-error",
+            "hypothesis_ids": [item.hypothesis_id for item in prioritized_hypotheses],
+        }
+
+
+def plan_experiments_with_subagent(
+    runtime: AgentRuntime,
+    config: PadvConfig,
+    *,
+    hypotheses: list[Hypothesis],
+    frontier_state: dict[str, Any],
+) -> tuple[dict[str, ValidationPlan], list[ExperimentAttempt], dict[str, Any]]:
+    prioritized_hypotheses = sorted(
+        hypotheses,
+        key=lambda item: float(item.confidence or 0.0),
+        reverse=True,
+    )[:3]
+    if not prioritized_hypotheses:
+        return {}, [], {"engine": "deepagents", "reason": "no-hypotheses", "planned_candidate_ids": []}
+    try:
+        parsed, handoff_meta = _invoke_agent_handoff(
+            runtime,
+            runtime.subagents.get("experiment", runtime.root),
+            config,
+            category="experiment_plan",
+            envelope={
+                "hypotheses": _compact_hypotheses_for_skeptic(prioritized_hypotheses, limit=3),
+                "skeptic_scope": {
+                    "focus": "exploit-invalidating objections only",
+                    "defer_environmental_constraints": True,
+                },
+            },
+            response_contract='{"plans":[{"hypothesis_id":"...","candidate":{"candidate_id":"...","vuln_class":"...","title":"...","file_path":"...","line":1,"sink":"...","expected_intercepts":[...],"notes":"...","provenance":[...],"evidence_refs":[...],"confidence":0.0},"oracle_functions":[...],"request_expectations":[...],"response_witnesses":[...],"intercepts":[...],"positive_requests":[...],"negative_requests":[...],"strategy":"...","negative_control_strategy":"...","plan_notes":[...],"attempt_id":"...","plan_id":"...","request_refs":[...],"witness_goal":"...","status":"planned","analysis_flags":[...]}],"notes":[...]}',
+            workspace_role="experiment",
+        )
+        plans, attempts = _normalize_experiment_attempts(parsed.get("plans", parsed), config)
+        if hypotheses and not plans:
+            raise AgentExecutionError("experiment subagent returned zero plans")
+        return plans, attempts, {"engine": "deepagents", "notes": parsed.get("notes", []), "planned_candidate_ids": sorted(plans.keys()), **handoff_meta}
+    except AgentExecutionError as exc:
+        fallback_candidates: list[Candidate] = []
+        candidate_to_hypothesis: dict[str, Hypothesis] = {}
+        for item in prioritized_hypotheses:
+            candidate = item.candidate
+            if candidate.candidate_id in candidate_to_hypothesis:
+                continue
+            candidate_to_hypothesis[candidate.candidate_id] = item
+            fallback_candidates.append(candidate)
+        if not fallback_candidates:
+            raise
+        plans, fallback_trace = make_validation_plans_with_deepagents(
+            fallback_candidates,
+            config,
+            repo_root=runtime.repo_root,
+            session=runtime.subagents.get("experiment", runtime.root),
+            batch_size=2,
+        )
+        attempts: list[ExperimentAttempt] = []
+        for idx, candidate in enumerate(fallback_candidates, start=1):
+            plan = plans.get(candidate.candidate_id)
+            hypothesis = candidate_to_hypothesis.get(candidate.candidate_id)
+            if plan is None or hypothesis is None:
+                continue
+            attempts.append(
+                ExperimentAttempt(
+                    attempt_id=f"fallback-attempt-{idx:04d}",
+                    hypothesis_id=hypothesis.hypothesis_id,
+                    plan_id=f"fallback-plan-{idx:04d}",
+                    request_refs=[],
+                    witness_goal=hypothesis.vuln_class,
+                    status="planned",
+                    analysis_flags=["fallback-plan"],
+                    metadata={"fallback_error": str(exc)},
+                )
+            )
+        if hypotheses and not plans:
+            raise
+        return plans, attempts, {
+            "engine": "deepagents-fallback",
+            "notes": [],
+            "planned_candidate_ids": sorted(plans.keys()),
+            "fallback_error": str(exc),
+            "fallback_trace": fallback_trace,
+        }
+
+
+def decide_continue_with_root_agent(
+    runtime: AgentRuntime,
+    config: PadvConfig,
+    *,
+    iteration: int,
+    objective_queue: list[ObjectiveScore],
+    hypotheses: list[Hypothesis],
+    refutations: list[Refutation],
+    witness_bundles: list[WitnessBundle],
+    max_iterations: int,
+) -> tuple[bool, dict[str, Any]]:
+    parsed, handoff_meta = _invoke_agent_handoff(
+        runtime,
+        runtime.root,
+        config,
+        category="continue_or_stop",
+        envelope={
+            "iteration": iteration,
+            "max_iterations": max_iterations,
+            "objective_queue": [o.to_dict() for o in objective_queue],
+            "hypotheses": [h.to_dict() for h in hypotheses],
+            "refutations": [r.to_dict() for r in refutations],
+            "witness_bundles": [w.to_dict() for w in witness_bundles],
+            "frontier_state": _compact_frontier_state(runtime.shared_context.get("frontier_state")),
+        },
+        response_contract='{"continue":true,"reason":"...","notes":[...]}',
+    )
+    should_continue = bool(parsed.get("continue")) and iteration < max_iterations
+    return should_continue, {"engine": "deepagents", "reason": str(parsed.get("reason", "")).strip(), "notes": parsed.get("notes", []), **handoff_meta}

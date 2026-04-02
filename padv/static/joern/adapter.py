@@ -1,16 +1,21 @@
 from __future__ import annotations
 
+import os
 import hashlib
 import json
+import base64
 import re
 import shlex
+import shutil
 import subprocess
 import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from urllib import error, request
 
 from padv.config.schema import PadvConfig
+from padv.discovery.budgeting import select_fair_share
 from padv.models import Candidate, StaticEvidence
 from padv.path_scope import is_app_candidate_path, normalize_repo_path
 from padv.static.joern.query_sets import VULN_CLASS_SPECS, VulnClassSpec, intercepts_for_class
@@ -41,6 +46,9 @@ class JoernDiscoveryMeta:
 _SPEC_BY_CLASS = {spec.vuln_class: spec for spec in VULN_CLASS_SPECS}
 _ANSI_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 _RESULT_MARKER = re.compile(r"<padv_result>\s*(\[.*\])\s*</padv_result>", re.DOTALL)
+_REPL_B64_STRING_RE = re.compile(r'"([A-Za-z0-9+/=]+)"')
+_REPL_LIST_BLOCK_RE = re.compile(r"val\s+res\d+:\s+List\[String\]\s*=\s*List\((.*)\)\s*$", re.DOTALL)
+_JOERN_SHARED_DIR_ENV = "PADV_JOERN_SHARED_DIR"
 
 
 def _hash_for(file_path: str, line: int, text: str) -> str:
@@ -161,18 +169,20 @@ def _escape_scala_string(value: str) -> str:
 
 
 def _joern_http_query_with_import(import_statement: str) -> str:
-    query = """
+    query = r"""
 workspace.reset
 __IMPORT_STATEMENT__
 import io.shiftleft.semanticcpg.language._
+import java.nio.charset.StandardCharsets
+import java.util.Base64
 
 case class Rule(vulnClass: String, queryId: String, regex: scala.util.matching.Regex)
 val rules = List(
-  Rule("sql_injection_boundary", "joern::sql_boundary", "(?i)(mysqli_query|mysqli_real_query|mysqli::query|mysqli_multi_query|pdo::query|pdo::prepare|pdo::exec|pg_query)".r),
+  Rule("sql_injection_boundary", "joern::sql_boundary", "(?i)(mysqli_query|mysqli_real_query|mysqli::query|mysqli_multi_query|pdo::query|pdo::prepare|pdo::exec|pg_query|sqlsrv_query|\\bquery\\b|\\bprepare\\b|\\bexec\\b)".r),
   Rule("command_injection_boundary", "joern::cmd_boundary", "(?i)(exec|shell_exec|system|passthru|popen|proc_open|pcntl_exec|`)".r),
   Rule("code_injection_boundary", "joern::code_boundary", "(?i)(eval|assert|preg_replace|create_function)".r),
   Rule("ldap_injection_boundary", "joern::ldap_boundary", "(?i)(ldap_search|ldap_list|ldap_read|ldap_add|ldap_modify)".r),
-  Rule("xpath_injection_boundary", "joern::xpath_boundary", "(?i)(domxpath::query|domxpath::evaluate|simplexmlelement::xpath)".r),
+  Rule("xpath_injection_boundary", "joern::xpath_boundary", "(?i)(domxpath::query|domxpath::evaluate|simplexmlelement::xpath|\\bxpath\\b|\\bevaluate\\b)".r),
   Rule("file_boundary_influence", "joern::file_boundary", "(?i)(file_put_contents|file_get_contents|fopen|include_once|include|require_once|require|readfile|show_source|highlight_file)".r),
   Rule("file_upload_influence", "joern::upload_boundary", "(?i)(move_uploaded_file|finfo_file|mime_content_type)".r),
   Rule("xss_output_boundary", "joern::xss_boundary", "(?i)(\\becho\\b|printf|vprintf|die|exit|\\bprint\\b)".r),
@@ -199,7 +209,7 @@ val rules = List(
 )
 
 def esc(value: String): String =
-  value.replace("\\\\", "\\\\\\\\").replace("\"", "\\\\\"").replace("\\n", "\\\\n").replace("\\r", "\\\\r").replace("\\t", "\\\\t")
+  value.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
 
 val rows = cpg.call.l.flatMap { call =>
   val name = Option(call.name).getOrElse("")
@@ -210,16 +220,18 @@ val rows = cpg.call.l.flatMap { call =>
       val line = call.lineNumber.getOrElse(0)
       val sink = if (name.nonEmpty) name else "unknown"
       val snippet = code.take(240)
-      "{\\\"vuln_class\\\":\\\"" + esc(rule.vulnClass) +
-      "\\\",\\\"query_id\\\":\\\"" + esc(rule.queryId) +
-      "\\\",\\\"file_path\\\":\\\"" + esc(filePath) +
-      "\\\",\\\"line\\\":" + line +
-      ",\\\"sink\\\":\\\"" + esc(sink) +
-      "\\\",\\\"snippet\\\":\\\"" + esc(snippet) +
-      "\\\"}"
+      Base64.getEncoder.encodeToString(
+        ("{\"vuln_class\":\"" + esc(rule.vulnClass) +
+        "\",\"query_id\":\"" + esc(rule.queryId) +
+        "\",\"file_path\":\"" + esc(filePath) +
+        "\",\"line\":" + line +
+        ",\"sink\":\"" + esc(sink) +
+        "\",\"snippet\":\"" + esc(snippet) +
+        "\"}").getBytes(StandardCharsets.UTF_8)
+      )
   }
 }
-println("<padv_result>[" + rows.mkString(",") + "]</padv_result>")
+rows
 """
     return query.replace("__IMPORT_STATEMENT__", import_statement)
 
@@ -238,6 +250,197 @@ def _strip_ansi(value: str) -> str:
     return _ANSI_RE.sub("", value)
 
 
+def _load_composer_vendor_dir(repo_root: Path) -> str | None:
+    payload = _load_composer_payload(repo_root)
+    if not isinstance(payload, dict):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    config = payload.get("config")
+    if not isinstance(config, dict):
+        return None
+    vendor_dir = config.get("vendor-dir")
+    if not isinstance(vendor_dir, str):
+        return None
+    normalized = vendor_dir.replace("\\", "/").strip().strip("/")
+    return normalized or None
+
+
+def _load_composer_payload(repo_root: Path) -> dict[str, object] | None:
+    composer_json = repo_root / "composer.json"
+    if not composer_json.exists():
+        return None
+    try:
+        payload = json.loads(composer_json.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def _load_composer_autoload_roots(repo_root: Path) -> list[str]:
+    payload = _load_composer_payload(repo_root)
+    if not isinstance(payload, dict):
+        return []
+    autoload = payload.get("autoload")
+    if not isinstance(autoload, dict):
+        return []
+
+    roots: set[str] = set()
+    for field in ("psr-4", "psr-0"):
+        mapping = autoload.get(field)
+        if not isinstance(mapping, dict):
+            continue
+        for value in mapping.values():
+            values = value if isinstance(value, list) else [value]
+            for item in values:
+                if isinstance(item, str):
+                    normalized = normalize_repo_path(item, repo_root=None)
+                    normalized = normalized.removeprefix("./").strip("/")
+                    if normalized:
+                        roots.add(normalized)
+    classmap = autoload.get("classmap")
+    if isinstance(classmap, list):
+        for item in classmap:
+            if isinstance(item, str):
+                normalized = normalize_repo_path(item, repo_root=None)
+                normalized = normalized.removeprefix("./").strip("/")
+                if normalized:
+                    roots.add(normalized)
+
+    return sorted(roots)
+
+
+def _is_php_source_file(path: Path) -> bool:
+    return path.suffix.casefold() in {".php", ".phtml", ".inc", ".phpt"}
+
+
+def _path_is_within(rel_path: str, scope_root: str) -> bool:
+    path_parts = PurePosixPath(rel_path).parts
+    root_parts = PurePosixPath(scope_root).parts
+    return len(path_parts) >= len(root_parts) and path_parts[: len(root_parts)] == root_parts
+
+
+def _discover_entrypoint_dirs(repo_root: Path, autoload_roots: list[str]) -> set[str]:
+    entrypoint_dirs: set[str] = set()
+    for root in autoload_roots:
+        root_path = PurePosixPath(root)
+        app_base = root_path.parent.parent
+        if not app_base.parts:
+            continue
+        base_path = repo_root / app_base.as_posix()
+        if not base_path.exists():
+            continue
+        for index_file in base_path.rglob("index.php"):
+            try:
+                rel_path = index_file.relative_to(repo_root).as_posix()
+            except ValueError:
+                continue
+            if not is_app_candidate_path(rel_path):
+                continue
+            rel_parts = PurePosixPath(rel_path).parts
+            base_parts = app_base.parts
+            if len(rel_parts) - len(base_parts) > 2:
+                continue
+            entrypoint_dirs.add(PurePosixPath(rel_path).parent.as_posix())
+    return entrypoint_dirs
+
+
+def _include_path_via_autoload_roots(
+    rel_path: str, autoload_roots: list[str], entrypoint_dirs: set[str]
+) -> bool:
+    if not autoload_roots:
+        return True
+
+    path_parts = PurePosixPath(rel_path).parts
+    for root in autoload_roots:
+        root_path = PurePosixPath(root)
+        root_parts = root_path.parts
+        if _path_is_within(rel_path, root):
+            return True
+
+        source_parent = root_path.parent
+        if source_parent.parts and path_parts[:-1] == source_parent.parts:
+            return True
+
+        app_base = source_parent.parent
+        if app_base.parts and path_parts[:-1] == app_base.parts:
+            return True
+        if PurePosixPath(rel_path).parent.as_posix() in entrypoint_dirs:
+            return True
+
+    return False
+
+
+def _build_joern_parse_scope(repo_root: Path, staging_root: Path) -> Path:
+    scoped_root = staging_root / "source"
+    scoped_root.mkdir(parents=True, exist_ok=True)
+
+    vendor_dir = _load_composer_vendor_dir(repo_root)
+    autoload_roots = _load_composer_autoload_roots(repo_root)
+    entrypoint_dirs = _discover_entrypoint_dirs(repo_root, autoload_roots)
+    staging_resolved = staging_root.resolve()
+    copied = 0
+    for source in repo_root.rglob("*"):
+        if not source.is_file():
+            continue
+        try:
+            source.resolve().relative_to(staging_resolved)
+            continue
+        except ValueError:
+            pass
+        if not _is_php_source_file(source):
+            continue
+        rel_path = source.relative_to(repo_root).as_posix()
+        if vendor_dir and (rel_path == vendor_dir or rel_path.startswith(f"{vendor_dir}/")):
+            continue
+        if not is_app_candidate_path(rel_path):
+            continue
+        if not _include_path_via_autoload_roots(rel_path, autoload_roots, entrypoint_dirs):
+            continue
+
+        destination = scoped_root / rel_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+        copied += 1
+
+    if copied == 0:
+        raise JoernExecutionError(f"no parseable PHP application files found under: {repo_root}")
+
+    return scoped_root
+
+
+def _remap_findings_to_repo_root(
+    findings: list[JoernFinding], parse_root: Path, repo_root: Path
+) -> list[JoernFinding]:
+    remapped: list[JoernFinding] = []
+    parse_root_resolved = parse_root.resolve()
+    repo_root_resolved = repo_root.resolve()
+    for finding in findings:
+        file_path = finding.file_path
+        if file_path:
+            path_obj = Path(file_path)
+            if path_obj.is_absolute():
+                try:
+                    relative = path_obj.resolve().relative_to(parse_root_resolved)
+                except ValueError:
+                    relative = None
+                if relative is not None:
+                    file_path = str((repo_root_resolved / relative).as_posix())
+        remapped.append(
+            JoernFinding(
+                vuln_class=finding.vuln_class,
+                query_id=finding.query_id,
+                file_path=file_path,
+                line=finding.line,
+                sink=finding.sink,
+                snippet=finding.snippet,
+            )
+        )
+    return remapped
+
+
 def _parse_joern_stdout_json(stdout: str) -> list[JoernFinding]:
     cleaned = _strip_ansi(stdout)
     marker_match = _RESULT_MARKER.search(cleaned)
@@ -249,6 +452,23 @@ def _parse_joern_stdout_json(stdout: str) -> list[JoernFinding]:
         if isinstance(data, list):
             return _parse_joern_items(data)
 
+    block_matches = list(_REPL_LIST_BLOCK_RE.finditer(cleaned))
+    if block_matches:
+        candidate_region = block_matches[-1].group(1)
+    else:
+        list_idx = cleaned.rfind("List(")
+        candidate_region = cleaned[list_idx:] if list_idx != -1 else cleaned
+
+    decoded_items: list[object] = []
+    for encoded in _REPL_B64_STRING_RE.findall(candidate_region):
+        try:
+            payload = base64.b64decode(encoded).decode("utf-8")
+            decoded_items.append(json.loads(payload))
+        except Exception:
+            continue
+    if decoded_items:
+        return _parse_joern_items(decoded_items)
+
     tmp_items: list[object] = []
     for raw_line in cleaned.splitlines():
         line = raw_line.strip()
@@ -258,7 +478,10 @@ def _parse_joern_stdout_json(stdout: str) -> list[JoernFinding]:
             tmp_items.append(json.loads(line))
         except json.JSONDecodeError:
             continue
-    return _parse_joern_items(tmp_items)
+    if tmp_items:
+        return _parse_joern_items(tmp_items)
+
+    return _parse_joern_items(decoded_items)
 
 
 def _run_joern_parse(repo_root: Path, cpg_path: Path, config: PadvConfig) -> None:
@@ -289,6 +512,19 @@ def _run_joern_parse(repo_root: Path, cpg_path: Path, config: PadvConfig) -> Non
 
     if not cpg_path.exists():
         raise JoernExecutionError(f"joern-parse did not produce CPG artifact: {cpg_path}")
+
+
+@contextmanager
+def _joern_http_workspace():
+    shared_dir = os.environ.get(_JOERN_SHARED_DIR_ENV, "").strip()
+    if shared_dir:
+        shared_path = Path(shared_dir)
+        shared_path.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="padv-joern-http-", dir=str(shared_path)) as temp_dir:
+            yield Path(temp_dir)
+        return
+    with tempfile.TemporaryDirectory(prefix="padv-joern-http-") as temp_dir:
+        yield Path(temp_dir)
 
 
 def _post_joern_http_query(query: str, config: PadvConfig) -> str:
@@ -337,13 +573,15 @@ def _run_joern_findings_http(repo_root: Path, config: PadvConfig) -> list[JoernF
         stdout = _post_joern_http_query(query=query, config=config)
         return _parse_joern_stdout_json(stdout)
 
-    with tempfile.TemporaryDirectory(prefix="padv-joern-http-") as temp_dir:
-        cpg_path = Path(temp_dir) / "repo.cpg.bin"
-        _run_joern_parse(repo_root=repo_root, cpg_path=cpg_path, config=config)
+    with _joern_http_workspace() as temp_dir:
+        parse_root = _build_joern_parse_scope(repo_root=repo_root, staging_root=temp_dir)
+        cpg_path = temp_dir / "repo.cpg.bin"
+        _run_joern_parse(repo_root=parse_root, cpg_path=cpg_path, config=config)
 
         query = _joern_http_query_for_php(cpg_path)
         stdout = _post_joern_http_query(query=query, config=config)
-        return _parse_joern_stdout_json(stdout)
+        findings = _parse_joern_stdout_json(stdout)
+        return _remap_findings_to_repo_root(findings=findings, parse_root=parse_root, repo_root=repo_root)
 
 
 def _run_joern_findings_script(repo_root: Path, config: PadvConfig) -> list[JoernFinding]:
@@ -406,9 +644,8 @@ def _discover_with_joern(
         unique_findings.append(finding)
 
     meta = JoernDiscoveryMeta(joern_findings=len(unique_findings))
-    candidates: list[Candidate] = []
-    evidence: list[StaticEvidence] = []
-    detector_note = "joern http detector" if config.joern.use_http_api else "joern script detector"
+    eligible_findings: list[tuple[JoernFinding, VulnClassSpec, str]] = []
+    seen_app: set[tuple[str, str, int, str, str]] = set()
     for finding in unique_findings:
         spec = _SPEC_BY_CLASS.get(finding.vuln_class)
         if spec is None:
@@ -416,9 +653,23 @@ def _discover_with_joern(
         rel_path = normalize_repo_path(finding.file_path, repo_root=repo_root)
         if not rel_path or not is_app_candidate_path(rel_path):
             continue
-        meta.joern_app_findings += 1
-        if len(candidates) >= config.budgets.max_candidates:
+        app_key = (finding.vuln_class, rel_path, finding.line, finding.sink, finding.query_id)
+        if app_key in seen_app:
             continue
+        seen_app.add(app_key)
+        meta.joern_app_findings += 1
+        eligible_findings.append((finding, spec, rel_path))
+
+    selected_findings = select_fair_share(
+        eligible_findings,
+        key_fn=lambda item: item[0].vuln_class,
+        limit=config.budgets.max_candidates,
+    )
+
+    candidates: list[Candidate] = []
+    evidence: list[StaticEvidence] = []
+    detector_note = "joern http detector" if config.joern.use_http_api else "joern script detector"
+    for idx, (finding, spec, rel_path) in enumerate(selected_findings, start=1):
         candidate_id = f"cand-{len(candidates)+1:05d}"
         candidate, static = _make_candidate_and_evidence(
             candidate_id=candidate_id,

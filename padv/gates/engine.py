@@ -3,8 +3,9 @@ from __future__ import annotations
 import urllib.parse
 
 from padv.config.schema import PadvConfig
-from padv.models import DifferentialPair, GateResult, RuntimeEvidence, StaticEvidence
+from padv.models import Candidate, DifferentialPair, EnvironmentFacts, GateResult, RuntimeEvidence, StaticEvidence, ValidationPlan
 from padv.static.joern.query_sets import VULN_CLASS_SPECS
+from padv.taxonomy import canonicalize_vuln_class
 
 
 REQUIRED_GATES = ["V0", "V1", "V2", "V3", "V4", "V5", "V6"]
@@ -123,6 +124,11 @@ def _flag_set(runs: list[RuntimeEvidence]) -> set[str]:
         for flag in run.analysis_flags:
             if isinstance(flag, str) and flag.strip():
                 out.add(flag.strip().casefold())
+        witness = getattr(run, "witness_evidence", None)
+        witness_flags = getattr(witness, "witness_flags", []) if witness is not None else []
+        for flag in witness_flags:
+            if isinstance(flag, str) and flag.strip():
+                out.add(flag.strip().casefold())
     return out
 
 
@@ -133,6 +139,24 @@ def _oracle_hit_count(
     config: PadvConfig,
 ) -> int:
     return sum(1 for run in runs if _has_oracle_hit(run, intercepts, canary, config))
+
+
+def _typed_oracle_hit_count(runs: list[RuntimeEvidence], intercepts: set[str]) -> int:
+    normalized = {x.casefold() for x in intercepts if isinstance(x, str) and x.strip()}
+    count = 0
+    for run in runs:
+        evidence = getattr(run, "oracle_evidence", []) or []
+        matched = False
+        for item in evidence:
+            function = str(getattr(item, "function", "")).strip().casefold()
+            if normalized and function not in normalized:
+                continue
+            if bool(getattr(item, "matched_canary", False)):
+                matched = True
+                break
+        if matched:
+            count += 1
+    return count
 
 
 def _has_status_diff(positive_runs: list[RuntimeEvidence], negative_runs: list[RuntimeEvidence]) -> bool:
@@ -222,8 +246,8 @@ def _derived_class_flags(
     oracle_witness = _CLASS_ORACLE_WITNESS_FLAGS.get(class_key)
     if oracle_witness:
         min_positive_hits = min(2, len(positive_runs)) if positive_runs else 0
-        pos_hits = _oracle_hit_count(positive_runs, intercept_set, canary, config)
-        neg_hits = _oracle_hit_count(negative_runs, intercept_set, canary, config)
+        pos_hits = _typed_oracle_hit_count(positive_runs, intercept_set) or _oracle_hit_count(positive_runs, intercept_set, canary, config)
+        neg_hits = _typed_oracle_hit_count(negative_runs, intercept_set) or _oracle_hit_count(negative_runs, intercept_set, canary, config)
         if min_positive_hits > 0 and pos_hits >= min_positive_hits:
             positive_flags.add(oracle_witness)
         if neg_hits > 0:
@@ -261,10 +285,20 @@ def evaluate_candidate(
     evidence_signals: list[str] | None = None,
     vuln_class: str | None = None,
     differential_pairs: list[DifferentialPair] | None = None,
+    candidate: Candidate | None = None,
+    plan: ValidationPlan | None = None,
+    environment_facts: EnvironmentFacts | None = None,
 ) -> GateResult:
     passed: list[str] = []
+    if candidate is not None and str(getattr(candidate, "validation_mode", "")).strip() == "analysis_only":
+        return GateResult("CONFIRMED_ANALYSIS_FINDING", ["A0"], None, "analysis-only candidate confirmed by static and research evidence")
 
-    if any(run.status in {"auth_failed", "missing_key", "missing_intercept", "inactive", "request_failed"} for run in positive_runs):
+    hard_scope_failures = {"auth_failed", "missing_key", "missing_intercept", "inactive"}
+    if any(run.status in hard_scope_failures for run in positive_runs):
+        return GateResult("DROPPED", passed, "V0", "runtime not in valid scope")
+    in_scope_positive_runs = [run for run in positive_runs if run.status != "request_failed"]
+    in_scope_negative_runs = [run for run in negative_runs if run.status != "request_failed"]
+    if not in_scope_positive_runs or not in_scope_negative_runs:
         return GateResult("DROPPED", passed, "V0", "runtime not in valid scope")
     passed.append("V0")
 
@@ -274,14 +308,16 @@ def evaluate_candidate(
 
     if not static_evidence:
         return GateResult("DROPPED", passed, "V2", "missing static evidence")
-    if not positive_runs:
+    if not in_scope_positive_runs:
         return GateResult("DROPPED", passed, "V2", "missing runtime evidence")
     signal_set = {s.strip().lower() for s in (evidence_signals or []) if isinstance(s, str) and s.strip()}
     if len(signal_set) < 2:
         return GateResult("DROPPED", passed, "V2", "insufficient multi-evidence corroboration")
     passed.append("V2")
 
-    class_key = (vuln_class or "").strip().casefold()
+    class_key = canonicalize_vuln_class(
+        getattr(candidate, "canonical_class", "") or vuln_class or getattr(candidate, "vuln_class", "")
+    )
     intercept_set = set(intercepts)
     positive_flags = _flag_set(positive_runs)
     negative_flags = _flag_set(negative_runs)
@@ -292,8 +328,8 @@ def evaluate_candidate(
 
     derived_positive, derived_negative = _derived_class_flags(
         class_key,
-        positive_runs=positive_runs,
-        negative_runs=negative_runs,
+        positive_runs=in_scope_positive_runs,
+        negative_runs=in_scope_negative_runs,
         intercept_set=intercept_set,
         canary=canary,
         config=config,
@@ -329,25 +365,25 @@ def evaluate_candidate(
         passed.append("V4")
     else:
         # Legacy fallback for non-runtime classes and unknown classes only.
-        positive_hits = [
-            _has_oracle_hit(run, intercept_set, canary, config)
-            for run in positive_runs
-        ]
+        positive_hits = []
+        for run in in_scope_positive_runs:
+            typed_hit = any(bool(getattr(item, "matched_canary", False)) for item in getattr(run, "oracle_evidence", []) or [])
+            positive_hits.append(typed_hit or _has_oracle_hit(run, intercept_set, canary, config))
         if not all(positive_hits):
             return GateResult("DROPPED", passed, "V3", "canary boundary proof missing")
         passed.append("V3")
 
-        negative_hits = [
-            _has_oracle_hit(run, intercept_set, canary, config)
-            for run in negative_runs
-        ]
+        negative_hits = []
+        for run in in_scope_negative_runs:
+            typed_hit = any(bool(getattr(item, "matched_canary", False)) for item in getattr(run, "oracle_evidence", []) or [])
+            negative_hits.append(typed_hit or _has_oracle_hit(run, intercept_set, canary, config))
         if any(negative_hits):
             return GateResult("DROPPED", passed, "V4", "negative control hit canary")
         passed.append("V4")
 
-    if len(positive_runs) < 3 or len(negative_runs) < 1:
+    if len(in_scope_positive_runs) < 2 or len(in_scope_negative_runs) < 1:
         return GateResult("DROPPED", passed, "V5", "insufficient repro runs")
-    if any(run.overflow or run.result_truncated for run in positive_runs + negative_runs):
+    if any(run.overflow or run.result_truncated for run in in_scope_positive_runs + in_scope_negative_runs):
         return GateResult("DROPPED", passed, "V5", "runtime evidence truncated")
     passed.append("V5")
 

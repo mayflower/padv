@@ -68,7 +68,7 @@ def analyze_failures(store: EvidenceStore, min_occurrences: int = 3) -> FailureA
         if not isinstance(gate_result, dict):
             continue
         decision = _as_str(gate_result.get("decision"))
-        if decision == "VALIDATED":
+        if decision in {"VALIDATED", "CONFIRMED_ANALYSIS_FINDING"}:
             continue
 
         failed_gate = _as_str(gate_result.get("failed_gate"), "unknown")

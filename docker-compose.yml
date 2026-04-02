@@ -1,12 +1,13 @@
 services:
   joern:
-    image: ${JOERN_IMAGE:-ghcr.io/joernio/joern:master}
+    image: ${JOERN_IMAGE:-ghcr.io/joernio/joern:v4.0.228}
     command: ["joern", "--server", "--server-host", "0.0.0.0", "--server-port", "8080"]
     working_dir: /workspace
     ports:
       - "8080:8080"
     volumes:
       - ${PADV_TARGETS_DIR:-./targets}:/workspace/targets:ro
+      - joern-exchange:/workspace/joern-exchange
 
   padv:
     build:
@@ -18,9 +19,14 @@ services:
     environment:
       PADV_CONFIG: /workspace/haxor/padv.docker.toml
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      PADV_JOERN_SHARED_DIR: /workspace/joern-exchange
     extra_hosts:
       - "host.docker.internal:host-gateway"
     shm_size: "1gb"
     volumes:
       - ./:/workspace/haxor
       - ${PADV_TARGETS_DIR:-./targets}:/workspace/targets
+      - joern-exchange:/workspace/joern-exchange
+
+volumes:
+  joern-exchange:

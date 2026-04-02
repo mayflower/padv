@@ -24,12 +24,14 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--repo-root", required=True)
     run.add_argument("--mode", default="variant", choices=["variant", "delta", "batch"])
     run.add_argument("--no-progress", action="store_true", help="Disable live step updates on stderr")
+    run.add_argument("--resume", nargs="?", const="latest", default=None, help="Resume an interrupted run by run id or latest compatible run")
 
     analyze_cmd = sub.add_parser("analyze", help="Static discovery/detection only")
     analyze_cmd.add_argument("--config", default=None, help="Path to TOML config")
     analyze_cmd.add_argument("--repo-root", required=True)
     analyze_cmd.add_argument("--mode", default="variant", choices=["variant", "delta", "batch"])
     analyze_cmd.add_argument("--no-progress", action="store_true", help="Disable live step updates on stderr")
+    analyze_cmd.add_argument("--resume", nargs="?", const="latest", default=None, help="Resume an interrupted analyze run by run id or latest compatible run")
 
     analyze_failures_cmd = sub.add_parser("analyze-failures", help="Analyze historical failure patterns")
     analyze_failures_cmd.add_argument("--config", default=None, help="Path to TOML config")
@@ -42,6 +44,7 @@ def _build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--repo-root", default=None)
     validate.add_argument("--mode", default="variant", choices=["variant", "delta", "batch"])
     validate.add_argument("--no-progress", action="store_true", help="Disable live step updates on stderr")
+    validate.add_argument("--resume", nargs="?", const="latest", default=None, help="Resume an interrupted validate run by run id or latest compatible run")
 
     sandbox = sub.add_parser("sandbox", help="Sandbox helper commands")
     sandbox.add_argument("--config", default=None, help="Path to TOML config")
@@ -49,7 +52,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     list_cmd = sub.add_parser("list", help="List artifacts")
     list_cmd.add_argument("--config", default=None, help="Path to TOML config")
-    list_cmd.add_argument("kind", choices=["candidates", "bundles", "runs"])
+    list_cmd.add_argument("kind", choices=["candidates", "bundles", "runs", "resumes"])
 
     show = sub.add_parser("show", help="Show artifact details")
     show.add_argument("--config", default=None, help="Path to TOML config")
@@ -125,6 +128,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
             store=store,
             mode=args.mode,
             progress_callback=_progress_callback(not args.no_progress),
+            resume_run_id=args.resume,
         )
         _print_json(summary.to_dict())
         return 0
@@ -143,6 +147,7 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
             store=store,
             mode=args.mode,
             progress_callback=_progress_callback(not args.no_progress),
+            resume_run_id=args.resume,
         )
         _print_json(
             {
@@ -204,11 +209,13 @@ def _cmd_validate(args: argparse.Namespace) -> int:
             run_id=run_id,
             repo_root=args.repo_root,
             progress_callback=progress_cb,
+            resume_run_id=args.resume,
         )
         _print_json(
             {
                 "run_id": run_id,
                 "validated": decisions.get("VALIDATED", 0),
+                "confirmed_analysis": decisions.get("CONFIRMED_ANALYSIS_FINDING", 0),
                 "dropped": decisions.get("DROPPED", 0),
                 "needs_human_setup": decisions.get("NEEDS_HUMAN_SETUP", 0),
                 "bundle_ids": [b.bundle_id for b in bundles],
@@ -244,6 +251,8 @@ def _cmd_list(args: argparse.Namespace) -> int:
         _print_json([c.to_dict() for c in store.load_candidates()])
     elif args.kind == "bundles":
         _print_json(store.list_bundle_ids())
+    elif args.kind == "resumes":
+        _print_json(store.list_resume_metadata())
     else:
         _print_json(store.list_run_ids())
     return 0

@@ -22,6 +22,9 @@ class _WebState(TypedDict, total=False):
     seen: list[str]
     visited: list[str]
     found: dict[str, list[str]]
+    pages: list[dict[str, Any]]
+    requests: list[dict[str, Any]]
+    errors: list[str]
     steps: int
     current_url: str
     current_path: str
@@ -101,6 +104,22 @@ def _extract_json_object(text: str) -> dict[str, Any] | None:
     except json.JSONDecodeError:
         return None
     return parsed if isinstance(parsed, dict) else None
+
+
+async def _safe_dismiss_dialog(dialog: Any) -> None:
+    try:
+        await dialog.dismiss()
+    except Exception:
+        # Some targets open dialogs while the page is already tearing down.
+        return
+
+
+def _install_dialog_guards(context: Any, page: Any) -> None:
+    def _wire_dialog_handler(target_page: Any) -> None:
+        target_page.on("dialog", lambda dialog: asyncio.create_task(_safe_dismiss_dialog(dialog)))
+
+    _wire_dialog_handler(page)
+    context.on("page", _wire_dialog_handler)
 
 
 def _build_llm(config: PadvConfig):
@@ -213,7 +232,7 @@ async def _llm_select_login_selectors(config: PadvConfig, form_meta: Any) -> tup
     return username_selector, password_selector, submit_selector
 
 
-async def _extract_page_observations(page: Any) -> tuple[list[str], list[str], str]:
+async def _extract_page_observations(page: Any) -> dict[str, Any]:
     result = await page.evaluate(
         """
         () => {
@@ -244,24 +263,83 @@ async def _extract_page_observations(page: Any) -> tuple[list[str], list[str], s
 
           const title = document.title || '';
           const h1 = Array.from(document.querySelectorAll('h1, h2')).map(x => (x.textContent || '').trim()).filter(Boolean).slice(0, 6);
+          const forms = [];
+          for (const f of document.querySelectorAll('form')) {
+            const inputs = [];
+            for (const i of f.querySelectorAll('input,select,textarea')) {
+              inputs.push({
+                name: i.getAttribute('name') || '',
+                id: i.id || '',
+                type: i.getAttribute('type') || i.tagName.toLowerCase(),
+                required: i.hasAttribute('required'),
+              });
+            }
+            forms.push({
+              action: f.getAttribute('action') || '',
+              method: (f.getAttribute('method') || 'get').toLowerCase(),
+              inputs,
+            });
+          }
           return {
             urls,
             params,
             summary: `${title}\n${h1.join(' | ')}`.trim(),
+            title,
+            headings: h1,
+            forms,
           };
         }
         """
     )
 
     if not isinstance(result, dict):
-        return [], [], ""
+        return {"urls": [], "params": [], "summary": "", "title": "", "headings": [], "forms": []}
     urls = [str(x).strip() for x in result.get("urls", []) if isinstance(x, str) and x.strip()]
     params = [str(x).strip() for x in result.get("params", []) if isinstance(x, str) and x.strip()]
+    headings = [str(x).strip() for x in result.get("headings", []) if isinstance(x, str) and x.strip()]
+    forms: list[dict[str, Any]] = []
+    for item in result.get("forms", []):
+        if not isinstance(item, dict):
+            continue
+        action = str(item.get("action", "")).strip()
+        method = str(item.get("method", "get")).strip().lower() or "get"
+        inputs: list[dict[str, Any]] = []
+        for raw in item.get("inputs", []):
+            if not isinstance(raw, dict):
+                continue
+            inputs.append(
+                {
+                    "name": str(raw.get("name", "")).strip(),
+                    "id": str(raw.get("id", "")).strip(),
+                    "type": str(raw.get("type", "")).strip().lower(),
+                    "required": bool(raw.get("required", False)),
+                }
+            )
+        forms.append({"action": action, "method": method, "inputs": inputs})
     summary = str(result.get("summary", "")).strip()
-    return urls, params, summary
+    return {
+        "urls": urls,
+        "params": params,
+        "summary": summary,
+        "title": str(result.get("title", "")).strip(),
+        "headings": headings,
+        "forms": forms,
+    }
 
 
-async def _discover_with_playwright_async(config: PadvConfig, seed_urls: list[str] | None = None) -> dict[str, list[str]]:
+def _cookie_origin_fields(base_url: str) -> tuple[str, str, bool]:
+    parsed = urllib.parse.urlsplit(base_url)
+    scheme = parsed.scheme or "http"
+    host = parsed.hostname or ""
+    secure = scheme == "https"
+    return scheme, host, secure
+
+
+async def _discover_with_playwright_async(
+    config: PadvConfig,
+    seed_urls: list[str] | None = None,
+    auth_state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     from langgraph.graph import END, START, StateGraph  # type: ignore[import-not-found]
     from playwright.async_api import async_playwright  # type: ignore[import-not-found]
 
@@ -279,12 +357,53 @@ async def _discover_with_playwright_async(config: PadvConfig, seed_urls: list[st
         initial_queue.append(normalized)
 
     if not initial_queue:
-        return {}
+        return {"hints": {}, "artifacts": {"seed_urls": [], "visited_urls": [], "pages": [], "requests": [], "errors": []}}
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(headless=config.web.headless)
         context = await browser.new_context(ignore_https_errors=True)
+        cookie_map = auth_state.get("cookies", {}) if isinstance(auth_state, dict) else {}
+        if isinstance(cookie_map, dict) and cookie_map:
+            scheme, host, secure = _cookie_origin_fields(base_url)
+            cookies_payload = [
+                {
+                    "name": str(name),
+                    "value": str(value),
+                    "domain": host,
+                    "path": "/",
+                    "httpOnly": False,
+                    "secure": secure,
+                    "sameSite": "Lax",
+                    "url": f"{scheme}://{host}/",
+                }
+                for name, value in cookie_map.items()
+                if str(name).strip()
+            ]
+            if cookies_payload:
+                await context.add_cookies(cookies_payload)
         page = await context.new_page()
+        _install_dialog_guards(context, page)
+        requests: list[dict[str, Any]] = []
+
+        def _record_request(request: Any) -> None:
+            try:
+                candidate = _canonicalize_url(request.url, base_url=base_url)
+                if not candidate:
+                    return
+                path, params = _normalize_path(candidate)
+                requests.append(
+                    {
+                        "url": candidate,
+                        "path": path,
+                        "method": str(getattr(request, "method", "") or "").upper(),
+                        "resource_type": str(getattr(request, "resource_type", "") or ""),
+                        "params": params,
+                    }
+                )
+            except Exception:
+                return
+
+        page.on("request", _record_request)
 
         timeout_ms = max(1, int(config.web.request_timeout_seconds)) * 1000
 
@@ -293,6 +412,8 @@ async def _discover_with_playwright_async(config: PadvConfig, seed_urls: list[st
             seen = list(state.get("seen", []))
             visited = list(state.get("visited", []))
             found = dict(state.get("found", {}))
+            pages = list(state.get("pages", []))
+            errors = list(state.get("errors", []))
             steps = int(state.get("steps", 0))
 
             current = ""
@@ -309,6 +430,9 @@ async def _discover_with_playwright_async(config: PadvConfig, seed_urls: list[st
                     "seen": seen,
                     "visited": visited,
                     "found": found,
+                    "pages": pages,
+                    "requests": list(requests),
+                    "errors": errors,
                     "steps": steps,
                     "current_url": "",
                     "current_path": "",
@@ -329,7 +453,9 @@ async def _discover_with_playwright_async(config: PadvConfig, seed_urls: list[st
                 current_path, query_params = _normalize_path(canonical_current)
                 found = _add_found(found, current_path, query_params)
 
-                raw_urls, raw_params, _summary = await _extract_page_observations(page)
+                observation = await _extract_page_observations(page)
+                raw_urls = list(observation.get("urls", []))
+                raw_params = list(observation.get("params", []))
                 candidate_params = raw_params
                 found = _add_found(found, current_path, raw_params)
 
@@ -346,8 +472,20 @@ async def _discover_with_playwright_async(config: PadvConfig, seed_urls: list[st
                         break
                     seen.append(url)
                     queue.append(url)
+                pages.append(
+                    {
+                        "url": canonical_current,
+                        "path": current_path,
+                        "summary": str(observation.get("summary", "")).strip(),
+                        "title": str(observation.get("title", "")).strip(),
+                        "headings": list(observation.get("headings", []))[:12],
+                        "params": raw_params[:64],
+                        "candidate_urls": candidate_urls[:24],
+                        "forms": list(observation.get("forms", []))[:12],
+                    }
+                )
             except Exception:
-                pass
+                errors.append(f"navigation_failed:{current}")
 
             if canonical_current not in visited:
                 visited.append(canonical_current)
@@ -357,6 +495,9 @@ async def _discover_with_playwright_async(config: PadvConfig, seed_urls: list[st
                 "seen": seen,
                 "visited": visited,
                 "found": found,
+                "pages": pages,
+                "requests": list(requests),
+                "errors": errors,
                 "steps": steps,
                 "current_url": canonical_current,
                 "current_path": current_path,
@@ -405,6 +546,9 @@ async def _discover_with_playwright_async(config: PadvConfig, seed_urls: list[st
                 "seen": seen,
                 "visited": visited,
                 "found": found,
+                "pages": list(state.get("pages", [])),
+                "requests": list(requests),
+                "errors": list(state.get("errors", [])),
             }
 
         def _route_continue(state: _WebState) -> str:
@@ -433,6 +577,9 @@ async def _discover_with_playwright_async(config: PadvConfig, seed_urls: list[st
                 "seen": initial_seen,
                 "visited": [],
                 "found": {},
+                "pages": [],
+                "requests": [],
+                "errors": [],
                 "steps": 0,
             }
         )
@@ -442,7 +589,7 @@ async def _discover_with_playwright_async(config: PadvConfig, seed_urls: list[st
 
     found = result.get("found") if isinstance(result, dict) else None
     if not isinstance(found, dict):
-        return {}
+        return {"hints": {}, "artifacts": {"seed_urls": initial_queue, "visited_urls": [], "pages": [], "requests": [], "errors": []}}
     normalized_found: dict[str, list[str]] = {}
     for path, params in found.items():
         if not isinstance(path, str):
@@ -451,7 +598,18 @@ async def _discover_with_playwright_async(config: PadvConfig, seed_urls: list[st
             normalized_found[path] = sorted({str(x).strip() for x in params if str(x).strip()})
         else:
             normalized_found[path] = []
-    return normalized_found
+    pages = result.get("pages", []) if isinstance(result, dict) else []
+    requests_payload = result.get("requests", []) if isinstance(result, dict) else []
+    errors = result.get("errors", []) if isinstance(result, dict) else []
+    visited_urls = result.get("visited", []) if isinstance(result, dict) else []
+    artifacts = {
+        "seed_urls": initial_queue,
+        "visited_urls": [str(x).strip() for x in visited_urls if isinstance(x, str) and str(x).strip()],
+        "pages": [item for item in pages if isinstance(item, dict)],
+        "requests": [item for item in requests_payload if isinstance(item, dict)][:200],
+        "errors": [str(x).strip() for x in errors if isinstance(x, str) and str(x).strip()],
+    }
+    return {"hints": normalized_found, "artifacts": artifacts}
 
 
 async def _extract_cookies_from_playwright_context(context: Any) -> dict[str, str]:
@@ -495,6 +653,7 @@ async def _auth_with_playwright_async(config: PadvConfig) -> dict[str, Any]:
         browser = await pw.chromium.launch(headless=config.web.headless)
         context = await browser.new_context(ignore_https_errors=True)
         page = await context.new_page()
+        _install_dialog_guards(context, page)
 
         await page.goto(config.auth.login_url, wait_until="domcontentloaded", timeout=timeout_ms)
 
@@ -608,7 +767,33 @@ def _run_async(coro_factory: Callable[[], Awaitable[Any]]) -> Any:
 
 def discover_web_hints(config: PadvConfig, seed_urls: list[str] | None = None) -> tuple[dict[str, list[str]], str | None]:
     try:
-        return _run_async(lambda: _discover_with_playwright_async(config, seed_urls=seed_urls)), None
+        payload = _run_async(lambda: _discover_with_playwright_async(config, seed_urls=seed_urls))
+        if not isinstance(payload, dict):
+            return {}, None
+        if payload and all(isinstance(k, str) and isinstance(v, list) for k, v in payload.items()):
+            return payload, None
+        hints = payload.get("hints", {})
+        return hints if isinstance(hints, dict) else {}, None
+    except Exception as exc:
+        raise RuntimeError(f"playwright_discovery_error:{exc}") from exc
+
+
+def discover_web_inventory(
+    config: PadvConfig,
+    seed_urls: list[str] | None = None,
+    auth_state: dict[str, Any] | None = None,
+) -> tuple[dict[str, list[str]], dict[str, Any], str | None]:
+    try:
+        payload = _run_async(lambda: _discover_with_playwright_async(config, seed_urls=seed_urls, auth_state=auth_state))
+        if not isinstance(payload, dict):
+            return {}, {"seed_urls": list(seed_urls or []), "visited_urls": [], "pages": [], "requests": [], "errors": []}, None
+        if payload and all(isinstance(k, str) and isinstance(v, list) for k, v in payload.items()):
+            return payload, {"seed_urls": list(seed_urls or []), "visited_urls": [], "pages": [], "requests": [], "errors": []}, None
+        hints = payload.get("hints", {})
+        artifacts = payload.get("artifacts", {})
+        normalized_hints = hints if isinstance(hints, dict) else {}
+        normalized_artifacts = artifacts if isinstance(artifacts, dict) else {}
+        return normalized_hints, normalized_artifacts, None
     except Exception as exc:
         raise RuntimeError(f"playwright_discovery_error:{exc}") from exc
 

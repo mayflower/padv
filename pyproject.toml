@@ -7,10 +7,22 @@ name = "padv"
 version = "0.1.0"
 description = "PHP Agentic Discovery and Validation CLI"
 readme = "README.md"
+license = {text = "MIT"}
 requires-python = ">=3.11"
-authors = [{ name = "haxor" }]
+authors = [{ name = "Mayflower GmbH" }]
+keywords = ["php", "security", "vulnerability", "discovery", "validation", "static-analysis"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Information Technology",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Security",
+]
 dependencies = [
   "langgraph>=1.0.0",
+  "langgraph-checkpoint-sqlite>=3.0.0",
   "deepagents>=0.0.7",
   "langchain-core>=1.0.0",
   "langchain-anthropic>=1.0.0",
@@ -19,18 +31,28 @@ dependencies = [
   "playwright>=1.55.0",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest", "pytest-cov"]
+
 [project.scripts]
 padv = "padv.cli.main:main"
+
+[project.urls]
+Repository = "https://github.com/mayflower/padv"
+Issues = "https://github.com/mayflower/padv/issues"
 
 [tool.setuptools]
 packages = [
   "padv",
+  "padv.analytics",
   "padv.cli",
   "padv.config",
   "padv.orchestrator",
   "padv.agents",
   "padv.discovery",
+  "padv.static",
   "padv.static.joern",
+  "padv.dynamic",
   "padv.dynamic.http",
   "padv.dynamic.sandbox",
   "padv.oracle",
@@ -38,7 +60,9 @@ packages = [
   "padv.store",
   "padv.eval",
   "padv.logging",
+  "padv.validation",
 ]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
+markers = ["integration: requires external services (Joern, SCIP, Morcilla, LLM API)"]

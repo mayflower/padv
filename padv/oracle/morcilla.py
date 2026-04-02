@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from padv.config.schema import OracleConfig
-from padv.models import RuntimeCall, RuntimeEvidence
+from padv.models import OracleEvidence, RuntimeCall, RuntimeEvidence
 
 
 class OracleParseError(ValueError):
@@ -153,4 +153,19 @@ def sanitized_runtime_evidence(evidence: RuntimeEvidence) -> RuntimeEvidence:
         location=evidence.location,
         analysis_flags=list(evidence.analysis_flags),
         aux=dict(evidence.aux),
+        oracle_evidence=[
+            OracleEvidence(
+                correlation_id=item.correlation_id,
+                function=item.function,
+                file=item.file,
+                line=item.line,
+                full_args=list(item.full_args),
+                display_args=list(item.display_args),
+                matched_canary=bool(item.matched_canary),
+            )
+            for item in evidence.oracle_evidence
+        ],
+        request_evidence=evidence.request_evidence,
+        response_evidence=evidence.response_evidence,
+        witness_evidence=evidence.witness_evidence,
     )

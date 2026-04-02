@@ -9,7 +9,7 @@ from .scip import (
     discover_scip_candidates_safe_with_meta,
     discover_scip_candidates_with_meta,
 )
-from .web import discover_web_hints, establish_auth_state
+from .web import discover_web_hints, discover_web_inventory, establish_auth_state
 
 __all__ = [
     "ScipExecutionError",
@@ -19,6 +19,7 @@ __all__ = [
     "discover_scip_candidates_safe",
     "discover_scip_candidates_safe_with_meta",
     "discover_web_hints",
+    "discover_web_inventory",
     "establish_auth_state",
     "FusionMeta",
     "fuse_candidates",

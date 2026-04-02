@@ -7,3 +7,11 @@ __pycache__
 .venv
 venv
 .DS_Store
+.env
+playwright-report
+test-results
+targets/*
+!targets/mutillidae/
+!targets/mutillidae/**
+!targets/mutillidae-docker/
+!targets/mutillidae-docker/**

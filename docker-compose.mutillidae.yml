@@ -1,0 +1,47 @@
+services:
+  database:
+    build:
+      context: ./targets/mutillidae-docker/.build/database
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: mutillidae
+      MYSQL_DATABASE: mutillidae
+      MYSQL_ROOT_HOST: "%"
+    healthcheck:
+      test: ["CMD-SHELL", "mariadb-admin ping -h 127.0.0.1 -uroot -pmutillidae --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    volumes:
+      - mutillidae-db-data:/var/lib/mysql
+
+  directory:
+    build:
+      context: ./targets/mutillidae-docker/.build/ldap
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    volumes:
+      - mutillidae-ldap-data:/var/lib/ldap
+      - mutillidae-ldap-config:/etc/ldap/slapd.d
+      - ./targets/mutillidae-docker/.build/ldap/configuration/ldif:/seed-ldif:ro
+
+  www:
+    build:
+      context: .
+      dockerfile: docker/mutillidae/www-morcilla.Dockerfile
+    restart: unless-stopped
+    depends_on:
+      database:
+        condition: service_healthy
+      directory:
+        condition: service_started
+    ports:
+      - "18080:80"
+      - "18443:443"
+
+volumes:
+  mutillidae-db-data:
+  mutillidae-ldap-data:
+  mutillidae-ldap-config:

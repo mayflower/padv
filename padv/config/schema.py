@@ -101,9 +101,14 @@ class AgentConfig:
     hard_fail: bool
     require_langgraph: bool
     max_iterations: int
+    max_agent_turns: int
     improvement_patience: int
     skeptic_rounds: int
     thread_prefix: str
+    checkpoint_dir: str
+    max_parallel_research: int
+    max_parallel_skeptic: int
+    max_parallel_experiments: int
 
 
 @dataclass(slots=True)
@@ -335,9 +340,14 @@ def load_config(path: str | Path) -> PadvConfig:
             "hard_fail",
             "require_langgraph",
             "max_iterations",
+            "max_agent_turns",
             "improvement_patience",
             "skeptic_rounds",
             "thread_prefix",
+            "checkpoint_dir",
+            "max_parallel_research",
+            "max_parallel_skeptic",
+            "max_parallel_experiments",
         },
     )
     _reject_unknown_keys(
@@ -466,9 +476,14 @@ def load_config(path: str | Path) -> PadvConfig:
             hard_fail=agent_hard_fail,
             require_langgraph=agent_require_langgraph,
             max_iterations=_get_int(agent, "max_iterations", min_value=1),
+            max_agent_turns=_get_optional_int(agent, "max_agent_turns", 3, min_value=1),
             improvement_patience=_get_int(agent, "improvement_patience", min_value=0),
             skeptic_rounds=_get_int(agent, "skeptic_rounds", min_value=0),
             thread_prefix=_get_str(agent, "thread_prefix"),
+            checkpoint_dir=_get_optional_str(agent, "checkpoint_dir", ""),
+            max_parallel_research=_get_optional_int(agent, "max_parallel_research", 3, min_value=1),
+            max_parallel_skeptic=_get_optional_int(agent, "max_parallel_skeptic", 3, min_value=1),
+            max_parallel_experiments=_get_optional_int(agent, "max_parallel_experiments", 3, min_value=1),
         ),
         scip=ScipConfig(
             enabled=scip_enabled,

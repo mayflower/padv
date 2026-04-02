@@ -3,3 +3,12 @@ __pycache__/
 .pytest_cache/
 .venv/
 .padv/
+targets/
+.env
+*.egg-info/
+.DS_Store
+prompts/
+CLAUDE.md
+AGENTS.md
+coverage.xml
+test-results.xml

@@ -1,0 +1,110 @@
+[
+  {
+    "gap_id": "mut-001",
+    "category": "sql_injection",
+    "documented_source": ["targets/mutillidae/src/set-up-database.php", "targets/mutillidae/src/user-poll.php"],
+    "expected_channels": ["source", "joern/scip", "web", "runtime"],
+    "runtime_validatable": true,
+    "minimum_evidence_expectation": "semantic SQL sink plus runtime boolean/time/error differential witness",
+    "target_expectation": "must_find"
+  },
+  {
+    "gap_id": "mut-002",
+    "category": "cross_site_scripting",
+    "documented_source": ["targets/mutillidae/src/set-up-database.php", "targets/mutillidae/src/index.php"],
+    "expected_channels": ["source", "joern/scip", "web", "runtime"],
+    "runtime_validatable": true,
+    "minimum_evidence_expectation": "HTML/DOM output sink plus browser or response witness for reflected or stored XSS",
+    "target_expectation": "must_find"
+  },
+  {
+    "gap_id": "mut-003",
+    "category": "command_injection",
+    "documented_source": ["targets/mutillidae/src/dns-lookup.php", "targets/mutillidae/src/echo.php"],
+    "expected_channels": ["source", "joern/scip", "web", "runtime"],
+    "runtime_validatable": true,
+    "minimum_evidence_expectation": "OS command sink plus runtime differential witness showing injected shell effect",
+    "target_expectation": "must_find"
+  },
+  {
+    "gap_id": "mut-004",
+    "category": "authn_authz_failures",
+    "documented_source": ["targets/mutillidae/src/authorization-required.php", "targets/mutillidae/src/privilege-escalation.php", "targets/mutillidae/src/login.php"],
+    "expected_channels": ["source", "joern/scip", "web", "runtime"],
+    "runtime_validatable": true,
+    "minimum_evidence_expectation": "stateful access-control differential or authentication bypass witness",
+    "target_expectation": "must_find"
+  },
+  {
+    "gap_id": "mut-005",
+    "category": "session_misuse",
+    "documented_source": ["targets/mutillidae/src/index.php", "targets/mutillidae/src/set-up-database.php"],
+    "expected_channels": ["source", "joern/scip", "web", "runtime"],
+    "runtime_validatable": true,
+    "minimum_evidence_expectation": "session fixation or cookie abuse witness across authenticated state transitions",
+    "target_expectation": "should_find"
+  },
+  {
+    "gap_id": "mut-006",
+    "category": "csrf",
+    "documented_source": ["targets/mutillidae/src/set-up-database.php", "targets/mutillidae/src/register.php", "targets/mutillidae/src/user-poll.php"],
+    "expected_channels": ["source", "joern/scip", "web", "runtime"],
+    "runtime_validatable": true,
+    "minimum_evidence_expectation": "state-changing workflow without effective CSRF token validation under insecure level",
+    "target_expectation": "must_find"
+  },
+  {
+    "gap_id": "mut-007",
+    "category": "file_inclusion_path_traversal",
+    "documented_source": ["targets/mutillidae/src/arbitrary-file-inclusion.php", "targets/mutillidae/src/set-up-database.php"],
+    "expected_channels": ["source", "joern/scip", "web", "runtime"],
+    "runtime_validatable": true,
+    "minimum_evidence_expectation": "include or file-read sink plus local/remote inclusion witness",
+    "target_expectation": "must_find"
+  },
+  {
+    "gap_id": "mut-008",
+    "category": "ldap_injection",
+    "documented_source": ["targets/mutillidae/src/conference-room-lookup.php", "targets/mutillidae/src/set-up-database.php"],
+    "expected_channels": ["source", "joern/scip", "web", "runtime"],
+    "runtime_validatable": true,
+    "minimum_evidence_expectation": "LDAP query construction flaw plus differential LDAP result witness",
+    "target_expectation": "must_find"
+  },
+  {
+    "gap_id": "mut-009",
+    "category": "xxe_xml_injection",
+    "documented_source": ["targets/mutillidae/src/xml-validator.php", "targets/mutillidae/src/set-up-database.php"],
+    "expected_channels": ["source", "joern/scip", "web", "runtime"],
+    "runtime_validatable": true,
+    "minimum_evidence_expectation": "XML parser sink plus XXE or XML entity expansion witness",
+    "target_expectation": "must_find"
+  },
+  {
+    "gap_id": "mut-010",
+    "category": "unrestricted_file_upload",
+    "documented_source": ["targets/mutillidae/src/upload-file.php", "targets/mutillidae/src/set-up-database.php"],
+    "expected_channels": ["source", "joern/scip", "web", "runtime"],
+    "runtime_validatable": true,
+    "minimum_evidence_expectation": "upload endpoint plus runtime acceptance of dangerous file type or upload path control",
+    "target_expectation": "must_find"
+  },
+  {
+    "gap_id": "mut-011",
+    "category": "open_redirect_header_cookie_manipulation",
+    "documented_source": ["targets/mutillidae/src/set-up-database.php", "targets/mutillidae/src/redirectandlog.php", "targets/mutillidae/src/index.php"],
+    "expected_channels": ["source", "joern/scip", "web", "runtime"],
+    "runtime_validatable": true,
+    "minimum_evidence_expectation": "redirect/header/cookie misuse evidenced by runtime response or state manipulation",
+    "target_expectation": "should_find"
+  },
+  {
+    "gap_id": "mut-012",
+    "category": "information_disclosure_misconfiguration",
+    "documented_source": ["targets/mutillidae/src/php-errors.php", "targets/mutillidae/src/phpinfo.php", "targets/mutillidae/src/set-up-database.php"],
+    "expected_channels": ["source", "joern/scip", "web", "runtime"],
+    "runtime_validatable": true,
+    "minimum_evidence_expectation": "page or configuration leak witness exposing stack, path, or sensitive configuration data",
+    "target_expectation": "must_find"
+  }
+]

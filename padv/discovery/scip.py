@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shlex
 import shutil
@@ -12,6 +13,7 @@ from tempfile import TemporaryDirectory
 from time import time
 
 from padv.config.schema import PadvConfig
+from padv.discovery.budgeting import select_fair_share
 from padv.models import Candidate, StaticEvidence
 from padv.path_scope import is_app_candidate_path, normalize_repo_path
 from padv.static.joern.query_sets import VULN_CLASS_SPECS, VulnClassSpec
@@ -64,6 +66,78 @@ def _collect_created_scip_files(base_dir: Path, started_at: float) -> list[Path]
         except OSError:
             continue
     return sorted(files)
+
+
+def _iter_repo_entries(repo_root: Path) -> list[Path]:
+    ignored = {
+        ".git",
+        ".hg",
+        ".svn",
+        ".idea",
+        ".vscode",
+        "node_modules",
+        "__pycache__",
+    }
+    entries: list[Path] = []
+    for child in sorted(repo_root.iterdir(), key=lambda path: path.name):
+        if child.name in ignored:
+            continue
+        entries.append(child)
+    return entries
+
+
+def _symlink_or_copy(source: Path, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        if source.is_dir():
+            os.symlink(source, target, target_is_directory=True)
+        else:
+            os.symlink(source, target)
+    except OSError:
+        if source.is_dir():
+            shutil.copytree(source, target, dirs_exist_ok=True)
+        else:
+            shutil.copy2(source, target)
+
+
+def _write_synthetic_composer_json(workspace_root: Path) -> None:
+    payload = {
+        "name": "padv/scip-workspace",
+        "type": "project",
+        "require": {},
+        "autoload": {"classmap": ["."]},
+        "config": {"sort-packages": True, "optimize-autoloader": True},
+    }
+    (workspace_root / "composer.json").write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+
+def _composer_bootstrap_command() -> str:
+    return (
+        "composer install --no-interaction --no-progress --no-scripts "
+        "--prefer-dist --ignore-platform-reqs"
+    )
+
+
+def _build_scip_workspace(repo_root: Path, workspace_root: Path, config: PadvConfig) -> Path:
+    workspace_root.mkdir(parents=True, exist_ok=True)
+    for entry in _iter_repo_entries(repo_root):
+        if entry.name == "vendor":
+            continue
+        _symlink_or_copy(entry, workspace_root / entry.name)
+
+    composer_json = workspace_root / "composer.json"
+    if not composer_json.exists():
+        _write_synthetic_composer_json(workspace_root)
+
+    vendor_autoload = workspace_root / "vendor" / "autoload.php"
+    if not vendor_autoload.exists():
+        proc = _run_command(_composer_bootstrap_command(), workspace_root, config.scip.timeout_seconds)
+        if proc.returncode != 0:
+            stderr = (proc.stderr or "").strip()
+            stdout = (proc.stdout or "").strip()
+            msg = stderr or stdout or "composer bootstrap failed"
+            raise ScipExecutionError(f"scip workspace bootstrap failed ({proc.returncode}): {msg}")
+    return workspace_root
 
 
 def _run_command(cmd: str, cwd: Path, timeout_seconds: int) -> subprocess.CompletedProcess[str]:
@@ -272,71 +346,81 @@ def discover_scip_candidates_with_meta(
         artifact_root = root / artifact_root
     artifact_root.mkdir(parents=True, exist_ok=True)
 
-    artifact_refs: list[str] = []
-    scip_file = _run_scip_generate(root, config, artifact_root)
-    artifact_refs.append(str(scip_file))
+    with TemporaryDirectory(prefix="padv-scip-") as temp_dir:
+        workspace_root = _build_scip_workspace(root, Path(temp_dir) / "workspace", config)
 
-    print_stdout = _run_scip_print(scip_file, config, root)
-    hits, hit_meta = _extract_hits_with_meta(print_stdout)
+        artifact_refs: list[str] = []
+        scip_file = _run_scip_generate(workspace_root, config, artifact_root)
+        artifact_refs.append(str(scip_file))
 
-    candidates: list[Candidate] = []
-    evidence: list[StaticEvidence] = []
-    app_scoped_sinks = 0
-    dropped_non_app_sinks = 0
-    for idx, hit in enumerate(hits, start=1):
-        spec = _SPEC_BY_CLASS.get(hit.vuln_class)
-        if spec is None:
-            continue
-        rel_path = normalize_repo_path(hit.file_path, repo_root=root)
-        if not rel_path or not is_app_candidate_path(rel_path):
-            dropped_non_app_sinks += 1
-            continue
-        app_scoped_sinks += 1
-        if len(candidates) >= config.budgets.max_candidates:
-            continue
+        print_stdout = _run_scip_print(scip_file, config, workspace_root)
+        hits, hit_meta = _extract_hits_with_meta(print_stdout)
 
-        candidate_id = f"scip-{idx:05d}"
-        evidence_id = f"scip::{hit.vuln_class}:{rel_path}:{hit.line}"
-        snippet = hit.symbol[:240]
-        candidates.append(
-            Candidate(
-                candidate_id=candidate_id,
-                vuln_class=spec.vuln_class,
-                title=f"{spec.owasp_id} {spec.description}",
-                file_path=rel_path,
-                line=hit.line,
-                sink=hit.symbol or "scip-symbol",
-                expected_intercepts=list(spec.intercepts),
-                entrypoint_hint=None,
-                preconditions=_preconditions_for_spec(spec, config),
-                notes="scip semantic detector",
-                provenance=["scip"],
-                evidence_refs=[evidence_id],
-                confidence=0.55,
-                auth_requirements=(["login"] if config.auth.enabled else []),
-                web_path_hints=[],
-            )
-        )
-        evidence.append(
-            StaticEvidence(
-                candidate_id=candidate_id,
-                query_profile=config.joern.query_profile,
-                query_id=f"scip::{spec.vuln_class}",
-                file_path=rel_path,
-                line=hit.line,
-                snippet=snippet,
-                hash=_hash_for(rel_path, hit.line, snippet),
-            )
+        candidates: list[Candidate] = []
+        evidence: list[StaticEvidence] = []
+        app_scoped_sinks = 0
+        dropped_non_app_sinks = 0
+        eligible_hits: list[tuple[ScipSymbolHit, VulnClassSpec, str]] = []
+        for hit in hits:
+            spec = _SPEC_BY_CLASS.get(hit.vuln_class)
+            if spec is None:
+                continue
+            rel_path = normalize_repo_path(hit.file_path, repo_root=root)
+            if not rel_path or not is_app_candidate_path(rel_path):
+                dropped_non_app_sinks += 1
+                continue
+            app_scoped_sinks += 1
+            eligible_hits.append((hit, spec, rel_path))
+
+        selected_hits = select_fair_share(
+            eligible_hits,
+            key_fn=lambda item: item[0].vuln_class,
+            limit=config.budgets.max_candidates,
         )
 
-    meta = ScipDiscoveryMeta(
-        raw_scip_hits=hit_meta.raw_scip_hits,
-        mapped_scip_sinks=hit_meta.mapped_scip_sinks,
-        app_scoped_sinks=app_scoped_sinks,
-        dropped_non_app_sinks=dropped_non_app_sinks,
-        candidate_count=len(candidates),
-    )
-    return candidates, evidence, artifact_refs, meta
+        for idx, (hit, spec, rel_path) in enumerate(selected_hits, start=1):
+            candidate_id = f"scip-{idx:05d}"
+            evidence_id = f"scip::{hit.vuln_class}:{rel_path}:{hit.line}"
+            snippet = hit.symbol[:240]
+            candidates.append(
+                Candidate(
+                    candidate_id=candidate_id,
+                    vuln_class=spec.vuln_class,
+                    title=f"{spec.owasp_id} {spec.description}",
+                    file_path=rel_path,
+                    line=hit.line,
+                    sink=hit.symbol or "scip-symbol",
+                    expected_intercepts=list(spec.intercepts),
+                    entrypoint_hint=None,
+                    preconditions=_preconditions_for_spec(spec, config),
+                    notes="scip semantic detector",
+                    provenance=["scip"],
+                    evidence_refs=[evidence_id],
+                    confidence=0.55,
+                    auth_requirements=(["login"] if config.auth.enabled else []),
+                    web_path_hints=[],
+                )
+            )
+            evidence.append(
+                StaticEvidence(
+                    candidate_id=candidate_id,
+                    query_profile=config.joern.query_profile,
+                    query_id=f"scip::{spec.vuln_class}",
+                    file_path=rel_path,
+                    line=hit.line,
+                    snippet=snippet,
+                    hash=_hash_for(rel_path, hit.line, snippet),
+                )
+            )
+
+        meta = ScipDiscoveryMeta(
+            raw_scip_hits=hit_meta.raw_scip_hits,
+            mapped_scip_sinks=hit_meta.mapped_scip_sinks,
+            app_scoped_sinks=app_scoped_sinks,
+            dropped_non_app_sinks=dropped_non_app_sinks,
+            candidate_count=len(candidates),
+        )
+        return candidates, evidence, artifact_refs, meta
 
 
 def discover_scip_candidates(
