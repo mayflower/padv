@@ -3,6 +3,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 
+_FOPEN_SINK = "fopen("
+
+
 @dataclass(frozen=True, slots=True)
 class VulnClassSpec:
     vuln_class: str
@@ -82,7 +85,7 @@ VULN_CLASS_SPECS: tuple[VulnClassSpec, ...] = (
         sink_patterns=(
             "file_put_contents",
             "file_get_contents",
-            "fopen(",
+            _FOPEN_SINK,
             "include(",
             "include_once(",
             "require(",
@@ -135,7 +138,7 @@ VULN_CLASS_SPECS: tuple[VulnClassSpec, ...] = (
         owasp_id="A10",
         description="Outbound request influence",
         runtime_validatable=True,
-        sink_patterns=("curl_exec", "curl_setopt", "CURLOPT_URL", "file_get_contents(", "fopen(", "fsockopen(", "pfsockopen("),
+        sink_patterns=("curl_exec", "curl_setopt", "CURLOPT_URL", "file_get_contents(", _FOPEN_SINK, "fsockopen(", "pfsockopen("),
         intercepts=("curl_exec", "curl_setopt", "file_get_contents", "fopen", "fsockopen", "pfsockopen"),
     ),
     VulnClassSpec(
@@ -291,7 +294,7 @@ VULN_CLASS_SPECS: tuple[VulnClassSpec, ...] = (
         owasp_id="A10",
         description="Server-side request forgery",
         runtime_validatable=True,
-        sink_patterns=("curl_exec", "curl_setopt", "CURLOPT_URL", "file_get_contents(", "fopen(", "fsockopen(", "pfsockopen("),
+        sink_patterns=("curl_exec", "curl_setopt", "CURLOPT_URL", "file_get_contents(", _FOPEN_SINK, "fsockopen(", "pfsockopen("),
         intercepts=("curl_exec", "curl_setopt", "file_get_contents", "fopen", "fsockopen", "pfsockopen"),
     ),
     VulnClassSpec(

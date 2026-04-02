@@ -19,6 +19,9 @@ from padv.path_scope import is_app_candidate_path, normalize_repo_path
 from padv.static.joern.query_sets import VULN_CLASS_SPECS, VulnClassSpec
 
 
+_RE_NON_ALNUM = r"[^a-z0-9_$]"
+
+
 class ScipExecutionError(RuntimeError):
     pass
 
@@ -200,7 +203,7 @@ def _run_scip_print(scip_file: Path, config: PadvConfig, repo_root: Path) -> str
 def _pattern_candidates(raw: str) -> set[str]:
     candidates = {raw}
     candidates.add(raw.replace(" ", ""))
-    candidates.add(re.sub(r"[^a-z0-9_$]", "", raw))
+    candidates.add(re.sub(_RE_NON_ALNUM, "", raw))
     if "::" in raw:
         candidates.add(raw.split("::", 1)[1])
     if raw.startswith("$_get") or raw.startswith("$_post") or raw.startswith("$_session"):
@@ -213,7 +216,7 @@ def _pattern_candidates(raw: str) -> set[str]:
 def _best_token_score(tokens: set[str], normalized: str, compact_symbol: str) -> int:
     best = -1
     for token in sorted(c for c in tokens if c):
-        compact_token = re.sub(r"[^a-z0-9_$]", "", token)
+        compact_token = re.sub(_RE_NON_ALNUM, "", token)
         is_match = token in normalized
         if not is_match and compact_token:
             is_match = compact_token in compact_symbol or compact_symbol.startswith(compact_token)
@@ -227,7 +230,7 @@ def _best_token_score(tokens: set[str], normalized: str, compact_symbol: str) ->
 
 def _match_vuln_class(symbol: str) -> str | None:
     normalized = symbol.casefold()
-    compact_symbol = re.sub(r"[^a-z0-9_$]", "", normalized)
+    compact_symbol = re.sub(_RE_NON_ALNUM, "", normalized)
     best_class: str | None = None
     best_score = -1
     for spec in VULN_CLASS_SPECS:

@@ -13,6 +13,9 @@ from padv.dynamic.sandbox import adapter as sandbox_adapter
 from padv.orchestrator.pipeline import analyze, export_bundle, run_pipeline, validate_candidates
 from padv.store.evidence_store import EvidenceStore
 
+_HELP_CONFIG_PATH = "Path to TOML config"
+_HELP_NO_PROGRESS = "Disable live step updates on stderr"
+
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="padv", description="PHP Agentic Discovery & Validation CLI")
@@ -20,48 +23,48 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     run = sub.add_parser("run", help="Discovery + detection + validation")
-    run.add_argument("--config", default=None, help="Path to TOML config")
+    run.add_argument("--config", default=None, help=_HELP_CONFIG_PATH)
     run.add_argument("--repo-root", required=True)
     run.add_argument("--mode", default="variant", choices=["variant", "delta", "batch"])
-    run.add_argument("--no-progress", action="store_true", help="Disable live step updates on stderr")
+    run.add_argument("--no-progress", action="store_true", help=_HELP_NO_PROGRESS)
     run.add_argument("--resume", nargs="?", const="latest", default=None, help="Resume an interrupted run by run id or latest compatible run")
 
     analyze_cmd = sub.add_parser("analyze", help="Static discovery/detection only")
-    analyze_cmd.add_argument("--config", default=None, help="Path to TOML config")
+    analyze_cmd.add_argument("--config", default=None, help=_HELP_CONFIG_PATH)
     analyze_cmd.add_argument("--repo-root", required=True)
     analyze_cmd.add_argument("--mode", default="variant", choices=["variant", "delta", "batch"])
-    analyze_cmd.add_argument("--no-progress", action="store_true", help="Disable live step updates on stderr")
+    analyze_cmd.add_argument("--no-progress", action="store_true", help=_HELP_NO_PROGRESS)
     analyze_cmd.add_argument("--resume", nargs="?", const="latest", default=None, help="Resume an interrupted analyze run by run id or latest compatible run")
 
     analyze_failures_cmd = sub.add_parser("analyze-failures", help="Analyze historical failure patterns")
-    analyze_failures_cmd.add_argument("--config", default=None, help="Path to TOML config")
+    analyze_failures_cmd.add_argument("--config", default=None, help=_HELP_CONFIG_PATH)
     analyze_failures_cmd.add_argument("--min-occurrences", type=int, default=3)
     analyze_failures_cmd.add_argument("--format", choices=["json", "table"], default="table")
 
     validate = sub.add_parser("validate", help="Validate selected candidates")
-    validate.add_argument("--config", default=None, help="Path to TOML config")
+    validate.add_argument("--config", default=None, help=_HELP_CONFIG_PATH)
     validate.add_argument("--candidate-id", action="append", dest="candidate_ids", default=[])
     validate.add_argument("--repo-root", default=None)
     validate.add_argument("--mode", default="variant", choices=["variant", "delta", "batch"])
-    validate.add_argument("--no-progress", action="store_true", help="Disable live step updates on stderr")
+    validate.add_argument("--no-progress", action="store_true", help=_HELP_NO_PROGRESS)
     validate.add_argument("--resume", nargs="?", const="latest", default=None, help="Resume an interrupted validate run by run id or latest compatible run")
 
     sandbox = sub.add_parser("sandbox", help="Sandbox helper commands")
-    sandbox.add_argument("--config", default=None, help="Path to TOML config")
+    sandbox.add_argument("--config", default=None, help=_HELP_CONFIG_PATH)
     sandbox.add_argument("action", choices=["deploy", "reset", "status", "logs"])
 
     list_cmd = sub.add_parser("list", help="List artifacts")
-    list_cmd.add_argument("--config", default=None, help="Path to TOML config")
+    list_cmd.add_argument("--config", default=None, help=_HELP_CONFIG_PATH)
     list_cmd.add_argument("kind", choices=["candidates", "bundles", "runs", "resumes"])
 
     show = sub.add_parser("show", help="Show artifact details")
-    show.add_argument("--config", default=None, help="Path to TOML config")
+    show.add_argument("--config", default=None, help=_HELP_CONFIG_PATH)
     show.add_argument("--bundle-id")
     show.add_argument("--run-id")
     show.add_argument("--candidate-id")
 
     export = sub.add_parser("export", help="Export bundle to a file")
-    export.add_argument("--config", default=None, help="Path to TOML config")
+    export.add_argument("--config", default=None, help=_HELP_CONFIG_PATH)
     export.add_argument("--bundle-id", required=True)
     export.add_argument("--output", required=True)
 

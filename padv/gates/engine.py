@@ -396,13 +396,11 @@ def _evaluate_v3v4_legacy(
     config: PadvConfig,
     passed: list[str],
 ) -> GateResult | None:
-    positive_hits = [_run_has_canary_hit(run, intercept_set, canary, config) for run in in_scope_positive_runs]
-    if not all(positive_hits):
+    if not all(_run_has_canary_hit(run, intercept_set, canary, config) for run in in_scope_positive_runs):
         return GateResult("DROPPED", passed, "V3", "canary boundary proof missing")
     passed.append("V3")
 
-    negative_hits = [_run_has_canary_hit(run, intercept_set, canary, config) for run in in_scope_negative_runs]
-    if any(negative_hits):
+    if any(_run_has_canary_hit(run, intercept_set, canary, config) for run in in_scope_negative_runs):
         return GateResult("DROPPED", passed, "V4", "negative control hit canary")
     passed.append("V4")
     return None

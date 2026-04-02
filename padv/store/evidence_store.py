@@ -7,6 +7,8 @@ from typing import Any
 
 from padv.models import Candidate, EvidenceBundle, RunSummary, StaticEvidence
 
+_JSON_GLOB = "*.json"
+
 
 @dataclass(slots=True)
 class EvidenceStore:
@@ -95,7 +97,7 @@ class EvidenceStore:
     def list_bundle_ids(self) -> list[str]:
         if not self.bundles_dir.exists():
             return []
-        return sorted(p.stem for p in self.bundles_dir.glob("*.json"))
+        return sorted(p.stem for p in self.bundles_dir.glob(_JSON_GLOB))
 
     def save_run_summary(self, summary: RunSummary) -> Path:
         self.ensure()
@@ -112,7 +114,7 @@ class EvidenceStore:
     def list_run_ids(self) -> list[str]:
         if not self.runs_dir.exists():
             return []
-        return sorted(p.stem for p in self.runs_dir.glob("*.json"))
+        return sorted(p.stem for p in self.runs_dir.glob(_JSON_GLOB))
 
     def save_frontier_state(self, state: dict[str, Any]) -> Path:
         self.ensure()
@@ -161,7 +163,7 @@ class EvidenceStore:
     def list_resume_ids(self) -> list[str]:
         if not self.resume_dir.exists():
             return []
-        return sorted(p.stem for p in self.resume_dir.glob("*.json"))
+        return sorted(p.stem for p in self.resume_dir.glob(_JSON_GLOB))
 
     def list_resume_metadata(self) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
@@ -171,6 +173,27 @@ class EvidenceStore:
                 out.append(item)
         return out
 
+    @staticmethod
+    def _matches_resume_filters(
+        item: dict[str, Any],
+        *,
+        mode: str | None,
+        run_validation: bool | None,
+        target_signature: str | None,
+        config_signature: str | None,
+    ) -> bool:
+        if str(item.get("status", "")).strip().lower() not in {"open", "failed", "yielded"}:
+            return False
+        if mode is not None and str(item.get("mode", "")).strip() != mode:
+            return False
+        if run_validation is not None and bool(item.get("run_validation")) != bool(run_validation):
+            return False
+        if target_signature is not None and str(item.get("target_signature", "")).strip() != target_signature:
+            return False
+        if config_signature is not None and str(item.get("config_signature", "")).strip() != config_signature:
+            return False
+        return True
+
     def latest_resumable_run(
         self,
         *,
@@ -179,20 +202,16 @@ class EvidenceStore:
         target_signature: str | None = None,
         config_signature: str | None = None,
     ) -> dict[str, Any] | None:
-        items = self.list_resume_metadata()
-        filtered: list[dict[str, Any]] = []
-        for item in items:
-            if str(item.get("status", "")).strip().lower() not in {"open", "failed", "yielded"}:
-                continue
-            if mode is not None and str(item.get("mode", "")).strip() != mode:
-                continue
-            if run_validation is not None and bool(item.get("run_validation")) != bool(run_validation):
-                continue
-            if target_signature is not None and str(item.get("target_signature", "")).strip() != target_signature:
-                continue
-            if config_signature is not None and str(item.get("config_signature", "")).strip() != config_signature:
-                continue
-            filtered.append(item)
+        filtered = [
+            item for item in self.list_resume_metadata()
+            if self._matches_resume_filters(
+                item,
+                mode=mode,
+                run_validation=run_validation,
+                target_signature=target_signature,
+                config_signature=config_signature,
+            )
+        ]
         if not filtered:
             return None
         filtered.sort(key=lambda item: str(item.get("updated_at", "")), reverse=True)

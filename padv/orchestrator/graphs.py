@@ -135,6 +135,7 @@ class GraphState(TypedDict, total=False):
 
 _PROGRESS_CALLBACKS: dict[str, Callable[[dict[str, Any]], None]] = {}
 _AGENT_RUNTIMES: dict[str, Any] = {}
+_SKIPPED_VALIDATE_ONLY = "skipped (validate-only)"
 
 
 def _safe_copy_candidate(candidate: Candidate) -> Candidate:
@@ -208,6 +209,34 @@ def _serialize_runtime_context_items(items: list[Any] | tuple[Any, ...]) -> list
     return [_stable_serialize(item) for item in items]
 
 
+def _collect_serialized_state_fields(state: GraphState) -> dict[str, Any]:
+    """Extract and serialize graph state fields into a runtime context payload."""
+    payload: dict[str, Any] = {}
+    _SERIALIZED_LIST_FIELDS: tuple[tuple[str, str], ...] = (
+        ("objective_queue", "objective_queue"),
+        ("research_findings", "research_findings"),
+        ("hypothesis_board", "hypotheses"),
+        ("refutations", "refutations"),
+        ("experiment_board", "experiment_board"),
+        ("candidates", "candidate_seeds"),
+        ("static_evidence", "static_evidence"),
+        ("witness_bundles", "witness_bundles"),
+    )
+    for state_key, payload_key in _SERIALIZED_LIST_FIELDS:
+        if state_key in state:
+            payload[payload_key] = _serialize_runtime_context_items(list(state.get(state_key, [])))
+
+    _STABLE_SERIALIZE_LIST_FIELDS: tuple[str, ...] = ("gate_history", "runtime_history")
+    for key in _STABLE_SERIALIZE_LIST_FIELDS:
+        if key in state:
+            payload[key] = _stable_serialize(list(state.get(key, [])))
+
+    for key in ("auth_contexts", "web_hints", "web_artifacts", "artifact_index"):
+        if key in state:
+            payload[key] = _stable_serialize(state.get(key))
+    return payload
+
+
 def _sync_runtime_from_state(runtime: Any, state: GraphState) -> None:
     if runtime is None or not hasattr(runtime, "shared_context"):
         return
@@ -216,29 +245,7 @@ def _sync_runtime_from_state(runtime: Any, state: GraphState) -> None:
     frontier_state = state.get("frontier_state")
     if isinstance(frontier_state, dict):
         payload["frontier_state"] = _sanitize_frontier_for_persistence(frontier_state)
-    if "objective_queue" in state:
-        payload["objective_queue"] = _serialize_runtime_context_items(list(state.get("objective_queue", [])))
-    if "research_findings" in state:
-        payload["research_findings"] = _serialize_runtime_context_items(list(state.get("research_findings", [])))
-    if "hypothesis_board" in state:
-        payload["hypotheses"] = _serialize_runtime_context_items(list(state.get("hypothesis_board", [])))
-    if "refutations" in state:
-        payload["refutations"] = _serialize_runtime_context_items(list(state.get("refutations", [])))
-    if "experiment_board" in state:
-        payload["experiment_board"] = _serialize_runtime_context_items(list(state.get("experiment_board", [])))
-    if "candidates" in state:
-        payload["candidate_seeds"] = _serialize_runtime_context_items(list(state.get("candidates", [])))
-    if "static_evidence" in state:
-        payload["static_evidence"] = _serialize_runtime_context_items(list(state.get("static_evidence", [])))
-    if "witness_bundles" in state:
-        payload["witness_bundles"] = _serialize_runtime_context_items(list(state.get("witness_bundles", [])))
-    if "gate_history" in state:
-        payload["gate_history"] = _stable_serialize(list(state.get("gate_history", [])))
-    if "runtime_history" in state:
-        payload["runtime_history"] = _stable_serialize(list(state.get("runtime_history", [])))
-    for key in ("auth_contexts", "web_hints", "web_artifacts", "artifact_index"):
-        if key in state:
-            payload[key] = _stable_serialize(state.get(key))
+    payload.update(_collect_serialized_state_fields(state))
     if payload:
         update_agent_runtime_context(runtime, **payload)
 
@@ -370,156 +377,189 @@ def _invariant_error(stage: str, detail: str) -> RuntimeError:
     return RuntimeError(f"{stage} invariant failed: {detail}")
 
 
-def _assert_stage_invariants(state: GraphState, stage: str) -> None:
-    def _expect_list(key: str) -> list[Any]:
-        value = state.get(key)
+class _InvariantChecker:
+    """Helper to validate stage invariants without deep nesting."""
+
+    def __init__(self, state: GraphState, stage: str) -> None:
+        self._state = state
+        self._stage = stage
+
+    def expect_list(self, key: str) -> list[Any]:
+        value = self._state.get(key)
         if not isinstance(value, list):
-            raise _invariant_error(stage, f"{key} must be a list")
+            raise _invariant_error(self._stage, f"{key} must be a list")
         return value
 
-    def _expect_dict(key: str) -> dict[str, Any]:
-        value = state.get(key)
+    def expect_dict(self, key: str) -> dict[str, Any]:
+        value = self._state.get(key)
         if not isinstance(value, dict):
-            raise _invariant_error(stage, f"{key} must be a dict")
+            raise _invariant_error(self._stage, f"{key} must be a dict")
         return value
+
+
+def _assert_init_invariants(chk: _InvariantChecker, state: GraphState, stage: str) -> None:
+    chk.expect_dict("discovery_trace")
+    chk.expect_dict("planner_trace")
+    chk.expect_list("candidates")
+    chk.expect_list("static_evidence")
+    chk.expect_list("artifact_refs")
+    chk.expect_list("all_bundles")
+    chk.expect_list("iteration_bundles")
+    chk.expect_dict("decisions")
+    chk.expect_dict("auth_state")
+    analysis = state.get("failure_analysis")
+    if analysis is not None and not isinstance(analysis, FailureAnalysis):
+        raise _invariant_error(stage, "failure_analysis must be FailureAnalysis or None")
+
+
+def _assert_web_discovery_invariants(chk: _InvariantChecker, state: GraphState, stage: str) -> None:
+    chk.expect_dict("web_hints")
+    web_error = state.get("web_error")
+    if web_error is not None and not isinstance(web_error, str):
+        raise _invariant_error(stage, "web_error must be a string or null")
+
+
+def _assert_candidate_synthesis_invariants(chk: _InvariantChecker, state: GraphState, stage: str) -> None:
+    chk.expect_list("candidates")
+    proposer = chk.expect_dict("planner_trace").get("proposer")
+    if proposer is not None and not isinstance(proposer, dict):
+        raise _invariant_error(stage, "planner_trace.proposer must be a dict")
+
+
+def _assert_skeptic_refine_invariants(chk: _InvariantChecker, state: GraphState, stage: str) -> None:
+    chk.expect_list("candidates")
+    skeptic = chk.expect_dict("planner_trace").get("skeptic")
+    if skeptic is not None and not isinstance(skeptic, dict):
+        raise _invariant_error(stage, "planner_trace.skeptic must be a dict")
+
+
+def _assert_objective_schedule_invariants(chk: _InvariantChecker, state: GraphState, stage: str) -> None:
+    selected = chk.expect_list("selected_candidates")
+    chk.expect_list("selected_static")
+    chk.expect_dict("objective_scores")
+    if any(not hasattr(c, "candidate_id") for c in selected):
+        raise _invariant_error(stage, "selected_candidates entries must be Candidate-like")
+
+
+def _assert_frontier_update_invariants(chk: _InvariantChecker, state: GraphState, stage: str) -> None:
+    frontier = chk.expect_dict("frontier_state")
+    if not isinstance(frontier.get("coverage"), dict):
+        raise _invariant_error(stage, "frontier_state.coverage must be a dict")
+    if not isinstance(frontier.get("history"), list):
+        raise _invariant_error(stage, "frontier_state.history must be a list")
+    if not isinstance(frontier.get("candidate_resume", {}), dict):
+        raise _invariant_error(stage, "frontier_state.candidate_resume must be a dict")
+
+
+def _assert_validation_plan_invariants(chk: _InvariantChecker, state: GraphState, stage: str) -> None:
+    plans = chk.expect_dict("plans_by_candidate")
+    if not state.get("run_validation"):
+        return
+    selected = state.get("selected_candidates") or state.get("candidates") or []
+    selected_ids = {
+        c.candidate_id
+        for c in selected
+        if hasattr(c, "candidate_id")
+    }
+    missing = [cid for cid in selected_ids if cid not in plans]
+    if missing:
+        raise _invariant_error(stage, f"missing plans for candidates: {sorted(missing)}")
+
+
+def _assert_stage_invariants(state: GraphState, stage: str) -> None:
+    chk = _InvariantChecker(state, stage)
 
     if stage == "init":
-        _expect_dict("discovery_trace")
-        _expect_dict("planner_trace")
-        _expect_list("candidates")
-        _expect_list("static_evidence")
-        _expect_list("artifact_refs")
-        _expect_list("all_bundles")
-        _expect_list("iteration_bundles")
-        _expect_dict("decisions")
-        _expect_dict("auth_state")
-        analysis = state.get("failure_analysis")
-        if analysis is not None and not isinstance(analysis, FailureAnalysis):
-            raise _invariant_error(stage, "failure_analysis must be FailureAnalysis or None")
+        _assert_init_invariants(chk, state, stage)
         return
 
     if stage == "static_discovery":
-        _expect_list("candidates")
-        _expect_list("static_evidence")
+        chk.expect_list("candidates")
+        chk.expect_list("static_evidence")
         return
 
     if stage in {"web_discovery", "authenticated_web_discovery"}:
-        web_hints = state.get("web_hints")
-        if not isinstance(web_hints, dict):
-            raise _invariant_error(stage, "web_hints must be a dict")
-        web_error = state.get("web_error")
-        if web_error is not None and not isinstance(web_error, str):
-            raise _invariant_error(stage, "web_error must be a string or null")
+        _assert_web_discovery_invariants(chk, state, stage)
         return
 
     if stage == "auth_setup":
-        _expect_dict("auth_state")
+        chk.expect_dict("auth_state")
         return
 
     if stage == "discovery_summary":
-        _expect_dict("discovery_summary")
+        chk.expect_dict("discovery_summary")
         return
 
     if stage == "orient":
-        _expect_list("objective_queue")
+        chk.expect_list("objective_queue")
         return
 
     if stage == "select_objective":
-        active = state.get("active_objective")
-        if active is None:
+        if state.get("active_objective") is None:
             raise _invariant_error(stage, "active_objective must be set")
         return
 
-    if stage in {"source_research", "graph_research", "web_research"}:
+    if stage in {"source_research", "graph_research", "web_research", "continue_or_stop"}:
         return
 
     if stage == "reduce_research":
-        _expect_list("research_tasks")
-        _expect_list("research_findings")
+        chk.expect_list("research_tasks")
+        chk.expect_list("research_findings")
         return
 
     if stage == "hypothesis_board_update":
-        _expect_list("hypothesis_board")
-        _expect_list("candidates")
+        chk.expect_list("hypothesis_board")
+        chk.expect_list("candidates")
         return
 
     if stage == "skeptic_challenge":
-        _expect_list("refutations")
+        chk.expect_list("refutations")
         return
 
     if stage == "experiment_plan":
-        _expect_dict("plans_by_candidate")
+        chk.expect_dict("plans_by_candidate")
         return
 
     if stage == "runtime_execute":
-        _expect_list("bundles")
+        chk.expect_list("bundles")
         return
 
     if stage == "evidence_reduce":
-        _expect_list("witness_bundles")
+        chk.expect_list("witness_bundles")
         return
 
     if stage == "deterministic_gate":
-        _expect_list("gate_history")
-        return
-
-    if stage == "continue_or_stop":
+        chk.expect_list("gate_history")
         return
 
     if stage == "candidate_synthesis":
-        _expect_list("candidates")
-        proposer = _expect_dict("planner_trace").get("proposer")
-        if proposer is not None and not isinstance(proposer, dict):
-            raise _invariant_error(stage, "planner_trace.proposer must be a dict")
+        _assert_candidate_synthesis_invariants(chk, state, stage)
         return
 
     if stage == "skeptic_refine":
-        _expect_list("candidates")
-        skeptic = _expect_dict("planner_trace").get("skeptic")
-        if skeptic is not None and not isinstance(skeptic, dict):
-            raise _invariant_error(stage, "planner_trace.skeptic must be a dict")
+        _assert_skeptic_refine_invariants(chk, state, stage)
         return
 
     if stage == "objective_schedule":
-        selected = _expect_list("selected_candidates")
-        _expect_list("selected_static")
-        _expect_dict("objective_scores")
-        if any(not hasattr(c, "candidate_id") for c in selected):
-            raise _invariant_error(stage, "selected_candidates entries must be Candidate-like")
+        _assert_objective_schedule_invariants(chk, state, stage)
         return
 
     if stage == "frontier_update":
-        frontier = _expect_dict("frontier_state")
-        if not isinstance(frontier.get("coverage"), dict):
-            raise _invariant_error(stage, "frontier_state.coverage must be a dict")
-        if not isinstance(frontier.get("history"), list):
-            raise _invariant_error(stage, "frontier_state.history must be a list")
-        if not isinstance(frontier.get("candidate_resume", {}), dict):
-            raise _invariant_error(stage, "frontier_state.candidate_resume must be a dict")
+        _assert_frontier_update_invariants(chk, state, stage)
         return
 
     if stage == "validation_plan":
-        plans = _expect_dict("plans_by_candidate")
-        if state.get("run_validation"):
-            selected = state.get("selected_candidates") or state.get("candidates") or []
-            selected_ids = {
-                c.candidate_id
-                for c in selected
-                if hasattr(c, "candidate_id")
-            }
-            missing = [cid for cid in selected_ids if cid not in plans]
-            if missing:
-                raise _invariant_error(stage, f"missing plans for candidates: {sorted(missing)}")
+        _assert_validation_plan_invariants(chk, state, stage)
         return
 
     if stage in {"runtime_validate", "dedup_topk"}:
-        _expect_list("bundles")
-        _expect_dict("decisions")
+        chk.expect_list("bundles")
+        chk.expect_dict("decisions")
         return
 
     if stage == "persist":
-        _expect_list("candidates")
-        _expect_list("static_evidence")
+        chk.expect_list("candidates")
+        chk.expect_list("static_evidence")
 
 
 def _stage_snapshot_payload(state: GraphState, stage: str) -> dict[str, Any]:
@@ -722,20 +762,8 @@ def _objective_family_title(family: str) -> str:
     return family.replace("_", " ").title()
 
 
-def _supplement_objectives_with_candidate_coverage(
-    state: GraphState,
-    objectives: list[ObjectiveScore],
-) -> tuple[list[ObjectiveScore], dict[str, Any]]:
-    candidates = [item for item in state.get("candidates", []) if isinstance(item, Candidate)]
-    if not candidates:
-        return objectives, {"added": [], "families": {}}
-
-    represented: set[str] = set()
-    for item in objectives:
-        family = _objective_family_from_text(item.objective_id, item.title, item.rationale)
-        if family:
-            represented.add(family)
-
+def _build_family_buckets(candidates: list[Candidate]) -> dict[str, dict[str, Any]]:
+    """Group candidates into vuln-class family buckets."""
     family_buckets: dict[str, dict[str, Any]] = {}
     for candidate in candidates:
         family = _objective_family_from_vuln_class(candidate.vuln_class)
@@ -756,6 +784,54 @@ def _supplement_objectives_with_candidate_coverage(
         bucket["max_confidence"] = max(float(bucket["max_confidence"]), float(candidate.confidence))
         if candidate.vuln_class in _RUNTIME_VALIDATABLE_CLASSES:
             bucket["runtime_validatable"] = True
+    return family_buckets
+
+
+def _make_backfill_objective(
+    family: str,
+    data: dict[str, Any],
+    existing_ids: set[str],
+) -> ObjectiveScore:
+    """Create a single backfill ObjectiveScore for a vuln-class family."""
+    objective_id = f"obj-auto-{family}"
+    suffix = 1
+    while objective_id in existing_ids:
+        suffix += 1
+        objective_id = f"obj-auto-{family}-{suffix}"
+    candidate_count = len(data["candidate_ids"])
+    file_count = len(data["file_paths"])
+    max_confidence = float(data["max_confidence"])
+    runtime_bonus = 0.1 if data["runtime_validatable"] else 0.0
+    priority = min(0.99, 0.45 + min(candidate_count, 8) * 0.05 + runtime_bonus + min(max_confidence, 1.0) * 0.1)
+    return ObjectiveScore(
+        objective_id=objective_id,
+        title=f"Investigate {_objective_family_title(family)}",
+        rationale=(
+            f"Deterministic coverage backfill for {family} based on {candidate_count} candidate seeds "
+            f"across {file_count} files; sample leads: {', '.join(data['sample_titles']) or family}."
+        ),
+        expected_info_gain=priority,
+        priority=priority,
+        channels=["source", "graph", "web"],
+        related_hypothesis_ids=[],
+    )
+
+
+def _supplement_objectives_with_candidate_coverage(
+    state: GraphState,
+    objectives: list[ObjectiveScore],
+) -> tuple[list[ObjectiveScore], dict[str, Any]]:
+    candidates = [item for item in state.get("candidates", []) if isinstance(item, Candidate)]
+    if not candidates:
+        return objectives, {"added": [], "families": {}}
+
+    represented: set[str] = set()
+    for item in objectives:
+        family = _objective_family_from_text(item.objective_id, item.title, item.rationale)
+        if family:
+            represented.add(family)
+
+    family_buckets = _build_family_buckets(candidates)
 
     # Keep enough headroom to preserve coverage across the full Mutillidae family
     # set instead of truncating lower-signal runtime-validatable classes like LDAP.
@@ -778,33 +854,11 @@ def _supplement_objectives_with_candidate_coverage(
             break
         if family in represented:
             continue
-        objective_id = f"obj-auto-{family}"
-        suffix = 1
-        while objective_id in existing_ids:
-            suffix += 1
-            objective_id = f"obj-auto-{family}-{suffix}"
-        candidate_count = len(data["candidate_ids"])
-        file_count = len(data["file_paths"])
-        max_confidence = float(data["max_confidence"])
-        runtime_bonus = 0.1 if data["runtime_validatable"] else 0.0
-        priority = min(0.99, 0.45 + min(candidate_count, 8) * 0.05 + runtime_bonus + min(max_confidence, 1.0) * 0.1)
-        supplemented.append(
-            ObjectiveScore(
-                objective_id=objective_id,
-                title=f"Investigate {_objective_family_title(family)}",
-                rationale=(
-                    f"Deterministic coverage backfill for {family} based on {candidate_count} candidate seeds "
-                    f"across {file_count} files; sample leads: {', '.join(data['sample_titles']) or family}."
-                ),
-                expected_info_gain=priority,
-                priority=priority,
-                channels=["source", "graph", "web"],
-                related_hypothesis_ids=[],
-            )
-        )
+        obj = _make_backfill_objective(family, data, existing_ids)
+        supplemented.append(obj)
         represented.add(family)
-        existing_ids.add(objective_id)
-        added.append(objective_id)
+        existing_ids.add(obj.objective_id)
+        added.append(obj.objective_id)
 
     summary = {
         family: {
@@ -868,20 +922,36 @@ def _coverage_delta(old: dict[str, list[str]], new: dict[str, list[str]]) -> dic
     return out
 
 
+def _extract_bundle_decision(bundle: Any) -> tuple[str, str, str]:
+    """Return (candidate_id, vuln_class, decision) from a bundle."""
+    candidate = getattr(bundle, "candidate", None)
+    candidate_id = str(getattr(candidate, "candidate_id", ""))
+    vuln_class = str(getattr(candidate, "vuln_class", ""))
+    gate = getattr(bundle, "gate_result", None)
+    decision = str(getattr(gate, "decision", ""))
+    return candidate_id, vuln_class, decision
+
+
+def _collect_attempt_flags(item: dict[str, Any], flags: set[str]) -> None:
+    """Extract analysis flags from a single attempt dict into the flags set."""
+    analysis_flags = item.get("analysis_flags", [])
+    if not isinstance(analysis_flags, list):
+        return
+    for flag in analysis_flags:
+        if isinstance(flag, str) and flag.strip():
+            flags.add(flag.strip())
+
+
 def _runtime_feedback_from_bundles(bundles: list[Any], iteration: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     attempts: list[dict[str, Any]] = []
     flags: set[str] = set()
     classes: set[str] = set()
     decisions: dict[str, int] = {}
     for bundle in bundles:
-        candidate = getattr(bundle, "candidate", None)
-        candidate_id = getattr(candidate, "candidate_id", "")
-        vuln_class = getattr(candidate, "vuln_class", "")
-        if isinstance(vuln_class, str) and vuln_class.strip():
+        candidate_id, vuln_class, decision = _extract_bundle_decision(bundle)
+        if vuln_class.strip():
             classes.add(vuln_class.strip())
-        gate = getattr(bundle, "gate_result", None)
-        decision = getattr(gate, "decision", "")
-        if isinstance(decision, str) and decision:
+        if decision:
             decisions[decision] = decisions.get(decision, 0) + 1
 
         trace = getattr(bundle, "planner_trace", {})
@@ -892,15 +962,11 @@ def _runtime_feedback_from_bundles(bundles: list[Any], iteration: int) -> tuple[
             if not isinstance(item, dict):
                 continue
             copied = dict(item)
-            copied["candidate_id"] = str(candidate_id)
-            copied["vuln_class"] = str(vuln_class)
+            copied["candidate_id"] = candidate_id
+            copied["vuln_class"] = vuln_class
             copied["iteration"] = iteration
             attempts.append(copied)
-            analysis_flags = item.get("analysis_flags", [])
-            if isinstance(analysis_flags, list):
-                for flag in analysis_flags:
-                    if isinstance(flag, str) and flag.strip():
-                        flags.add(flag.strip())
+            _collect_attempt_flags(item, flags)
     summary = {
         "attempt_count": len(attempts),
         "flags": sorted(flags),
@@ -1315,7 +1381,7 @@ def _node_static_discovery(state: GraphState) -> GraphState:
     _emit_progress(state, "static_discovery", "start")
     if state.get("skip_discovery"):
         state.setdefault("discovery_trace", {})["mode"] = "validate-only"
-        return _finalize_stage(state, "static_discovery", "skipped (validate-only)")
+        return _finalize_stage(state, "static_discovery", _SKIPPED_VALIDATE_ONLY)
 
     # Static discoveries are deterministic for a fixed repo/config. Reuse after first pass.
     if state.get("candidates") and state.get("static_evidence"):
@@ -1393,7 +1459,7 @@ def _node_static_discovery(state: GraphState) -> GraphState:
 def _node_web_discovery(state: GraphState) -> GraphState:
     _emit_progress(state, "web_discovery", "start")
     if state.get("skip_discovery"):
-        return _finalize_stage(state, "web_discovery", "skipped (validate-only)")
+        return _finalize_stage(state, "web_discovery", _SKIPPED_VALIDATE_ONLY)
     if state.get("anonymous_web_hints") and state.get("anonymous_web_artifacts") and not state.get("web_error"):
         return _finalize_stage(state, "web_discovery", "reused prior web results")
 
@@ -1428,7 +1494,6 @@ def _node_web_discovery(state: GraphState) -> GraphState:
         for candidate in state.get("candidates", []):
             candidate.web_path_hints = sorted(set(candidate.web_path_hints + paths))
 
-    state["discovery_trace"]["web_paths"] = len(merged_hints)
     state["discovery_trace"]["web_paths_anonymous"] = len(hints)
     state["discovery_trace"]["web_pages_anonymous"] = len(artifacts.get("pages", [])) if isinstance(artifacts, dict) else 0
     state["discovery_trace"]["web_requests_anonymous"] = len(artifacts.get("requests", [])) if isinstance(artifacts, dict) else 0
@@ -1489,7 +1554,7 @@ def _node_auth_setup(state: GraphState) -> GraphState:
 def _node_authenticated_web_discovery(state: GraphState) -> GraphState:
     _emit_progress(state, "authenticated_web_discovery", "start")
     if state.get("skip_discovery"):
-        return _finalize_stage(state, "authenticated_web_discovery", "skipped (validate-only)")
+        return _finalize_stage(state, "authenticated_web_discovery", _SKIPPED_VALIDATE_ONLY)
     if state.get("authenticated_web_hints") and state.get("authenticated_web_artifacts") and not state.get("web_error"):
         return _finalize_stage(state, "authenticated_web_discovery", "reused prior authenticated web results")
 
@@ -1548,46 +1613,67 @@ def _node_authenticated_web_discovery(state: GraphState) -> GraphState:
     return _finalize_stage(state, "authenticated_web_discovery", f"paths={len(merged_hints)}")
 
 
-def _node_discovery_summary(state: GraphState) -> GraphState:
-    _emit_progress(state, "discovery_summary", "start")
-    def _candidate_id(item: Any) -> str:
-        if isinstance(item, Candidate):
-            return str(item.candidate_id)
-        if isinstance(item, dict):
-            return str(item.get("candidate_id", ""))
-        return str(getattr(item, "candidate_id", ""))
+def _candidate_id_from_item(item: Any) -> str:
+    if isinstance(item, Candidate):
+        return str(item.candidate_id)
+    if isinstance(item, dict):
+        return str(item.get("candidate_id", ""))
+    return str(getattr(item, "candidate_id", ""))
 
+
+def _safe_artifact_count(artifacts: Any, key: str) -> int:
+    """Count items in an artifacts dict sub-key, safely handling non-dict values."""
+    if not isinstance(artifacts, dict):
+        return 0
+    items = artifacts.get(key, [])
+    return len(items) if isinstance(items, list) else 0
+
+
+def _build_web_summary(state: GraphState) -> dict[str, Any]:
+    """Build the web section of the discovery summary."""
+    return {
+        "anonymous_paths": sorted((state.get("anonymous_web_hints") or {}).keys()),
+        "authenticated_paths": sorted((state.get("authenticated_web_hints") or {}).keys()),
+        "merged_paths": sorted((state.get("web_hints") or {}).keys()),
+        "anonymous_page_count": _safe_artifact_count(state.get("anonymous_web_artifacts"), "pages"),
+        "authenticated_page_count": _safe_artifact_count(state.get("authenticated_web_artifacts"), "pages"),
+        "merged_page_count": _safe_artifact_count(state.get("web_artifacts"), "pages"),
+        "anonymous_request_count": _safe_artifact_count(state.get("anonymous_web_artifacts"), "requests"),
+        "authenticated_request_count": _safe_artifact_count(state.get("authenticated_web_artifacts"), "requests"),
+        "merged_request_count": _safe_artifact_count(state.get("web_artifacts"), "requests"),
+    }
+
+
+def _build_auth_summary(state: GraphState) -> dict[str, Any]:
+    """Build the auth section of the discovery summary."""
     auth_state = state.get("auth_state", {})
     auth_cookies = auth_state.get("cookies", {}) if isinstance(auth_state, dict) else {}
+    auth_contexts = state.get("auth_contexts")
+    return {
+        "enabled": bool(auth_state.get("auth_enabled")) if isinstance(auth_state, dict) else False,
+        "resolved": bool(auth_cookies) if isinstance(auth_cookies, dict) else False,
+        "cookie_count": len(auth_cookies) if isinstance(auth_cookies, dict) else 0,
+        "cookie_names": sorted(auth_cookies.keys()) if isinstance(auth_cookies, dict) else [],
+        "contexts": sorted(auth_contexts.keys()) if isinstance(auth_contexts, dict) else [],
+    }
+
+
+def _node_discovery_summary(state: GraphState) -> GraphState:
+    _emit_progress(state, "discovery_summary", "start")
+
     detection_board = state.get("detection_board", {})
     detection_candidates = detection_board.get("candidates", []) if isinstance(detection_board, dict) else []
     summary = {
         "candidate_count": len(state.get("candidates", [])),
         "static_evidence_count": len(state.get("static_evidence", [])),
-        "candidate_ids": [_candidate_id(item) for item in list(state.get("candidates", []))[:50] if _candidate_id(item)],
+        "candidate_ids": [_candidate_id_from_item(item) for item in list(state.get("candidates", []))[:50] if _candidate_id_from_item(item)],
         "semantic_discovery": dict(state.get("discovery_trace", {})),
         "detection_board_counts": {
             "candidates": len(detection_candidates) if isinstance(detection_candidates, list) else 0,
             "static_evidence": len(detection_board.get("static_evidence", [])) if isinstance(detection_board, dict) else 0,
         },
-        "web": {
-            "anonymous_paths": sorted((state.get("anonymous_web_hints") or {}).keys()),
-            "authenticated_paths": sorted((state.get("authenticated_web_hints") or {}).keys()),
-            "merged_paths": sorted((state.get("web_hints") or {}).keys()),
-            "anonymous_page_count": len((state.get("anonymous_web_artifacts") or {}).get("pages", [])) if isinstance(state.get("anonymous_web_artifacts"), dict) else 0,
-            "authenticated_page_count": len((state.get("authenticated_web_artifacts") or {}).get("pages", [])) if isinstance(state.get("authenticated_web_artifacts"), dict) else 0,
-            "merged_page_count": len((state.get("web_artifacts") or {}).get("pages", [])) if isinstance(state.get("web_artifacts"), dict) else 0,
-            "anonymous_request_count": len((state.get("anonymous_web_artifacts") or {}).get("requests", [])) if isinstance(state.get("anonymous_web_artifacts"), dict) else 0,
-            "authenticated_request_count": len((state.get("authenticated_web_artifacts") or {}).get("requests", [])) if isinstance(state.get("authenticated_web_artifacts"), dict) else 0,
-            "merged_request_count": len((state.get("web_artifacts") or {}).get("requests", [])) if isinstance(state.get("web_artifacts"), dict) else 0,
-        },
-        "auth": {
-            "enabled": bool(auth_state.get("auth_enabled")) if isinstance(auth_state, dict) else False,
-            "resolved": bool(auth_cookies) if isinstance(auth_cookies, dict) else False,
-            "cookie_count": len(auth_cookies) if isinstance(auth_cookies, dict) else 0,
-            "cookie_names": sorted(auth_cookies.keys()) if isinstance(auth_cookies, dict) else [],
-            "contexts": sorted((state.get("auth_contexts") or {}).keys()) if isinstance(state.get("auth_contexts"), dict) else [],
-        },
+        "web": _build_web_summary(state),
+        "auth": _build_auth_summary(state),
         "artifact_index": dict(state.get("artifact_index", {})),
     }
     state["discovery_summary"] = summary
@@ -1645,13 +1731,43 @@ def _merge_web_hints(
     return merged
 
 
+def _dedup_string_list(payload: dict[str, Any], key: str, seen: set[str], out: list[str]) -> None:
+    """Append unique stripped strings from payload[key] into out."""
+    for raw in payload.get(key, []):
+        value = str(raw).strip()
+        if value and value not in seen:
+            seen.add(value)
+            out.append(value)
+
+
+def _dedup_dict_list(
+    payload: dict[str, Any],
+    key: str,
+    seen: set[str],
+    out: list[dict[str, Any]],
+    *,
+    is_incoming: bool,
+    scope: str,
+) -> None:
+    """Append unique dict items from payload[key] into out, setting scope."""
+    for item in payload.get(key, []):
+        if not isinstance(item, dict):
+            continue
+        dedup_key = json.dumps(item, sort_keys=True, ensure_ascii=True)
+        if dedup_key in seen:
+            continue
+        seen.add(dedup_key)
+        record = dict(item)
+        record.setdefault("scope", scope if is_incoming else record.get("scope", "anonymous"))
+        out.append(record)
+
+
 def _merge_web_artifacts(
     base: dict[str, Any] | None,
     incoming: dict[str, Any] | None,
     *,
     scope: str,
 ) -> dict[str, Any]:
-    merged: dict[str, Any] = {}
     pages_seen: set[str] = set()
     requests_seen: set[str] = set()
     visited_seen: set[str] = set()
@@ -1663,51 +1779,24 @@ def _merge_web_artifacts(
     errors: list[str] = []
     seed_urls: list[str] = []
 
-    for payload in (base or {}, incoming or {}):
+    base_payload = base or {}
+    incoming_payload = incoming or {}
+    for payload, is_incoming in ((base_payload, False), (incoming_payload, True)):
         if not isinstance(payload, dict):
             continue
-        for raw in payload.get("seed_urls", []):
-            value = str(raw).strip()
-            if value and value not in seed_seen:
-                seed_seen.add(value)
-                seed_urls.append(value)
-        for raw in payload.get("visited_urls", []):
-            value = str(raw).strip()
-            if value and value not in visited_seen:
-                visited_seen.add(value)
-                visited_urls.append(value)
-        for raw in payload.get("errors", []):
-            value = str(raw).strip()
-            if value and value not in errors_seen:
-                errors_seen.add(value)
-                errors.append(value)
-        for item in payload.get("pages", []):
-            if not isinstance(item, dict):
-                continue
-            key = json.dumps(item, sort_keys=True, ensure_ascii=True)
-            if key in pages_seen:
-                continue
-            pages_seen.add(key)
-            page = dict(item)
-            page.setdefault("scope", scope if payload is incoming else page.get("scope", "anonymous"))
-            pages.append(page)
-        for item in payload.get("requests", []):
-            if not isinstance(item, dict):
-                continue
-            key = json.dumps(item, sort_keys=True, ensure_ascii=True)
-            if key in requests_seen:
-                continue
-            requests_seen.add(key)
-            request = dict(item)
-            request.setdefault("scope", scope if payload is incoming else request.get("scope", "anonymous"))
-            requests.append(request)
+        _dedup_string_list(payload, "seed_urls", seed_seen, seed_urls)
+        _dedup_string_list(payload, "visited_urls", visited_seen, visited_urls)
+        _dedup_string_list(payload, "errors", errors_seen, errors)
+        _dedup_dict_list(payload, "pages", pages_seen, pages, is_incoming=is_incoming, scope=scope)
+        _dedup_dict_list(payload, "requests", requests_seen, requests, is_incoming=is_incoming, scope=scope)
 
-    merged["seed_urls"] = seed_urls
-    merged["visited_urls"] = visited_urls
-    merged["pages"] = pages
-    merged["requests"] = requests[:200]
-    merged["errors"] = errors
-    return merged
+    return {
+        "seed_urls": seed_urls,
+        "visited_urls": visited_urls,
+        "pages": pages,
+        "requests": requests[:200],
+        "errors": errors,
+    }
 
 
 def _candidate_from_hypothesis(hypothesis: Hypothesis) -> Candidate:
@@ -1983,6 +2072,55 @@ def _node_web_research_parallel(state: GraphState) -> dict[str, Any]:
     return _run_parallel_research_branch(state, "web")
 
 
+def _merge_branch_traces(state: GraphState) -> None:
+    """Copy non-empty branch traces into planner_trace."""
+    planner_trace = state.setdefault("planner_trace", {})
+    for role in ("source", "graph", "web"):
+        trace = state.get(f"{role}_trace")
+        if isinstance(trace, dict) and trace:
+            planner_trace[f"{role}_research"] = dict(trace)
+
+
+def _collect_branch_errors(state: GraphState) -> dict[str, dict[str, Any]]:
+    """Collect non-empty branch errors from research fanout."""
+    return {
+        role: dict(item)
+        for role in ("source", "graph", "web")
+        if isinstance((item := state.get(f"{role}_branch_error")), dict) and item
+    }
+
+
+def _merge_context_deltas(state: GraphState) -> None:
+    """Merge all research branch context deltas into the agent runtime."""
+    runtime = _state_runtime(state)
+    for key in ("source_context_delta", "graph_context_delta", "web_context_delta"):
+        merge_agent_runtime_context_delta(runtime, state.get(key, {}))
+
+
+def _handle_zero_findings(
+    state: GraphState, branch_errors: dict[str, dict[str, Any]]
+) -> GraphState | None:
+    """Handle the case where research produced zero findings. Returns GraphState if handled, None otherwise."""
+    if not state.get("candidates") and not state.get("static_evidence"):
+        _merge_context_deltas(state)
+        update_agent_runtime_context(_state_runtime(state), research_findings=[])
+        _persist_agent_workspace_artifact(
+            state,
+            "research-findings",
+            {
+                "tasks": [],
+                "findings": [],
+                "branch_errors": branch_errors,
+                "reason": "no-candidate-material",
+            },
+        )
+        return _finalize_stage(state, "reduce_research", "findings=0 no-candidate-material")
+    if branch_errors:
+        detail = ", ".join(f"{role}: {item.get('error', 'unknown error')}" for role, item in sorted(branch_errors.items()))
+        raise RuntimeError(f"research fanout produced zero findings; branch errors={detail}")
+    raise RuntimeError("research fanout produced zero findings")
+
+
 def _node_reduce_research(state: GraphState) -> GraphState:
     _emit_progress(state, "reduce_research", "start")
     tasks = state.get("source_tasks", []) + state.get("graph_tasks", []) + state.get("web_tasks", [])
@@ -1995,46 +2133,17 @@ def _node_reduce_research(state: GraphState) -> GraphState:
         "tasks": [item.to_dict() for item in state["research_tasks"]],
         "findings": [item.to_dict() for item in state["research_findings"]],
     }
-    planner_trace = state.setdefault("planner_trace", {})
-    if isinstance(state.get("source_trace"), dict) and state["source_trace"]:
-        planner_trace["source_research"] = dict(state["source_trace"])
-    if isinstance(state.get("graph_trace"), dict) and state["graph_trace"]:
-        planner_trace["graph_research"] = dict(state["graph_trace"])
-    if isinstance(state.get("web_trace"), dict) and state["web_trace"]:
-        planner_trace["web_research"] = dict(state["web_trace"])
-    branch_errors = {
-        role: dict(item)
-        for role in ("source", "graph", "web")
-        if isinstance((item := state.get(f"{role}_branch_error")), dict) and item
-    }
+    _merge_branch_traces(state)
+    branch_errors = _collect_branch_errors(state)
     if branch_errors:
         state["research_branch_errors"] = branch_errors
-        planner_trace["research_branch_errors"] = branch_errors
+        state.setdefault("planner_trace", {})["research_branch_errors"] = branch_errors
     if not state["research_findings"]:
-        if not state.get("candidates") and not state.get("static_evidence"):
-            runtime = _state_runtime(state)
-            for key in ("source_context_delta", "graph_context_delta", "web_context_delta"):
-                merge_agent_runtime_context_delta(runtime, state.get(key, {}))
-            update_agent_runtime_context(runtime, research_findings=[])
-            _persist_agent_workspace_artifact(
-                state,
-                "research-findings",
-                {
-                    "tasks": [],
-                    "findings": [],
-                    "branch_errors": branch_errors,
-                    "reason": "no-candidate-material",
-                },
-            )
-            return _finalize_stage(state, "reduce_research", "findings=0 no-candidate-material")
-        if branch_errors:
-            detail = ", ".join(f"{role}: {item.get('error', 'unknown error')}" for role, item in sorted(branch_errors.items()))
-            raise RuntimeError(f"research fanout produced zero findings; branch errors={detail}")
-        raise RuntimeError("research fanout produced zero findings")
-    runtime = _state_runtime(state)
-    for key in ("source_context_delta", "graph_context_delta", "web_context_delta"):
-        merge_agent_runtime_context_delta(runtime, state.get(key, {}))
-    update_agent_runtime_context(runtime, research_findings=[item.to_dict() for item in state["research_findings"]])
+        result = _handle_zero_findings(state, branch_errors)
+        if result is not None:
+            return result
+    _merge_context_deltas(state)
+    update_agent_runtime_context(_state_runtime(state), research_findings=[item.to_dict() for item in state["research_findings"]])
     _persist_agent_workspace_artifact(
         state,
         "research-findings",
@@ -2399,6 +2508,44 @@ def _node_candidate_synthesis(state: GraphState) -> GraphState:
     return _finalize_stage(state, "candidate_synthesis", f"fused={len(candidates)} selected={len(state['candidates'])}")
 
 
+def _normalize_candidate_intercepts(candidates: list[Candidate]) -> list[Candidate]:
+    """Clone candidates and normalize their expected_intercepts."""
+    out: list[Candidate] = []
+    for candidate in candidates:
+        clone = _safe_copy_candidate(candidate)
+        if clone.expected_intercepts:
+            clone.expected_intercepts = sorted(set(clone.expected_intercepts))
+        elif clone.sink:
+            clone.expected_intercepts = [clone.sink.replace("(", "").replace("->", "::")]
+        out.append(clone)
+    return out
+
+
+def _aggregate_failed_paths(round_traces: list[dict[str, Any]]) -> list[str]:
+    """Collect all failed_paths from skeptic round traces."""
+    aggregated: list[str] = []
+    for trace in round_traces:
+        raw_failed = trace.get("failed_paths")
+        if not isinstance(raw_failed, list):
+            continue
+        for item in raw_failed:
+            if isinstance(item, str) and item.strip():
+                aggregated.append(item.strip())
+    return aggregated
+
+
+def _build_skeptic_trace(round_traces: list[dict[str, Any]], aggregated_failed: list[str]) -> dict[str, Any]:
+    """Assemble the final skeptic trace from round traces."""
+    if round_traces:
+        final_trace = dict(round_traces[-1])
+        final_trace["rounds"] = [dict(item) for item in round_traces]
+    else:
+        final_trace = {"engine": "deepagents", "rounds": []}
+    if aggregated_failed:
+        final_trace["failed_paths"] = sorted(set(aggregated_failed))
+    return final_trace
+
+
 def _node_skeptic_refine(state: GraphState) -> GraphState:
     _emit_progress(state, "skeptic_refine", "start")
     rounds = max(1, state["config"].agent.skeptic_rounds)
@@ -2419,35 +2566,32 @@ def _node_skeptic_refine(state: GraphState) -> GraphState:
         if not current:
             break
 
-    out: list[Candidate] = []
-    for candidate in current:
-        clone = _safe_copy_candidate(candidate)
-        if clone.expected_intercepts:
-            clone.expected_intercepts = sorted(set(clone.expected_intercepts))
-        elif clone.sink:
-            clone.expected_intercepts = [clone.sink.replace("(", "").replace("->", "::")]
-        out.append(clone)
-
-    aggregated_failed: list[str] = []
-    for trace in skeptic_round_traces:
-        raw_failed = trace.get("failed_paths")
-        if isinstance(raw_failed, list):
-            for item in raw_failed:
-                if isinstance(item, str) and item.strip():
-                    aggregated_failed.append(item.strip())
-
-    final_trace: dict[str, Any]
-    if skeptic_round_traces:
-        final_trace = dict(skeptic_round_traces[-1])
-        final_trace["rounds"] = [dict(item) for item in skeptic_round_traces]
-    else:
-        final_trace = {"engine": "deepagents", "rounds": []}
-    if aggregated_failed:
-        final_trace["failed_paths"] = sorted(set(aggregated_failed))
+    out = _normalize_candidate_intercepts(current)
+    final_trace = _build_skeptic_trace(skeptic_round_traces, _aggregate_failed_paths(skeptic_round_traces))
 
     state["candidates"] = out
     state.setdefault("planner_trace", {})["skeptic"] = final_trace
     return _finalize_stage(state, "skeptic_refine", f"remaining={len(out)}")
+
+
+def _apply_resume_filter(
+    candidates: list[Candidate],
+    frontier_state: dict[str, Any],
+) -> tuple[list[Candidate], list[str]]:
+    """Filter out candidates that completed cleanly in a prior run. Returns (remaining, filtered_ids)."""
+    resume_map = frontier_state.get("candidate_resume", {}) if isinstance(frontier_state, dict) else {}
+    if not isinstance(resume_map, dict):
+        return list(candidates), []
+    filtered: list[Candidate] = []
+    filtered_ids: list[str] = []
+    for candidate in candidates:
+        entry = resume_map.get(_candidate_signature(candidate))
+        if isinstance(entry, dict) and bool(entry.get("completed_clean")):
+            filtered_ids.append(candidate.candidate_id)
+            continue
+        filtered.append(candidate)
+    scheduler_input = filtered if filtered else []
+    return scheduler_input, filtered_ids
 
 
 def _node_objective_schedule(state: GraphState) -> GraphState:
@@ -2464,21 +2608,8 @@ def _node_objective_schedule(state: GraphState) -> GraphState:
     scheduler_input = list(candidates)
     frontier_state = state.get("frontier_state", {})
     if state.get("run_validation"):
-        resume_map = frontier_state.get("candidate_resume", {}) if isinstance(frontier_state, dict) else {}
-        if isinstance(resume_map, dict):
-            filtered: list[Candidate] = []
-            filtered_ids: list[str] = []
-            for candidate in candidates:
-                entry = resume_map.get(_candidate_signature(candidate))
-                if isinstance(entry, dict) and bool(entry.get("completed_clean")):
-                    filtered_ids.append(candidate.candidate_id)
-                    continue
-                filtered.append(candidate)
-            if filtered:
-                scheduler_input = filtered
-            else:
-                scheduler_input = []
-            state["resume_filtered_candidates"] = sorted(set(filtered_ids))
+        scheduler_input, filtered_ids = _apply_resume_filter(candidates, frontier_state)
+        state["resume_filtered_candidates"] = sorted(set(filtered_ids))
 
     selected, scores, scheduler_trace = schedule_actions_with_deepagents(
         scheduler_input,
@@ -2511,7 +2642,7 @@ def _node_frontier_update(state: GraphState) -> GraphState:
     _emit_progress(state, "frontier_update", "start")
     if state.get("skip_discovery"):
         state["loop_continue"] = False
-        return _finalize_stage(state, "frontier_update", "skipped (validate-only)")
+        return _finalize_stage(state, "frontier_update", _SKIPPED_VALIDATE_ONLY)
 
     frontier = state.get("frontier_state") or _default_frontier_state()
     iteration = int(frontier.get("iteration", 0)) + 1
@@ -2822,16 +2953,15 @@ def _node_persist(state: GraphState) -> GraphState:
     return _finalize_stage(state, "persist", "evidence persisted")
 
 
-def _run_langgraph(state: GraphState, include_validation: bool) -> GraphState:
-    try:
-        from langgraph.graph import END, START, StateGraph  # type: ignore[import-not-found]
-    except Exception as exc:
-        raise RuntimeError(f"langgraph import failed: {exc}") from exc
+def _after_frontier_route(current: GraphState) -> str:
+    if current.get("skip_discovery") or not current.get("loop_continue"):
+        return "done"
+    return "again"
 
-    def _after_frontier_route(current: GraphState) -> str:
-        if current.get("skip_discovery") or not current.get("loop_continue"):
-            return "done"
-        return "again"
+
+def _build_pipeline_graph(include_validation: bool) -> Any:
+    """Build and return the compiled LangGraph StateGraph pipeline."""
+    from langgraph.graph import END, START, StateGraph  # type: ignore[import-not-found]
 
     builder = StateGraph(GraphState)
     builder.add_node("init", _node_init)
@@ -2895,6 +3025,51 @@ def _run_langgraph(state: GraphState, include_validation: bool) -> GraphState:
     if include_validation:
         builder.add_edge("dedup_topk", "persist")
     builder.add_edge("persist", END)
+    return builder
+
+
+def _handle_graph_invoke_error(
+    exc: BaseException,
+    state: GraphState,
+    graph: Any,
+    graph_config: dict[str, Any],
+    thread_id: str,
+) -> None:
+    """Save resume metadata for a failed or yielded graph invocation, then re-raise."""
+    checkpoint_id, next_nodes = _latest_checkpoint_info(graph, graph_config)
+    state["graph_checkpoint_id"] = checkpoint_id
+    error_text = str(exc).strip() or exc.__class__.__name__
+    status = "failed"
+    if isinstance(exc, AgentSoftYield):
+        status = "yielded"
+        state["soft_yield"] = {
+            "role": exc.role,
+            "category": exc.category,
+            "turn": exc.turn,
+            "handoff_ref": exc.handoff_ref,
+            "progress_ref": exc.progress_ref,
+            "response_ref": exc.response_ref,
+            "last_response": dict(exc.last_response),
+        }
+    state["store"].save_resume_metadata(
+        str(state.get("run_id") or ""),
+        _graph_resume_payload(
+            state,
+            thread_id=thread_id,
+            checkpoint_id=checkpoint_id,
+            status=status,
+            next_nodes=next_nodes,
+            error=error_text,
+        ),
+    )
+    raise exc
+
+
+def _run_langgraph(state: GraphState, include_validation: bool) -> GraphState:
+    try:
+        builder = _build_pipeline_graph(include_validation)
+    except Exception as exc:
+        raise RuntimeError(f"langgraph import failed: {exc}") from exc
 
     thread_id = _graph_thread_id(state)
     checkpointer = FileBackedMemorySaver(_graph_checkpointer_path(state["store"], thread_id))
@@ -2916,33 +3091,7 @@ def _run_langgraph(state: GraphState, include_validation: bool) -> GraphState:
     try:
         result = graph.invoke(invoke_input, config=graph_config)
     except BaseException as exc:
-        checkpoint_id, next_nodes = _latest_checkpoint_info(graph, graph_config)
-        state["graph_checkpoint_id"] = checkpoint_id
-        error_text = str(exc).strip() or exc.__class__.__name__
-        status = "failed"
-        if isinstance(exc, AgentSoftYield):
-            status = "yielded"
-            state["soft_yield"] = {
-                "role": exc.role,
-                "category": exc.category,
-                "turn": exc.turn,
-                "handoff_ref": exc.handoff_ref,
-                "progress_ref": exc.progress_ref,
-                "response_ref": exc.response_ref,
-                "last_response": dict(exc.last_response),
-            }
-        state["store"].save_resume_metadata(
-            str(state.get("run_id") or ""),
-            _graph_resume_payload(
-                state,
-                thread_id=thread_id,
-                checkpoint_id=checkpoint_id,
-                status=status,
-                next_nodes=next_nodes,
-                error=error_text,
-            ),
-        )
-        raise
+        _handle_graph_invoke_error(exc, state, graph, graph_config, thread_id)
 
     checkpoint_id, next_nodes = _latest_checkpoint_info(graph, graph_config)
     if isinstance(result, dict):
@@ -2963,6 +3112,69 @@ def _run_langgraph(state: GraphState, include_validation: bool) -> GraphState:
     return result
 
 
+def _resolve_resume_metadata(
+    store: EvidenceStore,
+    resume_run_id: str | None,
+    *,
+    mode: str,
+    run_validation: bool,
+    resolved_repo_root: str,
+    config: PadvConfig,
+    check_compatibility: bool = True,
+) -> dict[str, Any] | None:
+    """Resolve resume metadata from a run ID or 'latest' sentinel.
+
+    Returns the metadata dict or None if no resume was requested.
+    Raises RuntimeError if the requested run is not found or incompatible.
+    """
+    if not resume_run_id:
+        return None
+    if resume_run_id == "latest":
+        meta = store.latest_resumable_run(
+            mode=mode,
+            run_validation=run_validation,
+            target_signature=_target_signature_for(resolved_repo_root, str(config.target.base_url or "")),
+            config_signature=_config_signature(config, mode, run_validation),
+        )
+    else:
+        meta = store.load_resume_metadata(resume_run_id)
+    if meta is None:
+        raise RuntimeError(f"resume run not found: {resume_run_id}")
+    if check_compatibility and not _resume_compatible(
+        meta, config=config, repo_root=resolved_repo_root, mode=mode, run_validation=run_validation
+    ):
+        raise RuntimeError(f"resume metadata incompatible with current {mode} target/config: {meta.get('run_id')}")
+    return meta
+
+
+def _state_from_resume_meta(
+    resume_meta: dict[str, Any] | None,
+    *,
+    config: PadvConfig,
+    resolved_repo_root: str,
+    store: EvidenceStore,
+    mode: str,
+    run_validation: bool,
+    run_id_prefix: str,
+) -> GraphState:
+    """Build the initial GraphState from optional resume metadata."""
+    meta = resume_meta or {}
+    run_id = str(meta.get("run_id") or new_run_id(run_id_prefix))
+    return {
+        "config": config,
+        "repo_root": resolved_repo_root,
+        "store": store,
+        "mode": mode,
+        "run_validation": run_validation,
+        "run_id": run_id,
+        "resume_mode": bool(resume_meta),
+        "resume_requested_run_id": str(meta.get("run_id") or ""),
+        "started_at": str(meta.get("started_at") or _now_iso()),
+        "graph_thread_id": str(meta.get("thread_id") or ""),
+        "graph_checkpoint_id": str(meta.get("checkpoint_id") or ""),
+    }
+
+
 def analyze_with_graph(
     config: PadvConfig,
     repo_root: str,
@@ -2972,36 +3184,18 @@ def analyze_with_graph(
     resume_run_id: str | None = None,
 ) -> tuple[list[Candidate], list[StaticEvidence], dict[str, Any]]:
     resolved_repo_root = str(Path(repo_root).resolve())
-    resume_meta: dict[str, Any] | None = None
-    if resume_run_id:
-        if resume_run_id == "latest":
-            resume_meta = store.latest_resumable_run(
-                mode=mode,
-                run_validation=False,
-                target_signature=_target_signature_for(resolved_repo_root, str(config.target.base_url or "")),
-                config_signature=_config_signature(config, mode, False),
-            )
-        else:
-            resume_meta = store.load_resume_metadata(resume_run_id)
-        if resume_meta is None:
-            raise RuntimeError(f"resume run not found: {resume_run_id}")
-        if not _resume_compatible(resume_meta, config=config, repo_root=resolved_repo_root, mode=mode, run_validation=False):
-            raise RuntimeError(f"resume metadata incompatible with current analyze target/config: {resume_meta.get('run_id')}")
-    run_id = str((resume_meta or {}).get("run_id") or new_run_id("analyze"))
+    resume_meta = _resolve_resume_metadata(
+        store, resume_run_id,
+        mode=mode, run_validation=False,
+        resolved_repo_root=resolved_repo_root, config=config,
+    )
+    state = _state_from_resume_meta(
+        resume_meta,
+        config=config, resolved_repo_root=resolved_repo_root, store=store,
+        mode=mode, run_validation=False, run_id_prefix="analyze",
+    )
+    run_id = str(state["run_id"])
     _set_progress_callback(run_id, progress_callback)
-    state: GraphState = {
-        "config": config,
-        "repo_root": resolved_repo_root,
-        "store": store,
-        "mode": mode,
-        "run_validation": False,
-        "run_id": run_id,
-        "resume_mode": bool(resume_meta),
-        "resume_requested_run_id": str((resume_meta or {}).get("run_id") or ""),
-        "started_at": str((resume_meta or {}).get("started_at") or _now_iso()),
-        "graph_thread_id": str((resume_meta or {}).get("thread_id") or ""),
-        "graph_checkpoint_id": str((resume_meta or {}).get("checkpoint_id") or ""),
-    }
     try:
         result = _run_langgraph(state, include_validation=False)
         return result.get("candidates", []), result.get("static_evidence", []), result.get("discovery_trace", {})
@@ -3019,41 +3213,23 @@ def run_with_graph(
     resume_run_id: str | None = None,
 ) -> RunSummary:
     resolved_repo_root = str(Path(repo_root).resolve())
-    resume_meta: dict[str, Any] | None = None
-    if resume_run_id:
-        if resume_run_id == "latest":
-            resume_meta = store.latest_resumable_run(
-                mode=mode,
-                run_validation=True,
-                target_signature=_target_signature_for(resolved_repo_root, str(config.target.base_url or "")),
-                config_signature=_config_signature(config, mode, True),
-            )
-        else:
-            resume_meta = store.load_resume_metadata(resume_run_id)
-        if resume_meta is None:
-            raise RuntimeError(f"resume run not found: {resume_run_id}")
-        if not _resume_compatible(resume_meta, config=config, repo_root=resolved_repo_root, mode=mode, run_validation=True):
-            raise RuntimeError(f"resume metadata incompatible with current run target/config: {resume_meta.get('run_id')}")
-    run_id = str((resume_meta or {}).get("run_id") or new_run_id("run"))
-    started = str((resume_meta or {}).get("started_at") or datetime.now(tz=timezone.utc).isoformat())
+    resume_meta = _resolve_resume_metadata(
+        store, resume_run_id,
+        mode=mode, run_validation=True,
+        resolved_repo_root=resolved_repo_root, config=config,
+    )
+    state = _state_from_resume_meta(
+        resume_meta,
+        config=config, resolved_repo_root=resolved_repo_root, store=store,
+        mode=mode, run_validation=True, run_id_prefix="run",
+    )
+    run_id = str(state["run_id"])
+    started = str(state.get("started_at") or _now_iso())
     _set_progress_callback(run_id, progress_callback)
 
     if config.sandbox.deploy_cmd:
         sandbox_adapter.deploy(config.sandbox)
 
-    state: GraphState = {
-        "config": config,
-        "repo_root": resolved_repo_root,
-        "store": store,
-        "mode": mode,
-        "run_id": run_id,
-        "started_at": started,
-        "run_validation": True,
-        "resume_mode": bool(resume_meta),
-        "resume_requested_run_id": str((resume_meta or {}).get("run_id") or ""),
-        "graph_thread_id": str((resume_meta or {}).get("thread_id") or ""),
-        "graph_checkpoint_id": str((resume_meta or {}).get("checkpoint_id") or ""),
-    }
     try:
         result = _run_langgraph(state, include_validation=True)
         completed = datetime.now(tz=timezone.utc).isoformat()
@@ -3090,19 +3266,13 @@ def validate_with_graph(
     resume_run_id: str | None = None,
 ) -> tuple[list[Any], dict[str, int]]:
     resolved_repo_root = str(Path(repo_root or ".").resolve())
-    resume_meta: dict[str, Any] | None = None
-    if resume_run_id:
-        if resume_run_id == "latest":
-            resume_meta = store.latest_resumable_run(
-                mode="variant",
-                run_validation=True,
-                target_signature=_target_signature_for(resolved_repo_root, str(config.target.base_url or "")),
-                config_signature=_config_signature(config, "variant", True),
-            )
-        else:
-            resume_meta = store.load_resume_metadata(resume_run_id)
-        if resume_meta is None:
-            raise RuntimeError(f"resume run not found: {resume_run_id}")
+    resume_meta = _resolve_resume_metadata(
+        store, resume_run_id,
+        mode="variant", run_validation=True,
+        resolved_repo_root=resolved_repo_root, config=config,
+        check_compatibility=False,
+    )
+    if resume_meta is not None:
         run_id = str(resume_meta.get("run_id") or run_id)
     _set_progress_callback(run_id, progress_callback)
     state: GraphState = {

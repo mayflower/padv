@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import replace
+from typing import cast
 
 from padv.models import Candidate, ValidationClassProfile
 from padv.static.joern.query_sets import VULN_CLASS_SPECS
@@ -217,7 +218,7 @@ def canonical_issue_id(candidate: Candidate) -> str:
 
 def apply_validation_profile(candidate: Candidate) -> Candidate:
     profile = profile_for_vuln_class(candidate.canonical_class or candidate.vuln_class)
-    updated = replace(candidate)
+    updated = cast(Candidate, replace(candidate))
     updated.canonical_class = profile.canonical_class
     updated.validation_mode = profile.validation_mode
     if not updated.canonical_issue_id:

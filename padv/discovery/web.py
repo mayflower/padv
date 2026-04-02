@@ -469,6 +469,50 @@ def _empty_discovery_result(initial_queue: list[str] | None = None) -> dict[str,
     return {"hints": {}, "artifacts": {"seed_urls": list(initial_queue or []), "visited_urls": [], "pages": [], "requests": [], "errors": []}}
 
 
+def _collect_candidate_urls(observation: dict[str, Any], base_url: str) -> list[str]:
+    candidate_urls: list[str] = []
+    for raw in observation.get("urls", []):
+        normalized = _canonicalize_url(raw, base_url=base_url)
+        if normalized:
+            candidate_urls.append(normalized)
+    return candidate_urls
+
+
+def _build_page_record(
+    canonical_url: str,
+    current_path: str,
+    observation: dict[str, Any],
+    raw_params: list[str],
+    candidate_urls: list[str],
+) -> dict[str, Any]:
+    return {
+        "url": canonical_url, "path": current_path,
+        "summary": str(observation.get("summary", "")).strip(),
+        "title": str(observation.get("title", "")).strip(),
+        "headings": list(observation.get("headings", []))[:12],
+        "params": raw_params[:64],
+        "candidate_urls": candidate_urls[:24],
+        "forms": list(observation.get("forms", []))[:12],
+    }
+
+
+async def _navigate_and_extract_page(
+    page: Any,
+    current: str,
+    base_url: str,
+    timeout_ms: int,
+) -> tuple[str, str, list[str], list[str], dict[str, Any]]:
+    """Navigate to *current* and return (canonical_url, path, params, urls, observation)."""
+    await page.goto(current, wait_until="domcontentloaded", timeout=timeout_ms)
+    live_url = page.url or current
+    canonical = _canonicalize_url(live_url, base_url=base_url) or current
+    path, query_params = _normalize_path(canonical)
+    observation = await _extract_page_observations(page)
+    raw_params = list(observation.get("params", []))
+    candidate_urls = _collect_candidate_urls(observation, base_url)
+    return canonical, path, query_params + raw_params, candidate_urls, observation
+
+
 async def _discover_with_playwright_async(
     config: PadvConfig,
     seed_urls: list[str] | None = None,
@@ -499,7 +543,7 @@ async def _discover_with_playwright_async(
             seen = list(state.get("seen", []))
             visited = list(state.get("visited", []))
             found = dict(state.get("found", {}))
-            pages = list(state.get("pages", []))
+            pages_list = list(state.get("pages", []))
             errors = list(state.get("errors", []))
             steps = int(state.get("steps", 0))
 
@@ -507,46 +551,25 @@ async def _discover_with_playwright_async(
             if not current:
                 return {
                     "queue": queue, "seen": seen, "visited": visited,
-                    "found": found, "pages": pages, "requests": list(requests),
+                    "found": found, "pages": pages_list, "requests": list(requests),
                     "errors": errors, "steps": steps, "current_url": "",
                     "current_path": "", "candidate_urls": [], "candidate_params": [],
                 }
 
             steps += 1
-            candidate_urls: list[str] = []
-            candidate_params: list[str] = []
             canonical_current = current
             current_path = _normalize_path(current)[0]
+            candidate_urls: list[str] = []
+            candidate_params: list[str] = []
 
             try:
-                await page.goto(current, wait_until="domcontentloaded", timeout=timeout_ms)
-                live_url = page.url or current
-                canonical_current = _canonicalize_url(live_url, base_url=base_url) or current
-                current_path, query_params = _normalize_path(canonical_current)
-                found = _add_found(found, current_path, query_params)
-
-                observation = await _extract_page_observations(page)
-                raw_params = list(observation.get("params", []))
-                candidate_params = raw_params
-                found = _add_found(found, current_path, raw_params)
-
-                for raw in observation.get("urls", []):
-                    normalized = _canonicalize_url(raw, base_url=base_url)
-                    if normalized:
-                        candidate_urls.append(normalized)
-
-                _seed_urls_into_queue(candidate_urls, seen, visited, queue, max(config.web.max_pages * 6, 64))
-                pages.append(
-                    {
-                        "url": canonical_current, "path": current_path,
-                        "summary": str(observation.get("summary", "")).strip(),
-                        "title": str(observation.get("title", "")).strip(),
-                        "headings": list(observation.get("headings", []))[:12],
-                        "params": raw_params[:64],
-                        "candidate_urls": candidate_urls[:24],
-                        "forms": list(observation.get("forms", []))[:12],
-                    }
+                canonical_current, current_path, all_params, candidate_urls, obs = (
+                    await _navigate_and_extract_page(page, current, base_url, timeout_ms)
                 )
+                candidate_params = list(obs.get("params", []))
+                found = _add_found(found, current_path, all_params)
+                _seed_urls_into_queue(candidate_urls, seen, visited, queue, max(config.web.max_pages * 6, 64))
+                pages_list.append(_build_page_record(canonical_current, current_path, obs, candidate_params, candidate_urls))
             except Exception:
                 errors.append(f"navigation_failed:{current}")
 
@@ -555,7 +578,7 @@ async def _discover_with_playwright_async(
 
             return {
                 "queue": queue, "seen": seen, "visited": visited,
-                "found": found, "pages": pages, "requests": list(requests),
+                "found": found, "pages": pages_list, "requests": list(requests),
                 "errors": errors, "steps": steps, "current_url": canonical_current,
                 "current_path": current_path, "candidate_urls": candidate_urls,
                 "candidate_params": candidate_params,

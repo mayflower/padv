@@ -279,14 +279,13 @@ def _load_composer_payload(repo_root: Path) -> dict[str, object] | None:
     return payload
 
 
-def _load_composer_autoload_roots(repo_root: Path) -> list[str]:
-    payload = _load_composer_payload(repo_root)
-    if not isinstance(payload, dict):
-        return []
-    autoload = payload.get("autoload")
-    if not isinstance(autoload, dict):
-        return []
+def _normalize_autoload_path(raw: str) -> str | None:
+    normalized = normalize_repo_path(raw, repo_root=None)
+    normalized = normalized.removeprefix("./").strip("/")
+    return normalized or None
 
+
+def _collect_psr_roots(autoload: dict[str, object]) -> set[str]:
     roots: set[str] = set()
     for field in ("psr-4", "psr-0"):
         mapping = autoload.get(field)
@@ -296,19 +295,34 @@ def _load_composer_autoload_roots(repo_root: Path) -> list[str]:
             values = value if isinstance(value, list) else [value]
             for item in values:
                 if isinstance(item, str):
-                    normalized = normalize_repo_path(item, repo_root=None)
-                    normalized = normalized.removeprefix("./").strip("/")
-                    if normalized:
-                        roots.add(normalized)
-    classmap = autoload.get("classmap")
-    if isinstance(classmap, list):
-        for item in classmap:
-            if isinstance(item, str):
-                normalized = normalize_repo_path(item, repo_root=None)
-                normalized = normalized.removeprefix("./").strip("/")
-                if normalized:
-                    roots.add(normalized)
+                    path = _normalize_autoload_path(item)
+                    if path:
+                        roots.add(path)
+    return roots
 
+
+def _collect_classmap_roots(autoload: dict[str, object]) -> set[str]:
+    roots: set[str] = set()
+    classmap = autoload.get("classmap")
+    if not isinstance(classmap, list):
+        return roots
+    for item in classmap:
+        if isinstance(item, str):
+            path = _normalize_autoload_path(item)
+            if path:
+                roots.add(path)
+    return roots
+
+
+def _load_composer_autoload_roots(repo_root: Path) -> list[str]:
+    payload = _load_composer_payload(repo_root)
+    if not isinstance(payload, dict):
+        return []
+    autoload = payload.get("autoload")
+    if not isinstance(autoload, dict):
+        return []
+
+    roots = _collect_psr_roots(autoload) | _collect_classmap_roots(autoload)
     return sorted(roots)
 
 
@@ -322,29 +336,49 @@ def _path_is_within(rel_path: str, scope_root: str) -> bool:
     return len(path_parts) >= len(root_parts) and path_parts[: len(root_parts)] == root_parts
 
 
+def _entrypoint_dirs_for_base(repo_root: Path, app_base: PurePosixPath) -> set[str]:
+    base_path = repo_root / app_base.as_posix()
+    if not base_path.exists():
+        return set()
+    dirs: set[str] = set()
+    base_parts = app_base.parts
+    for index_file in base_path.rglob("index.php"):
+        try:
+            rel_path = index_file.relative_to(repo_root).as_posix()
+        except ValueError:
+            continue
+        if not is_app_candidate_path(rel_path):
+            continue
+        if len(PurePosixPath(rel_path).parts) - len(base_parts) > 2:
+            continue
+        dirs.add(PurePosixPath(rel_path).parent.as_posix())
+    return dirs
+
+
 def _discover_entrypoint_dirs(repo_root: Path, autoload_roots: list[str]) -> set[str]:
     entrypoint_dirs: set[str] = set()
     for root in autoload_roots:
-        root_path = PurePosixPath(root)
-        app_base = root_path.parent.parent
+        app_base = PurePosixPath(root).parent.parent
         if not app_base.parts:
             continue
-        base_path = repo_root / app_base.as_posix()
-        if not base_path.exists():
-            continue
-        for index_file in base_path.rglob("index.php"):
-            try:
-                rel_path = index_file.relative_to(repo_root).as_posix()
-            except ValueError:
-                continue
-            if not is_app_candidate_path(rel_path):
-                continue
-            rel_parts = PurePosixPath(rel_path).parts
-            base_parts = app_base.parts
-            if len(rel_parts) - len(base_parts) > 2:
-                continue
-            entrypoint_dirs.add(PurePosixPath(rel_path).parent.as_posix())
+        entrypoint_dirs |= _entrypoint_dirs_for_base(repo_root, app_base)
     return entrypoint_dirs
+
+
+def _path_matches_autoload_root(rel_path: str, root: str, entrypoint_dirs: set[str]) -> bool:
+    if _path_is_within(rel_path, root):
+        return True
+    path_parts = PurePosixPath(rel_path).parts
+    root_path = PurePosixPath(root)
+    source_parent = root_path.parent
+    if source_parent.parts and path_parts[:-1] == source_parent.parts:
+        return True
+    app_base = source_parent.parent
+    if app_base.parts and path_parts[:-1] == app_base.parts:
+        return True
+    if PurePosixPath(rel_path).parent.as_posix() in entrypoint_dirs:
+        return True
+    return False
 
 
 def _include_path_via_autoload_roots(
@@ -352,25 +386,7 @@ def _include_path_via_autoload_roots(
 ) -> bool:
     if not autoload_roots:
         return True
-
-    path_parts = PurePosixPath(rel_path).parts
-    for root in autoload_roots:
-        root_path = PurePosixPath(root)
-        root_parts = root_path.parts
-        if _path_is_within(rel_path, root):
-            return True
-
-        source_parent = root_path.parent
-        if source_parent.parts and path_parts[:-1] == source_parent.parts:
-            return True
-
-        app_base = source_parent.parent
-        if app_base.parts and path_parts[:-1] == app_base.parts:
-            return True
-        if PurePosixPath(rel_path).parent.as_posix() in entrypoint_dirs:
-            return True
-
-    return False
+    return any(_path_matches_autoload_root(rel_path, root, entrypoint_dirs) for root in autoload_roots)
 
 
 def _build_joern_parse_scope(repo_root: Path, staging_root: Path) -> Path:
@@ -441,16 +457,49 @@ def _remap_findings_to_repo_root(
     return remapped
 
 
+def _try_parse_marker_json(cleaned: str) -> list[JoernFinding] | None:
+    marker_match = _RESULT_MARKER.search(cleaned)
+    if not marker_match:
+        return None
+    try:
+        data = json.loads(marker_match.group(1))
+    except json.JSONDecodeError:
+        return None
+    if isinstance(data, list):
+        return _parse_joern_items(data)
+    return None
+
+
+def _decode_b64_items(candidate_region: str) -> list[object]:
+    items: list[object] = []
+    for encoded in _REPL_B64_STRING_RE.findall(candidate_region):
+        try:
+            payload = base64.b64decode(encoded).decode("utf-8")
+            items.append(json.loads(payload))
+        except Exception:
+            continue
+    return items
+
+
+def _parse_jsonl_items(text: str) -> list[object]:
+    items: list[object] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            items.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return items
+
+
 def _parse_joern_stdout_json(stdout: str) -> list[JoernFinding]:
     cleaned = _strip_ansi(stdout)
-    marker_match = _RESULT_MARKER.search(cleaned)
-    if marker_match:
-        try:
-            data = json.loads(marker_match.group(1))
-        except json.JSONDecodeError:
-            data = []
-        if isinstance(data, list):
-            return _parse_joern_items(data)
+
+    marker_result = _try_parse_marker_json(cleaned)
+    if marker_result is not None:
+        return marker_result
 
     block_matches = list(_REPL_LIST_BLOCK_RE.finditer(cleaned))
     if block_matches:
@@ -459,27 +508,13 @@ def _parse_joern_stdout_json(stdout: str) -> list[JoernFinding]:
         list_idx = cleaned.rfind("List(")
         candidate_region = cleaned[list_idx:] if list_idx != -1 else cleaned
 
-    decoded_items: list[object] = []
-    for encoded in _REPL_B64_STRING_RE.findall(candidate_region):
-        try:
-            payload = base64.b64decode(encoded).decode("utf-8")
-            decoded_items.append(json.loads(payload))
-        except Exception:
-            continue
+    decoded_items = _decode_b64_items(candidate_region)
     if decoded_items:
         return _parse_joern_items(decoded_items)
 
-    tmp_items: list[object] = []
-    for raw_line in cleaned.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        try:
-            tmp_items.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
-    if tmp_items:
-        return _parse_joern_items(tmp_items)
+    jsonl_items = _parse_jsonl_items(cleaned)
+    if jsonl_items:
+        return _parse_joern_items(jsonl_items)
 
     return _parse_joern_items(decoded_items)
 
@@ -690,6 +725,34 @@ def _discover_with_joern(
     return candidates, evidence, meta
 
 
+def _extract_dependency_names(payload: object) -> list[str]:
+    if not isinstance(payload, dict):
+        return []
+    names: list[str] = []
+    for field in ("require", "require-dev"):
+        deps = payload.get(field)
+        if isinstance(deps, dict):
+            names.extend(str(k) for k in deps.keys())
+    packages = payload.get("packages")
+    if isinstance(packages, list):
+        for package in packages:
+            if isinstance(package, dict) and package.get("name"):
+                names.append(str(package.get("name")))
+    return names
+
+
+def _manifest_snippet(raw_text: str) -> str:
+    try:
+        payload = json.loads(raw_text)
+        names = _extract_dependency_names(payload)
+        if names:
+            return "dependencies: " + ", ".join(names[:5])
+    except json.JSONDecodeError:
+        if raw_text.strip():
+            return raw_text.strip().replace("\n", " ")[:240]
+    return "composer manifest detected"
+
+
 def _discover_manifest_candidates(
     root: Path,
     config: PadvConfig,
@@ -707,31 +770,10 @@ def _discover_manifest_candidates(
             break
         if not manifest.exists() or not manifest.is_file():
             continue
-
         try:
             raw_text = manifest.read_text(encoding="utf-8", errors="ignore")
         except OSError:
             continue
-
-        snippet = "composer manifest detected"
-        try:
-            payload = json.loads(raw_text)
-            names: list[str] = []
-            if isinstance(payload, dict):
-                for field in ("require", "require-dev"):
-                    deps = payload.get(field)
-                    if isinstance(deps, dict):
-                        names.extend(str(k) for k in deps.keys())
-                packages = payload.get("packages")
-                if isinstance(packages, list):
-                    for package in packages:
-                        if isinstance(package, dict) and package.get("name"):
-                            names.append(str(package.get("name")))
-            if names:
-                snippet = "dependencies: " + ", ".join(names[:5])
-        except json.JSONDecodeError:
-            if raw_text.strip():
-                snippet = raw_text.strip().replace("\n", " ")[:240]
 
         rel_path = str(manifest.relative_to(root))
         candidate_id = f"cand-{len(candidates)+1:05d}"
@@ -741,7 +783,7 @@ def _discover_manifest_candidates(
             file_path=rel_path,
             line=1,
             sink="composer_dependency",
-            snippet=snippet,
+            snippet=_manifest_snippet(raw_text),
             query_profile=config.joern.query_profile,
             query_id="manifest::vulnerable_components",
             notes="dependency manifest detector",

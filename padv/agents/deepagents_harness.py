@@ -44,6 +44,7 @@ except Exception:  # pragma: no cover - optional at import time
 _JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(\{[^\}]*\})\s*```", re.DOTALL | re.IGNORECASE)
 _SEMANTIC_SIGNALS = frozenset({"joern", "scip"})
+_SKEPTIC_FOCUS = "exploit-invalidating objections only"
 _TRIAGE_FIELDS = (
     "reproducibility_gap",
     "legitimacy_gap",
@@ -232,12 +233,11 @@ def _repair_json_escape_at(payload: str, i: int, out: list[str]) -> int:
     if nxt in '"\\/bfnrtu':
         out.append("\\")
         out.append(nxt)
-        return i + 2
-    if nxt == "'":
+    elif nxt == "'":
         out.append("'")
-        return i + 2
-    out.append("\\\\")
-    out.append(nxt)
+    else:
+        out.append("\\\\")
+        out.append(nxt)
     return i + 2
 
 
@@ -1149,7 +1149,7 @@ def _compact_hypotheses_for_skeptic(hypotheses: list[Hypothesis], *, limit: int 
         item["auth_requirements"] = auth_requirements[:2]
         item["preconditions"] = preconditions[:2]
         item["environment_constraints_tracked_elsewhere"] = True
-        item["skeptic_focus"] = "exploit-invalidating objections only"
+        item["skeptic_focus"] = _SKEPTIC_FOCUS
     return compact
 
 
@@ -1339,78 +1339,79 @@ def _build_tool_use_detail(tool_name: str, **metadata: Any) -> str:
     return detail
 
 
-def _build_shared_context_tools(shared_context: dict[str, Any], repo_root: str | None, *, role: str) -> list[Any]:
-    try:
-        from langchain_core.tools import tool  # type: ignore[import-not-found]
-    except Exception as exc:
-        raise AgentExecutionError(f"langchain_core tools import failed: {exc}") from exc
+@dataclass
+class _ToolCtx:
+    """Shared state passed to tool-builder sub-functions."""
 
-    tools = _build_filesystem_tools(repo_root) if repo_root and role != "root" else []
-    workspace_dir = Path(str(shared_context.get("workspace_dir") or "")).resolve() if shared_context.get("workspace_dir") else None
+    shared_context: dict[str, Any]
+    role: str
+    workspace_dir: Path | None
+    repo_root: str | None
 
-    def _safe_workspace_path(rel_path: str) -> Path | None:
-        if workspace_dir is None:
+    def safe_workspace_path(self, rel_path: str) -> Path | None:
+        if self.workspace_dir is None:
             return None
         try:
-            candidate = (workspace_dir / rel_path).resolve()
+            candidate = (self.workspace_dir / rel_path).resolve()
         except Exception:
             return None
-        if workspace_dir == candidate or workspace_dir in candidate.parents:
+        if self.workspace_dir == candidate or self.workspace_dir in candidate.parents:
             return candidate
         return None
 
-    def _list_workspace(prefix: str = "") -> str:
-        if workspace_dir is None or not workspace_dir.exists():
+    def list_workspace(self, prefix: str = "") -> str:
+        if self.workspace_dir is None or not self.workspace_dir.exists():
             return "[]"
-        base = _safe_workspace_path(prefix.strip()) if prefix.strip() else workspace_dir
+        base = self.safe_workspace_path(prefix.strip()) if prefix.strip() else self.workspace_dir
         if base is None or not base.exists():
             return "[]"
         if base.is_file():
-            return json.dumps([str(base.relative_to(workspace_dir))], ensure_ascii=True)
-        items = sorted(
-            str(path.relative_to(workspace_dir))
-            for path in base.rglob("*.json")
-        )
+            return json.dumps([str(base.relative_to(self.workspace_dir))], ensure_ascii=True)
+        items = sorted(str(p.relative_to(self.workspace_dir)) for p in base.rglob("*.json"))
         return json.dumps(items[:500], ensure_ascii=True)
 
-    def _write_role_workspace(category: str, payload: dict[str, Any]) -> str:
-        if workspace_dir is None:
+    def write_role_workspace(self, category: str, payload: dict[str, Any]) -> str:
+        if self.workspace_dir is None:
             return "workspace unavailable"
         artifact_id = uuid.uuid4().hex[:12]
-        path = workspace_dir / role / category / f"{artifact_id}.json"
+        path = self.workspace_dir / self.role / category / f"{artifact_id}.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
-        relative = str(path.relative_to(workspace_dir))
-        _append_workspace_index_ref(shared_context, role=role, category=category, relative=relative)
+        relative = str(path.relative_to(self.workspace_dir))
+        _append_workspace_index_ref(self.shared_context, role=self.role, category=category, relative=relative)
         return relative
 
-    def _record_tool_use(tool_name: str, **metadata: Any) -> None:
-        payload = {"role": role, "tool": str(tool_name), **metadata}
-        relative = _write_role_workspace("tool_calls", payload)
-        _append_shared_context_entry(shared_context, key="tool_usage", role=role, payload={"ref": relative, **payload})
+    def record_tool_use(self, tool_name: str, **metadata: Any) -> None:
+        payload = {"role": self.role, "tool": str(tool_name), **metadata}
+        relative = self.write_role_workspace("tool_calls", payload)
+        _append_shared_context_entry(self.shared_context, key="tool_usage", role=self.role, payload={"ref": relative, **payload})
         detail = _build_tool_use_detail(tool_name, **metadata)
-        _emit_shared_progress(shared_context, role=role, status="activity", detail=detail, artifact_ref=relative, tool=tool_name)
+        _emit_shared_progress(self.shared_context, role=self.role, status="activity", detail=detail, artifact_ref=relative, tool=tool_name)
+
+
+def _build_query_tools(ctx: _ToolCtx, tool: Any) -> list[Any]:
+    """Build context-query tools (objectives, findings, hypotheses, etc.)."""
 
     @tool("search_repo_text")
     def search_repo_text(pattern: str) -> str:
         """Search the repo with ripgrep and return matching lines."""
         token = str(pattern or "").strip()
-        if not token or not repo_root:
+        if not token or not ctx.repo_root:
             return "search unavailable"
-        _record_tool_use("search_repo_text", pattern=token[:240])
-        return _run_repo_command(repo_root, f"rg -n --hidden --glob '!vendor' --glob '!node_modules' {shlex.quote(token)} .")
+        ctx.record_tool_use("search_repo_text", pattern=token[:240])
+        return _run_repo_command(ctx.repo_root, f"rg -n --hidden --glob '!vendor' --glob '!node_modules' {shlex.quote(token)} .")
 
     @tool("list_objectives")
     def list_objectives(_: str = "") -> str:
         """List current objective queue."""
-        payload = _shared_context_snapshot(shared_context, "objective_queue", [])
-        _record_tool_use("list_objectives", count=min(len(payload), 50) if isinstance(payload, list) else 0)
+        payload = _shared_context_snapshot(ctx.shared_context, "objective_queue", [])
+        ctx.record_tool_use("list_objectives", count=min(len(payload), 50) if isinstance(payload, list) else 0)
         return json.dumps(payload[:50], ensure_ascii=True)
 
     @tool("list_research_findings")
     def list_research_findings(channel: str = "") -> str:
         """List current research findings, optionally filtered by channel."""
-        findings = _shared_context_snapshot(shared_context, "research_findings", [])
+        findings = _shared_context_snapshot(ctx.shared_context, "research_findings", [])
         if not isinstance(findings, list):
             return "[]"
         wanted = str(channel or "").strip().lower()
@@ -1418,118 +1419,136 @@ def _build_shared_context_tools(shared_context: dict[str, Any], repo_root: str |
             item for item in findings
             if isinstance(item, dict) and (not wanted or str(item.get("channel", "")).strip().lower() == wanted)
         ]
-        _record_tool_use("list_research_findings", channel=wanted, count=min(len(filtered), 100))
+        ctx.record_tool_use("list_research_findings", channel=wanted, count=min(len(filtered), 100))
         return json.dumps(filtered[:100], ensure_ascii=True)
 
     @tool("list_hypotheses")
     def list_hypotheses(selector: str = "") -> str:
         """List current hypotheses filtered by objective, class, candidate or text selector."""
-        items = _shared_context_snapshot(shared_context, "hypotheses", [])
+        items = _shared_context_snapshot(ctx.shared_context, "hypotheses", [])
         if not isinstance(items, list):
             return "[]"
         token = str(selector or "").strip().lower()
         filtered = _filter_shared_list_by_selector(items, token)
-        _record_tool_use("list_hypotheses", selector=token[:120], count=len(filtered))
+        ctx.record_tool_use("list_hypotheses", selector=token[:120], count=len(filtered))
         return json.dumps(filtered, ensure_ascii=True)
 
     @tool("list_refutations")
     def list_refutations(selector: str = "") -> str:
         """List current refutations filtered by hypothesis, severity or text selector."""
-        items = _shared_context_snapshot(shared_context, "refutations", [])
+        items = _shared_context_snapshot(ctx.shared_context, "refutations", [])
         if not isinstance(items, list):
             return "[]"
         token = str(selector or "").strip().lower()
         filtered = _filter_shared_list_by_selector(items, token)
-        _record_tool_use("list_refutations", selector=token[:120], count=len(filtered))
+        ctx.record_tool_use("list_refutations", selector=token[:120], count=len(filtered))
         return json.dumps(filtered, ensure_ascii=True)
 
     @tool("list_experiment_attempts")
     def list_experiment_attempts(selector: str = "") -> str:
         """List current planned experiment attempts filtered by hypothesis or text selector."""
-        items = _shared_context_snapshot(shared_context, "experiment_board", [])
+        items = _shared_context_snapshot(ctx.shared_context, "experiment_board", [])
         if not isinstance(items, list):
             return "[]"
         token = str(selector or "").strip().lower()
         filtered = _filter_shared_list_by_selector(items, token)
-        _record_tool_use("list_experiment_attempts", selector=token[:120], count=len(filtered))
+        ctx.record_tool_use("list_experiment_attempts", selector=token[:120], count=len(filtered))
         return json.dumps(filtered, ensure_ascii=True)
 
     @tool("list_task_delegations")
     def list_task_delegations(selector: str = "") -> str:
         """List recorded root task delegations filtered by subagent type or text selector."""
-        items = _shared_context_snapshot(shared_context, "delegations", [])
+        items = _shared_context_snapshot(ctx.shared_context, "delegations", [])
         if not isinstance(items, list):
             return "[]"
         token = str(selector or "").strip().lower()
         filtered = _filter_shared_list_by_selector(items, token)
-        _record_tool_use("list_task_delegations", selector=token[:120], count=len(filtered))
+        ctx.record_tool_use("list_task_delegations", selector=token[:120], count=len(filtered))
         return json.dumps(filtered, ensure_ascii=True)
+
+    result = [
+        list_objectives, list_research_findings, list_hypotheses,
+        list_refutations, list_experiment_attempts, list_task_delegations,
+    ]
+    if ctx.role != "root":
+        result = [search_repo_text, *result]
+    return result
+
+
+def _build_evidence_tools(ctx: _ToolCtx, tool: Any) -> list[Any]:
+    """Build evidence and candidate lookup/summarize tools."""
 
     @tool("lookup_semantic_evidence")
     def lookup_semantic_evidence(selector: str = "") -> str:
         """Return semantic evidence refs and snippets for SCIP/Joern selectors."""
         token = str(selector or "").strip().lower()
-        evidence = _shared_context_snapshot(shared_context, "static_evidence", [])
+        evidence = _shared_context_snapshot(ctx.shared_context, "static_evidence", [])
         if not isinstance(evidence, list):
             return "[]"
         filtered = _filter_shared_list_by_selector(
             evidence, token, haystack_keys=["candidate_id", "query_id", "file_path", "snippet"],
         )
-        _record_tool_use("lookup_semantic_evidence", selector=token[:120], count=len(filtered))
+        ctx.record_tool_use("lookup_semantic_evidence", selector=token[:120], count=len(filtered))
         return json.dumps(filtered, ensure_ascii=True)
 
     @tool("summarize_semantic_evidence")
     def summarize_semantic_evidence(_: str = "") -> str:
         """Return aggregate counts and representative samples across all semantic evidence."""
-        evidence = _shared_context_snapshot(shared_context, "static_evidence", [])
+        evidence = _shared_context_snapshot(ctx.shared_context, "static_evidence", [])
         if not isinstance(evidence, list):
             return "{}"
         summary = _summarize_evidence_by_class(evidence)
-        _record_tool_use("summarize_semantic_evidence", class_count=summary.pop("_class_count", 0), total=summary["total"])
+        ctx.record_tool_use("summarize_semantic_evidence", class_count=summary.pop("_class_count", 0), total=summary["total"])
         return json.dumps(summary, ensure_ascii=True)
 
     @tool("lookup_candidate_seeds")
     def lookup_candidate_seeds(selector: str = "") -> str:
         """Return candidate seed records filtered by selector."""
         token = str(selector or "").strip().lower()
-        candidates = _shared_context_snapshot(shared_context, "candidate_seeds", [])
+        candidates = _shared_context_snapshot(ctx.shared_context, "candidate_seeds", [])
         if not isinstance(candidates, list):
             return "[]"
         filtered = _filter_shared_list_by_selector(
             candidates, token, haystack_keys=["candidate_id", "vuln_class", "file_path", "sink"],
         )
-        _record_tool_use("lookup_candidate_seeds", selector=token[:120], count=len(filtered))
+        ctx.record_tool_use("lookup_candidate_seeds", selector=token[:120], count=len(filtered))
         return json.dumps(filtered, ensure_ascii=True)
 
     @tool("summarize_candidate_seeds")
     def summarize_candidate_seeds(_: str = "") -> str:
         """Return aggregate counts and representative samples across all candidate seeds."""
-        candidates = _shared_context_snapshot(shared_context, "candidate_seeds", [])
+        candidates = _shared_context_snapshot(ctx.shared_context, "candidate_seeds", [])
         if not isinstance(candidates, list):
             return "{}"
         summary = _summarize_candidates_by_class(candidates)
-        _record_tool_use("summarize_candidate_seeds", class_count=summary.pop("_class_count", 0), total=summary["total"])
+        ctx.record_tool_use("summarize_candidate_seeds", class_count=summary.pop("_class_count", 0), total=summary["total"])
         return json.dumps(summary, ensure_ascii=True)
+
+    return [lookup_semantic_evidence, summarize_semantic_evidence, lookup_candidate_seeds, summarize_candidate_seeds]
+
+
+def _build_state_tools(ctx: _ToolCtx, tool: Any) -> list[Any]:
+    """Build web-state, playwright-artifact, and runtime-history lookup tools."""
 
     @tool("lookup_web_state")
     def lookup_web_state(selector: str = "") -> str:
         """Return Playwright-derived web artifacts, hints, auth contexts and discovery artifacts."""
         token = str(selector or "").strip().lower()
         payload = {
-            "web_hints": _shared_context_snapshot(shared_context, "web_hints", {}),
-            "web_artifacts": _shared_context_snapshot(shared_context, "web_artifacts", {}),
-            "auth_contexts": _shared_context_snapshot(shared_context, "auth_contexts", {}),
-            "artifact_index": _shared_context_snapshot(shared_context, "artifact_index", {}),
+            "web_hints": _shared_context_snapshot(ctx.shared_context, "web_hints", {}),
+            "web_artifacts": _shared_context_snapshot(ctx.shared_context, "web_artifacts", {}),
+            "auth_contexts": _shared_context_snapshot(ctx.shared_context, "auth_contexts", {}),
+            "artifact_index": _shared_context_snapshot(ctx.shared_context, "artifact_index", {}),
         }
         result = _filter_dict_payload_by_selector(payload, token)
-        _record_tool_use("lookup_web_state", selector=token[:120], keys=sorted(result.keys()))
+        ctx.record_tool_use("lookup_web_state", selector=token[:120], keys=sorted(result.keys()))
         return json.dumps(result, ensure_ascii=True)
 
     @tool("lookup_playwright_artifacts")
     def lookup_playwright_artifacts(selector: str = "") -> str:
         """Return persisted Playwright-discovered pages and requests filtered by selector."""
         token = str(selector or "").strip().lower()
-        artifacts = _shared_context_snapshot(shared_context, "web_artifacts", {})
+        artifacts = _shared_context_snapshot(ctx.shared_context, "web_artifacts", {})
         if not isinstance(artifacts, dict):
             return "{}"
         payload = {
@@ -1539,7 +1558,7 @@ def _build_shared_context_tools(shared_context: dict[str, Any], repo_root: str |
             "errors": artifacts.get("errors", []),
         }
         result = _filter_dict_payload_by_selector(payload, token)
-        _record_tool_use("lookup_playwright_artifacts", selector=token[:120], keys=sorted(result.keys()))
+        ctx.record_tool_use("lookup_playwright_artifacts", selector=token[:120], keys=sorted(result.keys()))
         return json.dumps(result, ensure_ascii=True)
 
     @tool("lookup_runtime_history")
@@ -1547,25 +1566,31 @@ def _build_shared_context_tools(shared_context: dict[str, Any], repo_root: str |
         """Return runtime history and witness bundles."""
         token = str(selector or "").strip().lower()
         payload = {
-            "runtime_history": _shared_context_snapshot(shared_context, "runtime_history", []),
-            "witness_bundles": _shared_context_snapshot(shared_context, "witness_bundles", []),
-            "gate_history": _shared_context_snapshot(shared_context, "gate_history", []),
+            "runtime_history": _shared_context_snapshot(ctx.shared_context, "runtime_history", []),
+            "witness_bundles": _shared_context_snapshot(ctx.shared_context, "witness_bundles", []),
+            "gate_history": _shared_context_snapshot(ctx.shared_context, "gate_history", []),
         }
         result = _filter_dict_payload_by_selector(payload, token)
-        _record_tool_use("lookup_runtime_history", selector=token[:120], keys=sorted(result.keys()))
+        ctx.record_tool_use("lookup_runtime_history", selector=token[:120], keys=sorted(result.keys()))
         return json.dumps(result, ensure_ascii=True)
+
+    return [lookup_web_state, lookup_playwright_artifacts, lookup_runtime_history]
+
+
+def _build_workspace_tools(ctx: _ToolCtx, tool: Any) -> list[Any]:
+    """Build workspace management tools (list, read, write)."""
 
     @tool("list_agent_workspace")
     def list_agent_workspace(prefix: str = "") -> str:
         """List persisted agent workspace artifacts by relative prefix."""
-        _record_tool_use("list_agent_workspace", prefix=str(prefix or "")[:240])
-        return _list_workspace(prefix)
+        ctx.record_tool_use("list_agent_workspace", prefix=str(prefix or "")[:240])
+        return ctx.list_workspace(prefix)
 
     @tool("read_agent_workspace")
     def read_agent_workspace(path: str) -> str:
         """Read a persisted agent workspace artifact by relative path."""
-        _record_tool_use("read_agent_workspace", path=str(path or "")[:240])
-        target = _safe_workspace_path(path)
+        ctx.record_tool_use("read_agent_workspace", path=str(path or "")[:240])
+        target = ctx.safe_workspace_path(path)
         if target is None or not target.exists() or not target.is_file():
             return "invalid workspace path"
         try:
@@ -1576,27 +1601,27 @@ def _build_shared_context_tools(shared_context: dict[str, Any], repo_root: str |
     @tool("list_role_workspace")
     def list_role_workspace(category: str = "") -> str:
         """List persisted workspace artifacts for the current agent role."""
-        prefix = role if not str(category or "").strip() else f"{role}/{str(category).strip().strip('/')}"
-        _record_tool_use("list_role_workspace", category=str(category or "")[:120], prefix=prefix[:240])
-        return _list_workspace(prefix)
+        prefix = ctx.role if not str(category or "").strip() else f"{ctx.role}/{str(category).strip().strip('/')}"
+        ctx.record_tool_use("list_role_workspace", category=str(category or "")[:120], prefix=prefix[:240])
+        return ctx.list_workspace(prefix)
 
     @tool("write_agent_worklog")
     def write_agent_worklog(category: str, summary: str, details: str = "", refs_json: str = "[]") -> str:
         """Persist a role-local worklog note with optional evidence refs."""
         note_category = str(category or "").strip() or "general"
         payload = {
-            "role": role,
+            "role": ctx.role,
             "category": note_category,
             "summary": str(summary or "").strip(),
             "details": str(details or "").strip(),
             "refs": _parse_json_list(refs_json),
         }
-        relative = _write_role_workspace("worklog", payload)
-        _append_shared_context_entry(shared_context, key="worklog", role=role, payload={"ref": relative, **payload})
+        relative = ctx.write_role_workspace("worklog", payload)
+        _append_shared_context_entry(ctx.shared_context, key="worklog", role=ctx.role, payload={"ref": relative, **payload})
         summary_text = str(payload.get("summary", "")).strip()
         _emit_shared_progress(
-            shared_context,
-            role=role,
+            ctx.shared_context,
+            role=ctx.role,
             status="worklog",
             detail=f"{note_category}: {summary_text[:120]}".strip(": "),
             artifact_ref=relative,
@@ -1604,28 +1629,26 @@ def _build_shared_context_tools(shared_context: dict[str, Any], repo_root: str |
         )
         return relative
 
-    shared_tools = [
-        list_objectives,
-        list_research_findings,
-        list_hypotheses,
-        list_refutations,
-        list_experiment_attempts,
-        list_task_delegations,
-        summarize_semantic_evidence,
-        lookup_semantic_evidence,
-        summarize_candidate_seeds,
-        lookup_candidate_seeds,
-        lookup_web_state,
-        lookup_playwright_artifacts,
-        lookup_runtime_history,
-        list_agent_workspace,
-        read_agent_workspace,
-        list_role_workspace,
-        write_agent_worklog,
-    ]
-    if role != "root":
-        shared_tools = [search_repo_text, *shared_tools]
-    return tools + shared_tools
+    return [list_agent_workspace, read_agent_workspace, list_role_workspace, write_agent_worklog]
+
+
+def _build_shared_context_tools(shared_context: dict[str, Any], repo_root: str | None, *, role: str) -> list[Any]:
+    try:
+        from langchain_core.tools import tool  # type: ignore[import-not-found]
+    except Exception as exc:
+        raise AgentExecutionError(f"langchain_core tools import failed: {exc}") from exc
+
+    fs_tools = _build_filesystem_tools(repo_root) if repo_root and role != "root" else []
+    workspace_dir = Path(str(shared_context.get("workspace_dir") or "")).resolve() if shared_context.get("workspace_dir") else None
+    ctx = _ToolCtx(shared_context=shared_context, role=role, workspace_dir=workspace_dir, repo_root=repo_root)
+
+    return (
+        fs_tools
+        + _build_query_tools(ctx, tool)
+        + _build_evidence_tools(ctx, tool)
+        + _build_state_tools(ctx, tool)
+        + _build_workspace_tools(ctx, tool)
+    )
 
 
 def _agent_thread_id(frontier_state: dict[str, Any] | None, *, role: str, prefix: str) -> str:
@@ -3936,7 +3959,7 @@ def challenge_hypotheses_with_subagent(
             envelope={
                 "hypotheses": _compact_hypotheses_for_skeptic(prioritized_hypotheses, limit=3),
                 "skeptic_scope": {
-                    "focus": "exploit-invalidating objections only",
+                    "focus": _SKEPTIC_FOCUS,
                     "defer_environmental_constraints": True,
                 },
             },
@@ -4015,7 +4038,7 @@ def _plan_experiments_primary(
         envelope={
             "hypotheses": _compact_hypotheses_for_skeptic(prioritized_hypotheses, limit=3),
             "skeptic_scope": {
-                "focus": "exploit-invalidating objections only",
+                "focus": _SKEPTIC_FOCUS,
                 "defer_environmental_constraints": True,
             },
         },
