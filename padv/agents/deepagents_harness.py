@@ -3577,6 +3577,8 @@ def _ensure_positive_request_count(
     min_count: int,
     canary_param: str,
 ) -> list[dict[str, Any]]:
+    if not positive_requests:
+        return positive_requests
     while len(positive_requests) < min_count:
         clone = dict(positive_requests[-1])
         clone_query = dict(clone.get("query", {}))
@@ -3593,8 +3595,10 @@ def _ensure_negative_request_count(
     canonical_class: str,
 ) -> list[dict[str, Any]]:
     if not negative_requests:
+        if not positive_requests:
+            return negative_requests
         negative_requests = [_neutralize_control_request(positive_requests[0], "control-0", canonical_class)]
-    while len(negative_requests) < min_count:
+    while len(negative_requests) < min_count and positive_requests:
         source_idx = min(len(negative_requests), len(positive_requests) - 1)
         negative_requests.append(
             _neutralize_control_request(positive_requests[source_idx], f"control-{len(negative_requests)}", canonical_class)
@@ -4072,6 +4076,12 @@ def plan_experiments_with_subagent(
     *,
     hypotheses: list[Hypothesis],
 ) -> tuple[dict[str, ValidationPlan], list[ExperimentAttempt], dict[str, Any]]:
+    # NOTE: config.agent.max_parallel_experiments is defined but not yet
+    # wired. Experiment planning currently runs sequentially. When parallel
+    # experiment execution is implemented, this value should cap the number
+    # of concurrent experiment subagent invocations.
+    # Similarly, config.agent.max_parallel_research and
+    # config.agent.max_parallel_skeptic are reserved for future parallelism.
     prioritized_hypotheses = sorted(
         hypotheses,
         key=lambda item: float(item.confidence or 0.0),

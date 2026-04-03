@@ -58,6 +58,8 @@ AUTHZ_VULN_CLASSES: frozenset[str] = frozenset(
         "broken_access_control",
         "idor_invariant_missing",
         "auth_and_session_failures",
+        "csrf_invariant_missing",
+        "session_fixation_invariant",
     }
 )
 

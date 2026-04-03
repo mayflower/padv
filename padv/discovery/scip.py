@@ -454,7 +454,9 @@ def discover_scip_candidates_safe_with_meta(
         candidates, evidence, refs, meta = discover_scip_candidates_with_meta(repo_root, config)
         return candidates, evidence, refs, meta, None
     except Exception as exc:
-        raise ScipExecutionError(str(exc)) from exc
+        if config.scip.hard_fail:
+            raise ScipExecutionError(str(exc)) from exc
+        return [], [], [], ScipDiscoveryMeta(0, 0, 0, 0, 0), str(exc)
 
 
 def discover_scip_candidates_safe(

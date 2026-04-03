@@ -554,6 +554,10 @@ def _run_joern_parse(repo_root: Path, cpg_path: Path, config: PadvConfig) -> Non
             check=False,
             timeout=config.joern.timeout_seconds,
         )
+    except subprocess.TimeoutExpired as exc:
+        raise JoernExecutionError(
+            f"joern parse command timed out ({config.joern.timeout_seconds}s)"
+        ) from exc
     except OSError as exc:
         raise JoernExecutionError(f"unable to execute joern parse command: {exc}") from exc
 
@@ -660,6 +664,10 @@ def _run_joern_findings_script(repo_root: Path, config: PadvConfig) -> list[Joer
                 check=False,
                 timeout=config.joern.timeout_seconds,
             )
+        except subprocess.TimeoutExpired as exc:
+            raise JoernExecutionError(
+                f"joern script command timed out ({config.joern.timeout_seconds}s)"
+            ) from exc
         except OSError as exc:
             raise JoernExecutionError(f"unable to execute joern command: {exc}") from exc
 

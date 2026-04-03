@@ -935,6 +935,8 @@ def _execute_differential_request(
         unpriv_runtime.aux["auth_context"] = context
         elapsed_ms = int((monotonic() - req_started) * 1000)
         _record_attempt(attempts, seen_flags, phase="differential", idx=diff_idx, request_spec=unpriv_request, runtime=unpriv_runtime, elapsed_ms=elapsed_ms)
+        if not positive_runs:
+            return None
         return compare_responses(positive_runs[0], unpriv_runtime, config)
     except RequestError:
         return None

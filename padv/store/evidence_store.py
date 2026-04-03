@@ -62,7 +62,10 @@ class EvidenceStore:
     def load_candidates(self) -> list[Candidate]:
         if not self.candidates_file.exists():
             return []
-        data = json.loads(self.candidates_file.read_text())
+        try:
+            data = json.loads(self.candidates_file.read_text())
+        except json.JSONDecodeError:
+            return []
         out: list[Candidate] = []
         for item in data:
             out.append(Candidate(**item))
@@ -76,7 +79,10 @@ class EvidenceStore:
     def load_static_evidence(self) -> list[StaticEvidence]:
         if not self.static_evidence_file.exists():
             return []
-        data = json.loads(self.static_evidence_file.read_text())
+        try:
+            data = json.loads(self.static_evidence_file.read_text())
+        except json.JSONDecodeError:
+            return []
         out: list[StaticEvidence] = []
         for item in data:
             out.append(StaticEvidence(**item))
@@ -92,7 +98,10 @@ class EvidenceStore:
         path = self.bundles_dir / f"{bundle_id}.json"
         if not path.exists():
             return None
-        return json.loads(path.read_text())
+        try:
+            return json.loads(path.read_text())
+        except json.JSONDecodeError:
+            return None
 
     def list_bundle_ids(self) -> list[str]:
         if not self.bundles_dir.exists():
@@ -109,7 +118,10 @@ class EvidenceStore:
         path = self.runs_dir / f"{run_id}.json"
         if not path.exists():
             return None
-        return json.loads(path.read_text())
+        try:
+            return json.loads(path.read_text())
+        except json.JSONDecodeError:
+            return None
 
     def list_run_ids(self) -> list[str]:
         if not self.runs_dir.exists():
@@ -124,7 +136,10 @@ class EvidenceStore:
     def load_frontier_state(self) -> dict[str, Any] | None:
         if not self.frontier_file.exists():
             return None
-        data = json.loads(self.frontier_file.read_text())
+        try:
+            data = json.loads(self.frontier_file.read_text())
+        except json.JSONDecodeError:
+            return None
         if isinstance(data, dict):
             return data
         return None
@@ -140,7 +155,10 @@ class EvidenceStore:
         path = self.root / relative_path
         if not path.exists():
             return None
-        data = json.loads(path.read_text())
+        try:
+            data = json.loads(path.read_text())
+        except json.JSONDecodeError:
+            return None
         if isinstance(data, (dict, list)):
             return data
         return None
@@ -155,7 +173,10 @@ class EvidenceStore:
         path = self.resume_dir / f"{run_id}.json"
         if not path.exists():
             return None
-        data = json.loads(path.read_text())
+        try:
+            data = json.loads(path.read_text())
+        except json.JSONDecodeError:
+            return None
         if isinstance(data, dict):
             return data
         return None

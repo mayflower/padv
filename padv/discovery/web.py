@@ -725,6 +725,9 @@ async def _submit_login_form(page: Any, submit_selector: str) -> None:
 
 
 async def _auth_with_playwright_async(config: PadvConfig) -> dict[str, Any]:
+    # NOTE: config.auth.profile_path is reserved for future browser profile
+    # persistence (storing/restoring Playwright storage state across runs).
+    # Currently, a fresh browser context is created each time.
     from playwright.async_api import async_playwright  # type: ignore[import-not-found]
 
     if not config.auth.enabled:
