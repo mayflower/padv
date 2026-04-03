@@ -1804,6 +1804,9 @@ def test_state_runtime_rehydrates_shared_context_from_state_on_resume(
     state["hypothesis_board"] = []
     state["refutations"] = []
     state["experiment_board"] = []
+    # Mark dirty so _state_runtime re-syncs after direct state mutation.
+    # In the real graph, _finalize_stage handles this automatically.
+    graph_mod._RUNTIME_SYNC_DIRTY.add(run_id)
     graph_mod._state_runtime(state)
 
     assert runtime.shared_context["hypotheses"] == []

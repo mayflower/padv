@@ -36,7 +36,12 @@ from padv.orchestrator.differential import (
     resolve_auth_state_for_level,
 )
 from padv.store.evidence_store import EvidenceStore
-from padv.taxonomy import canonicalize_vuln_class
+from padv.taxonomy import (
+    CLASS_ORACLE_WITNESS_FLAGS,
+    SQL_ERROR_MARKERS,
+    canonicalize_vuln_class,
+    contains_canary,
+)
 from padv.validation.contracts import apply_validation_profile, is_runtime_validatable, profile_for_vuln_class
 
 
@@ -60,7 +65,7 @@ _AUTHZ_PROBE_CLASSES = {
 
 _ERROR_MARKERS = ("warning:", "notice:", "fatal error", "stack trace", "uncaught exception")
 _LOGIN_MARKERS = ("login", "sign in", "signin", "anmelden", "auth", "passwort", "password")
-_SQL_ERROR_MARKERS = ("sql syntax", "mysql", "mysqli", "pdoexception", "syntax error near", "postgresql", "sqlite", "ora-")
+_SQL_ERROR_MARKERS = SQL_ERROR_MARKERS
 _NONBLOCKING_PRECONDITION_EXACT = {
     "runtime-oracle-not-applicable",
     "auth-state-known",
@@ -127,24 +132,7 @@ _AUTH_PRECONDITION_HINTS = (
     "privileged",
 )
 
-_CLASS_ORACLE_WITNESS_FLAGS: dict[str, str] = {
-    "sql_injection_boundary": "sql_sink_oracle_witness",
-    "command_injection_boundary": "command_sink_oracle_witness",
-    "code_injection_boundary": "code_sink_oracle_witness",
-    "ldap_injection_boundary": "ldap_sink_oracle_witness",
-    "xpath_injection_boundary": "xpath_sink_oracle_witness",
-    "file_boundary_influence": "file_sink_oracle_witness",
-    "file_upload_influence": "upload_sink_oracle_witness",
-    "outbound_request_influence": "ssrf_sink_oracle_witness",
-    "ssrf": "ssrf_sink_oracle_witness",
-    "xxe_influence": "xxe_sink_oracle_witness",
-    "deserialization_influence": "deserialization_sink_oracle_witness",
-    "php_object_gadget_surface": "gadget_sink_oracle_witness",
-    "header_injection_boundary": "header_sink_oracle_witness",
-    "regex_dos_boundary": "regex_sink_oracle_witness",
-    "xml_dos_boundary": "xml_sink_oracle_witness",
-    "security_misconfiguration": "misconfiguration_sink_oracle_witness",
-}
+_CLASS_ORACLE_WITNESS_FLAGS = CLASS_ORACLE_WITNESS_FLAGS
 
 
 def new_run_id(prefix: str = "run") -> str:
@@ -510,13 +498,12 @@ def _normalize_gate_preconditions(
 
 
 def _contains_canary(arg: str, canary: str, config: PadvConfig) -> bool:
-    candidates = [arg]
-    if config.canary.allow_url_decode:
-        candidates.append(urllib.parse.unquote(arg))
-    if config.canary.allow_casefold:
-        folded = canary.casefold()
-        return any(folded in value.casefold() for value in candidates)
-    return any(canary in value for value in candidates)
+    return contains_canary(
+        arg,
+        canary,
+        allow_casefold=config.canary.allow_casefold,
+        allow_url_decode=config.canary.allow_url_decode,
+    )
 
 
 def _has_class_oracle_witness(
@@ -820,10 +807,12 @@ def _try_anonymous_probe(
 
 
 def _run_positive_phase(
-    config: PadvConfig, candidate: Candidate, plan: ValidationPlan,
-    cookie_jar: dict[str, str], request_budget_remaining: int, candidate_deadline: float,
+    ctx: _ValidationContext, candidate: Candidate, plan: ValidationPlan,
+    request_budget_remaining: int, candidate_deadline: float,
     attempts: list[dict[str, Any]], seen_flags: set[str],
 ) -> tuple[list[RuntimeEvidence], list[str], int]:
+    config = ctx.config
+    cookie_jar = ctx.cookie_jar
     positive_runs: list[RuntimeEvidence] = []
     repro_ids: list[str] = []
     budget = request_budget_remaining
@@ -865,10 +854,12 @@ def _run_positive_phase(
 
 
 def _run_negative_phase(
-    config: PadvConfig, candidate: Candidate, plan: ValidationPlan,
-    cookie_jar: dict[str, str], request_budget_remaining: int, candidate_deadline: float,
+    ctx: _ValidationContext, candidate: Candidate, plan: ValidationPlan,
+    request_budget_remaining: int, candidate_deadline: float,
     attempts: list[dict[str, Any]], seen_flags: set[str],
 ) -> tuple[list[RuntimeEvidence], int]:
+    config = ctx.config
+    cookie_jar = ctx.cookie_jar
     negative_runs: list[RuntimeEvidence] = []
     budget = request_budget_remaining
     for idx, request_spec in enumerate(plan.negative_requests):
@@ -957,11 +948,13 @@ def _resolve_differential_levels(config: PadvConfig) -> list[str]:
 
 
 def _run_differential_phase(
-    config: PadvConfig, candidate: Candidate, plan: ValidationPlan,
-    positive_runs: list[RuntimeEvidence], auth_state: dict[str, Any],
+    ctx: _ValidationContext, candidate: Candidate, plan: ValidationPlan,
+    positive_runs: list[RuntimeEvidence],
     request_budget_remaining: int, candidate_deadline: float,
     attempts: list[dict[str, Any]], seen_flags: set[str],
 ) -> tuple[list[DifferentialPair], int]:
+    config = ctx.config
+    auth_state = ctx.auth_state
     pairs: list[DifferentialPair] = []
     budget = request_budget_remaining
     if not config.differential.enabled or not needs_differential(candidate.vuln_class):
@@ -1092,17 +1085,17 @@ def _validate_single_candidate_runtime(
     total_cost = 0
 
     positive_runs, repro_ids, pos_cost = _run_positive_phase(
-        config, candidate, plan, ctx.cookie_jar, request_budget_remaining, candidate_deadline, attempts, seen_flags,
+        ctx, candidate, plan, request_budget_remaining, candidate_deadline, attempts, seen_flags,
     )
     total_cost += pos_cost
 
     negative_runs, neg_cost = _run_negative_phase(
-        config, candidate, plan, ctx.cookie_jar, request_budget_remaining - total_cost, candidate_deadline, attempts, seen_flags,
+        ctx, candidate, plan, request_budget_remaining - total_cost, candidate_deadline, attempts, seen_flags,
     )
     total_cost += neg_cost
 
     differential_pairs, diff_cost = _run_differential_phase(
-        config, candidate, plan, positive_runs, ctx.auth_state, request_budget_remaining - total_cost, candidate_deadline, attempts, seen_flags,
+        ctx, candidate, plan, positive_runs, request_budget_remaining - total_cost, candidate_deadline, attempts, seen_flags,
     )
     total_cost += diff_cost
 

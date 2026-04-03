@@ -56,6 +56,7 @@ from padv.orchestrator.runtime import new_run_id, validate_candidates_runtime
 from padv.static.joern.adapter import discover_candidates_with_meta
 from padv.static.joern.query_sets import VULN_CLASS_SPECS
 from padv.store.evidence_store import EvidenceStore
+from padv.taxonomy import runtime_validatable_classes
 
 _DECISION_KEYS = ("VALIDATED", "DROPPED", "NEEDS_HUMAN_SETUP", "CONFIRMED_ANALYSIS_FINDING")
 
@@ -142,6 +143,13 @@ class GraphState(TypedDict, total=False):
 
 _PROGRESS_CALLBACKS: dict[str, Callable[[dict[str, Any]], None]] = {}
 _AGENT_RUNTIMES: dict[str, Any] = {}
+# Dirty-tracking for _state_runtime sync: set of run_ids that need re-sync.
+# A run_id is added here by _finalize_stage after persisting a stage snapshot,
+# and removed by _state_runtime after a successful sync.  When a run_id is
+# absent (i.e. clean) AND the runtime is already cached, _state_runtime skips
+# the expensive _sync_runtime_from_state call.  First-time creation and
+# injected runtimes always sync unconditionally.
+_RUNTIME_SYNC_DIRTY: set[str] = set()
 _SKIPPED_VALIDATE_ONLY = "skipped (validate-only)"
 
 
@@ -186,10 +194,13 @@ def _state_runtime(state: GraphState) -> Any:
     if injected_runtime is not None:
         _AGENT_RUNTIMES[run_id] = injected_runtime
         _sync_runtime_from_state(injected_runtime, state)
+        _RUNTIME_SYNC_DIRTY.discard(run_id)
         return injected_runtime
     runtime = _AGENT_RUNTIMES.get(run_id)
     if runtime is not None:
-        _sync_runtime_from_state(runtime, state)
+        if run_id in _RUNTIME_SYNC_DIRTY:
+            _sync_runtime_from_state(runtime, state)
+            _RUNTIME_SYNC_DIRTY.discard(run_id)
         return runtime
     checkpoint_dir = _agent_checkpoint_dir(state)
     runtime = ensure_agent_runtime(
@@ -201,12 +212,14 @@ def _state_runtime(state: GraphState) -> Any:
     )
     _AGENT_RUNTIMES[run_id] = runtime
     _sync_runtime_from_state(runtime, state)
+    _RUNTIME_SYNC_DIRTY.discard(run_id)
     return runtime
 
 
 def _clear_state_runtime(run_id: str | None) -> None:
     if run_id:
         _AGENT_RUNTIMES.pop(str(run_id), None)
+        _RUNTIME_SYNC_DIRTY.discard(str(run_id))
 
 
 def _serialize_runtime_context_items(items: list[Any] | tuple[Any, ...]) -> list[Any]:
@@ -657,6 +670,9 @@ def _persist_stage_snapshot(state: GraphState, stage: str) -> None:
 def _finalize_stage(state: GraphState, stage: str, detail: str | None = None) -> GraphState:
     _assert_stage_invariants(state, stage)
     _persist_stage_snapshot(state, stage)
+    run_id = str(state.get("run_id") or "").strip()
+    if run_id:
+        _RUNTIME_SYNC_DIRTY.add(run_id)
     _emit_progress(state, stage, "done", detail)
     return state
 
@@ -697,11 +713,7 @@ def _current_target_scope(state: GraphState) -> dict[str, str]:
     }
 
 
-_RUNTIME_VALIDATABLE_CLASSES = {
-    spec.vuln_class
-    for spec in VULN_CLASS_SPECS
-    if getattr(spec, "runtime_validatable", False)
-}
+_RUNTIME_VALIDATABLE_CLASSES = runtime_validatable_classes()
 
 _OBJECTIVE_FAMILY_KEYWORDS: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("sql_injection", ("sql", "sqli")),
@@ -1033,6 +1045,36 @@ def _seed_urls_from_frontier(frontier_state: dict[str, Any], max_urls: int, base
     return list(dict.fromkeys(seed_urls))
 
 
+def _write_artifact(
+    state: GraphState,
+    filename: str,
+    payload: dict[str, Any],
+    *,
+    index_key: str | None = None,
+) -> str:
+    """Write a JSON artifact to the store artifacts directory.
+
+    1. Gets the store from state, ensures directories exist.
+    2. Writes ``{"generated_at": <now>, **payload}`` as indented JSON.
+    3. Appends the path to ``state["artifact_refs"]``.
+    4. Optionally sets ``state["artifact_index"][index_key]``.
+    5. Returns the artifact path string.
+    """
+    store = state["store"]
+    store.ensure()
+    artifact_dir = store.root / "artifacts"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    artifact_path = artifact_dir / filename
+    artifact_path.write_text(
+        json.dumps({"generated_at": _now_iso(), **payload}, indent=2, ensure_ascii=True)
+    )
+    ref = str(Path(artifact_path))
+    state.setdefault("artifact_refs", []).append(ref)
+    if index_key is not None:
+        state.setdefault("artifact_index", {})[index_key] = ref
+    return ref
+
+
 def _persist_web_artifact(
     state: GraphState,
     seed_urls: list[str],
@@ -1044,101 +1086,54 @@ def _persist_web_artifact(
     artifact_prefix: str = "web-discovery",
     scope: str = "anonymous",
 ) -> None:
-    store = state["store"]
-    store.ensure()
-    artifact_dir = store.root / "artifacts"
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    artifact_path = artifact_dir / f"{artifact_prefix}-{new_run_id('disc')}.json"
-    payload = {
-        "generated_at": _now_iso(),
-        "scope": scope,
-        "seed_urls": seed_urls,
-        "hints": hints,
-        "artifacts": artifacts,
-        "error": err,
-    }
-    artifact_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True))
-    artifact_refs = state.setdefault("artifact_refs", [])
-    artifact_refs.append(str(Path(artifact_path)))
-    artifact_index = state.setdefault("artifact_index", {})
-    artifact_index[artifact_key] = str(Path(artifact_path))
+    _write_artifact(
+        state,
+        f"{artifact_prefix}-{new_run_id('disc')}.json",
+        {"scope": scope, "seed_urls": seed_urls, "hints": hints, "artifacts": artifacts, "error": err},
+        index_key=artifact_key,
+    )
 
 
 def _persist_semantic_discovery_artifact(state: GraphState, payload: dict[str, Any]) -> None:
-    store = state["store"]
-    store.ensure()
-    artifact_dir = store.root / "artifacts"
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    artifact_path = artifact_dir / f"semantic-discovery-{new_run_id('disc')}.json"
-    full_payload = {"generated_at": _now_iso(), **payload}
-    artifact_path.write_text(json.dumps(full_payload, indent=2, ensure_ascii=True))
-    state.setdefault("artifact_refs", []).append(str(Path(artifact_path)))
+    _write_artifact(state, f"semantic-discovery-{new_run_id('disc')}.json", payload)
 
 
 def _persist_fusion_artifact(state: GraphState, meta: dict[str, Any]) -> None:
-    store = state["store"]
-    store.ensure()
-    artifact_dir = store.root / "artifacts"
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    artifact_path = artifact_dir / f"semantic-fusion-{new_run_id('disc')}.json"
-    payload = {"generated_at": _now_iso(), **meta}
-    artifact_path.write_text(json.dumps(payload, indent=2, ensure_ascii=True))
-    state.setdefault("artifact_refs", []).append(str(Path(artifact_path)))
+    _write_artifact(state, f"semantic-fusion-{new_run_id('disc')}.json", meta)
 
 
 def _persist_auth_artifact(state: GraphState, auth_state: dict[str, Any]) -> None:
-    store = state["store"]
-    store.ensure()
-    artifact_dir = store.root / "artifacts"
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    artifact_path = artifact_dir / f"auth-state-{new_run_id('disc')}.json"
-    safe_payload = {
-        "generated_at": _now_iso(),
-        "auth_enabled": bool(auth_state.get("auth_enabled")),
-        "login_url": auth_state.get("login_url"),
-        "username": auth_state.get("username"),
-        "cookie_names": sorted((auth_state.get("cookies") or {}).keys()) if isinstance(auth_state.get("cookies"), dict) else [],
-        "cookie_count": len(auth_state.get("cookies", {})) if isinstance(auth_state.get("cookies"), dict) else 0,
-        "summary": auth_state.get("summary", ""),
-    }
-    artifact_path.write_text(json.dumps(safe_payload, indent=2, ensure_ascii=True))
-    state.setdefault("artifact_refs", []).append(str(Path(artifact_path)))
+    _write_artifact(
+        state,
+        f"auth-state-{new_run_id('disc')}.json",
+        {
+            "auth_enabled": bool(auth_state.get("auth_enabled")),
+            "login_url": auth_state.get("login_url"),
+            "username": auth_state.get("username"),
+            "cookie_names": sorted((auth_state.get("cookies") or {}).keys()) if isinstance(auth_state.get("cookies"), dict) else [],
+            "cookie_count": len(auth_state.get("cookies", {})) if isinstance(auth_state.get("cookies"), dict) else 0,
+            "summary": auth_state.get("summary", ""),
+        },
+    )
 
 
 def _persist_discovery_summary_artifact(state: GraphState, payload: dict[str, Any]) -> None:
-    store = state["store"]
-    store.ensure()
-    artifact_dir = store.root / "artifacts"
-    artifact_dir.mkdir(parents=True, exist_ok=True)
-    artifact_path = artifact_dir / f"discovery-summary-{new_run_id('disc')}.json"
-    full_payload = {"generated_at": _now_iso(), **payload}
-    artifact_path.write_text(json.dumps(full_payload, indent=2, ensure_ascii=True))
-    state.setdefault("artifact_refs", []).append(str(Path(artifact_path)))
-    state.setdefault("artifact_index", {})["discovery_summary"] = str(Path(artifact_path))
+    _write_artifact(
+        state,
+        f"discovery-summary-{new_run_id('disc')}.json",
+        payload,
+        index_key="discovery_summary",
+    )
 
 
 def _persist_failure_analysis_artifact(state: GraphState, analysis: FailureAnalysis) -> None:
-    store = state["store"]
-    store.ensure()
-    artifact_dir = store.root / "artifacts"
-    artifact_dir.mkdir(parents=True, exist_ok=True)
     run_id = str(state.get("run_id", "run-unknown"))
-    artifact_path = artifact_dir / f"failure-analysis-{run_id}.json"
-    artifact_path.write_text(json.dumps(analysis.to_dict(), indent=2, ensure_ascii=True))
-    state.setdefault("artifact_refs", []).append(str(Path(artifact_path)))
+    _write_artifact(state, f"failure-analysis-{run_id}.json", analysis.to_dict())
 
 
 def _persist_runtime_liveness_artifact(state: GraphState, payload: dict[str, Any]) -> None:
-    store = state["store"]
-    store.ensure()
-    artifact_dir = store.root / "artifacts"
-    artifact_dir.mkdir(parents=True, exist_ok=True)
     run_id = str(state.get("run_id", "run-unknown"))
-    artifact_path = artifact_dir / f"runtime-liveness-{run_id}-{new_run_id('diag')}.json"
-    artifact_path.write_text(
-        json.dumps({"generated_at": _now_iso(), **payload}, indent=2, ensure_ascii=True)
-    )
-    state.setdefault("artifact_refs", []).append(str(Path(artifact_path)))
+    _write_artifact(state, f"runtime-liveness-{run_id}-{new_run_id('diag')}.json", payload)
 
 
 def _persist_candidate_run_mapping(state: GraphState, records: list[dict[str, Any]]) -> None:
@@ -1478,12 +1473,27 @@ def _node_static_discovery(state: GraphState) -> GraphState:
     )
 
 
-def _node_web_discovery(state: GraphState) -> GraphState:
-    _emit_progress(state, "web_discovery", "start")
+def _run_web_discovery_phase(state: GraphState, scope: str) -> GraphState:
+    """Shared implementation for anonymous and authenticated web discovery."""
+    is_authenticated = scope == "authenticated"
+    stage_name = "authenticated_web_discovery" if is_authenticated else "web_discovery"
+    hints_key = f"{scope}_web_hints"
+    artifacts_key = f"{scope}_web_artifacts"
+
+    _emit_progress(state, stage_name, "start")
     if state.get("skip_discovery"):
-        return _finalize_stage(state, "web_discovery", _SKIPPED_VALIDATE_ONLY)
-    if state.get("anonymous_web_hints") and state.get("anonymous_web_artifacts") and not state.get("web_error"):
-        return _finalize_stage(state, "web_discovery", "reused prior web results")
+        return _finalize_stage(state, stage_name, _SKIPPED_VALIDATE_ONLY)
+    if state.get(hints_key) and state.get(artifacts_key) and not state.get("web_error"):
+        reuse_label = "authenticated " if is_authenticated else ""
+        return _finalize_stage(state, stage_name, f"reused prior {reuse_label}web results")
+
+    if is_authenticated:
+        auth_state = state.get("auth_state", {})
+        cookie_count = len(auth_state.get("cookies", {})) if isinstance(auth_state.get("cookies"), dict) else 0
+        if not cookie_count:
+            return _finalize_stage(state, stage_name, "skipped (no authenticated context)")
+    else:
+        auth_state = None
 
     config = state["config"]
     seed_urls = _seed_urls_from_frontier(
@@ -1491,22 +1501,25 @@ def _node_web_discovery(state: GraphState) -> GraphState:
         max_urls=config.web.max_pages,
         base_url=config.target.base_url,
     )
-    hints, artifacts, err = discover_web_inventory(config, seed_urls=seed_urls)
+    discover_kwargs: dict[str, Any] = {"seed_urls": seed_urls}
+    if is_authenticated:
+        discover_kwargs["auth_state"] = auth_state
+    hints, artifacts, err = discover_web_inventory(config, **discover_kwargs)
     _persist_web_artifact(
         state,
         seed_urls,
         hints,
         artifacts,
         err,
-        artifact_key="web_discovery_anonymous",
-        artifact_prefix="web-discovery-anonymous",
-        scope="anonymous",
+        artifact_key=f"web_discovery_{scope}",
+        artifact_prefix=f"web-discovery-{scope}",
+        scope=scope,
     )
 
     merged_hints = _merge_web_hints(state.get("web_hints", {}), hints)
-    merged_artifacts = _merge_web_artifacts(state.get("web_artifacts", {}), artifacts, scope="anonymous")
-    state["anonymous_web_hints"] = dict(hints)
-    state["anonymous_web_artifacts"] = dict(artifacts)
+    merged_artifacts = _merge_web_artifacts(state.get("web_artifacts", {}), artifacts, scope=scope)
+    state[hints_key] = dict(hints)
+    state[artifacts_key] = dict(artifacts)
     state["web_hints"] = merged_hints
     state["web_artifacts"] = merged_artifacts
     state["web_error"] = err
@@ -1516,22 +1529,28 @@ def _node_web_discovery(state: GraphState) -> GraphState:
         for candidate in state.get("candidates", []):
             candidate.web_path_hints = sorted(set(candidate.web_path_hints + paths))
 
-    state["discovery_trace"]["web_paths_anonymous"] = len(hints)
-    state["discovery_trace"]["web_pages_anonymous"] = len(artifacts.get("pages", [])) if isinstance(artifacts, dict) else 0
-    state["discovery_trace"]["web_requests_anonymous"] = len(artifacts.get("requests", [])) if isinstance(artifacts, dict) else 0
+    state["discovery_trace"][f"web_paths_{scope}"] = len(hints)
+    state["discovery_trace"][f"web_pages_{scope}"] = len(artifacts.get("pages", [])) if isinstance(artifacts, dict) else 0
+    state["discovery_trace"][f"web_requests_{scope}"] = len(artifacts.get("requests", [])) if isinstance(artifacts, dict) else 0
     state["discovery_trace"]["web_paths"] = len(merged_hints)
     state["discovery_trace"]["web_pages"] = len(merged_artifacts.get("pages", [])) if isinstance(merged_artifacts, dict) else 0
     state["discovery_trace"]["web_requests"] = len(merged_artifacts.get("requests", [])) if isinstance(merged_artifacts, dict) else 0
     runtime = _state_runtime(state)
-    update_agent_runtime_context(
-        runtime,
-        web_hints=merged_hints,
-        web_artifacts=merged_artifacts,
-        artifact_index=dict(state.get("artifact_index", {})),
-    )
+    context_kwargs: dict[str, Any] = {
+        "web_hints": merged_hints,
+        "web_artifacts": merged_artifacts,
+        "artifact_index": dict(state.get("artifact_index", {})),
+    }
+    if is_authenticated:
+        context_kwargs["auth_contexts"] = state.get("auth_contexts", {})
+    update_agent_runtime_context(runtime, **context_kwargs)
     if err:
-        raise RuntimeError(f"web discovery failed: {err}")
-    return _finalize_stage(state, "web_discovery", f"paths={len(merged_hints)}")
+        raise RuntimeError(f"{scope} web discovery failed: {err}")
+    return _finalize_stage(state, stage_name, f"paths={len(merged_hints)}")
+
+
+def _node_web_discovery(state: GraphState) -> GraphState:
+    return _run_web_discovery_phase(state, "anonymous")
 
 
 def _node_auth_setup(state: GraphState) -> GraphState:
@@ -1574,65 +1593,7 @@ def _node_auth_setup(state: GraphState) -> GraphState:
 
 
 def _node_authenticated_web_discovery(state: GraphState) -> GraphState:
-    _emit_progress(state, "authenticated_web_discovery", "start")
-    if state.get("skip_discovery"):
-        return _finalize_stage(state, "authenticated_web_discovery", _SKIPPED_VALIDATE_ONLY)
-    if state.get("authenticated_web_hints") and state.get("authenticated_web_artifacts") and not state.get("web_error"):
-        return _finalize_stage(state, "authenticated_web_discovery", "reused prior authenticated web results")
-
-    auth_state = state.get("auth_state", {})
-    cookie_count = len(auth_state.get("cookies", {})) if isinstance(auth_state.get("cookies"), dict) else 0
-    if not cookie_count:
-        return _finalize_stage(state, "authenticated_web_discovery", "skipped (no authenticated context)")
-
-    config = state["config"]
-    seed_urls = _seed_urls_from_frontier(
-        state.get("frontier_state", {}),
-        max_urls=config.web.max_pages,
-        base_url=config.target.base_url,
-    )
-    hints, artifacts, err = discover_web_inventory(config, seed_urls=seed_urls, auth_state=auth_state)
-    _persist_web_artifact(
-        state,
-        seed_urls,
-        hints,
-        artifacts,
-        err,
-        artifact_key="web_discovery_authenticated",
-        artifact_prefix="web-discovery-authenticated",
-        scope="authenticated",
-    )
-
-    merged_hints = _merge_web_hints(state.get("web_hints", {}), hints)
-    merged_artifacts = _merge_web_artifacts(state.get("web_artifacts", {}), artifacts, scope="authenticated")
-    state["authenticated_web_hints"] = dict(hints)
-    state["authenticated_web_artifacts"] = dict(artifacts)
-    state["web_hints"] = merged_hints
-    state["web_artifacts"] = merged_artifacts
-    state["web_error"] = err
-
-    if merged_hints:
-        paths = list(merged_hints.keys())
-        for candidate in state.get("candidates", []):
-            candidate.web_path_hints = sorted(set(candidate.web_path_hints + paths))
-
-    state["discovery_trace"]["web_paths_authenticated"] = len(hints)
-    state["discovery_trace"]["web_pages_authenticated"] = len(artifacts.get("pages", [])) if isinstance(artifacts, dict) else 0
-    state["discovery_trace"]["web_requests_authenticated"] = len(artifacts.get("requests", [])) if isinstance(artifacts, dict) else 0
-    state["discovery_trace"]["web_paths"] = len(merged_hints)
-    state["discovery_trace"]["web_pages"] = len(merged_artifacts.get("pages", [])) if isinstance(merged_artifacts, dict) else 0
-    state["discovery_trace"]["web_requests"] = len(merged_artifacts.get("requests", [])) if isinstance(merged_artifacts, dict) else 0
-    runtime = _state_runtime(state)
-    update_agent_runtime_context(
-        runtime,
-        web_hints=merged_hints,
-        web_artifacts=merged_artifacts,
-        artifact_index=dict(state.get("artifact_index", {})),
-        auth_contexts=state.get("auth_contexts", {}),
-    )
-    if err:
-        raise RuntimeError(f"authenticated web discovery failed: {err}")
-    return _finalize_stage(state, "authenticated_web_discovery", f"paths={len(merged_hints)}")
+    return _run_web_discovery_phase(state, "authenticated")
 
 
 def _candidate_id_from_item(item: Any) -> str:
@@ -1713,31 +1674,26 @@ def _node_discovery_summary(state: GraphState) -> GraphState:
 
 
 def _persist_agent_workspace_artifact(state: GraphState, name: str, payload: dict[str, Any]) -> None:
-    store = state["store"]
-    store.ensure()
     run_id = str(state.get("run_id", "run-unknown"))
-    path = store.root / "artifacts" / f"{name}-{run_id}-{new_run_id('ws')}.json"
-    path.write_text(json.dumps({"generated_at": _now_iso(), **payload}, indent=2, ensure_ascii=True))
-    state.setdefault("artifact_refs", []).append(str(Path(path)))
-    artifact_index = state.setdefault("artifact_index", {})
-    artifact_index[name] = str(Path(path))
+    _write_artifact(
+        state,
+        f"{name}-{run_id}-{new_run_id('ws')}.json",
+        payload,
+        index_key=name,
+    )
 
 
 def _persist_research_branch_error_artifact(state: GraphState, role: str, detail: str) -> str:
-    store = state["store"]
-    store.ensure()
     run_id = str(state.get("run_id", "run-unknown"))
-    path = store.root / "artifacts" / f"research-branch-error-{role}-{run_id}-{new_run_id('err')}.json"
-    payload = {
-        "generated_at": _now_iso(),
-        "role": role,
-        "detail": detail,
-        "active_objective": getattr(state.get("active_objective"), "objective_id", None),
-    }
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=True), encoding="utf-8")
-    ref = str(Path(path))
-    state.setdefault("artifact_refs", []).append(ref)
-    return ref
+    return _write_artifact(
+        state,
+        f"research-branch-error-{role}-{run_id}-{new_run_id('err')}.json",
+        {
+            "role": role,
+            "detail": detail,
+            "active_objective": getattr(state.get("active_objective"), "objective_id", None),
+        },
+    )
 
 
 def _merge_web_hints(

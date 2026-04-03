@@ -5,15 +5,7 @@ from typing import Any
 
 from padv.config.schema import PadvConfig
 from padv.models import DifferentialPair, RuntimeEvidence
-
-
-AUTHZ_VULN_CLASSES = frozenset(
-    {
-        "broken_access_control",
-        "idor_invariant_missing",
-        "auth_and_session_failures",
-    }
-)
+from padv.taxonomy import AUTHZ_VULN_CLASSES
 
 _AUTH_COOKIE_HINTS = ("auth", "token", "sess", "php")
 
