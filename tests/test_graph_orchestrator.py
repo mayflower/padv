@@ -737,7 +737,7 @@ def test_web_discovery_updates_runtime_with_playwright_artifacts(
     runtime = state["runtime"]
     assert runtime.shared_context["web_hints"]["/"] == ["page"]
     assert runtime.shared_context["web_artifacts"]["pages"][0]["forms"][0]["inputs"][0]["name"] == "username"
-    assert runtime.shared_context["artifact_index"]["web_discovery"].endswith(".json")
+    assert runtime.shared_context["artifact_index"]["web_discovery_anonymous"].endswith(".json")
 
 
 

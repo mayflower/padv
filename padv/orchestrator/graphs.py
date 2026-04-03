@@ -50,11 +50,18 @@ from padv.models import (
     RunSummary,
     StaticEvidence,
     WitnessBundle,
+    utc_now_iso as _now_iso,
 )
 from padv.orchestrator.runtime import new_run_id, validate_candidates_runtime
 from padv.static.joern.adapter import discover_candidates_with_meta
 from padv.static.joern.query_sets import VULN_CLASS_SPECS
 from padv.store.evidence_store import EvidenceStore
+
+_DECISION_KEYS = ("VALIDATED", "DROPPED", "NEEDS_HUMAN_SETUP", "CONFIRMED_ANALYSIS_FINDING")
+
+
+def _default_decisions() -> dict[str, int]:
+    return dict.fromkeys(_DECISION_KEYS, 0)
 
 
 class GraphState(TypedDict, total=False):
@@ -142,9 +149,6 @@ def _safe_copy_candidate(candidate: Candidate) -> Candidate:
     return cast(Candidate, replace(candidate))
 
 
-def _now_iso() -> str:
-    return datetime.now(tz=timezone.utc).isoformat()
-
 
 def _stable_serialize(value: Any) -> Any:
     if is_dataclass(value):
@@ -223,13 +227,15 @@ def _collect_serialized_state_fields(state: GraphState) -> dict[str, Any]:
         ("witness_bundles", "witness_bundles"),
     )
     for state_key, payload_key in _SERIALIZED_LIST_FIELDS:
-        if state_key in state:
-            payload[payload_key] = _serialize_runtime_context_items(list(state.get(state_key, [])))
+        value = state.get(state_key)
+        if value is not None:
+            payload[payload_key] = _serialize_runtime_context_items(value)
 
     _STABLE_SERIALIZE_LIST_FIELDS: tuple[str, ...] = ("gate_history", "runtime_history")
     for key in _STABLE_SERIALIZE_LIST_FIELDS:
-        if key in state:
-            payload[key] = _stable_serialize(list(state.get(key, [])))
+        value = state.get(key)
+        if value is not None:
+            payload[key] = _stable_serialize(value)
 
     for key in ("auth_contexts", "web_hints", "web_artifacts", "artifact_index"):
         if key in state:
@@ -1056,7 +1062,6 @@ def _persist_web_artifact(
     artifact_refs.append(str(Path(artifact_path)))
     artifact_index = state.setdefault("artifact_index", {})
     artifact_index[artifact_key] = str(Path(artifact_path))
-    artifact_index["web_discovery"] = str(Path(artifact_path))
 
 
 def _persist_semantic_discovery_artifact(state: GraphState, payload: dict[str, Any]) -> None:
@@ -1178,11 +1183,11 @@ def _resume_compatible(
 
 
 def _sanitize_frontier_for_persistence(frontier: dict[str, Any]) -> dict[str, Any]:
-    payload = json.loads(json.dumps(frontier))
-    if isinstance(payload, dict):
-        payload.pop("agent_threads", None)
-        payload.pop("agent_thread_id", None)
-    return payload if isinstance(payload, dict) else {}
+    import copy
+    payload = copy.deepcopy(frontier)
+    payload.pop("agent_threads", None)
+    payload.pop("agent_thread_id", None)
+    return payload
 
 
 def _triage_reason_for_candidate(trace: dict[str, Any], candidate_id: str) -> str:
@@ -1312,7 +1317,7 @@ def _init_state_fields(state: GraphState) -> None:
     state["resume_filtered_candidates"] = []
     state["had_semantic_candidates"] = False
     state["loop_continue"] = False
-    state["decisions"] = {"VALIDATED": 0, "DROPPED": 0, "NEEDS_HUMAN_SETUP": 0, "CONFIRMED_ANALYSIS_FINDING": 0}
+    state["decisions"] = _default_decisions()
     state["auth_state"] = {}
     state["failure_analysis"] = None
     state["objective_queue"] = []
@@ -2021,60 +2026,6 @@ def _run_parallel_research_branch(state: GraphState, role: str) -> dict[str, Any
         f"{role}_context_delta": context_delta,
         f"{role}_branch_error": branch_error,
     }
-
-
-def _node_source_research(state: GraphState) -> GraphState:
-    _emit_progress(state, "source_research", "start")
-    objective = state.get("active_objective")
-    if objective is None:
-        raise RuntimeError("source research requires active objective")
-    tasks, findings, trace = run_research_subagent(
-        _state_runtime(state),
-        "source",
-        state["config"],
-        objective=objective,
-        frontier_state=state.get("frontier_state", {}),
-    )
-    state["source_tasks"] = tasks
-    state["source_findings"] = findings
-    state.setdefault("planner_trace", {})["source_research"] = trace
-    return _finalize_stage(state, "source_research", f"findings={len(findings)}")
-
-
-def _node_graph_research(state: GraphState) -> GraphState:
-    _emit_progress(state, "graph_research", "start")
-    objective = state.get("active_objective")
-    if objective is None:
-        raise RuntimeError("graph research requires active objective")
-    tasks, findings, trace = run_research_subagent(
-        _state_runtime(state),
-        "graph",
-        state["config"],
-        objective=objective,
-        frontier_state=state.get("frontier_state", {}),
-    )
-    state["graph_tasks"] = tasks
-    state["graph_findings"] = findings
-    state.setdefault("planner_trace", {})["graph_research"] = trace
-    return _finalize_stage(state, "graph_research", f"findings={len(findings)}")
-
-
-def _node_web_research(state: GraphState) -> GraphState:
-    _emit_progress(state, "web_research", "start")
-    objective = state.get("active_objective")
-    if objective is None:
-        raise RuntimeError("web research requires active objective")
-    tasks, findings, trace = run_research_subagent(
-        _state_runtime(state),
-        "web",
-        state["config"],
-        objective=objective,
-        frontier_state=state.get("frontier_state", {}),
-    )
-    state["web_tasks"] = tasks
-    state["web_findings"] = findings
-    state.setdefault("planner_trace", {})["web_research"] = trace
-    return _finalize_stage(state, "web_research", f"findings={len(findings)}")
 
 
 def _node_source_research_parallel(state: GraphState) -> dict[str, Any]:
@@ -2842,81 +2793,6 @@ def _build_mapping_record(
     }
 
 
-def _node_runtime_validate(state: GraphState) -> GraphState:
-    _emit_progress(state, "runtime_validate", "start")
-    if not state.get("run_validation"):
-        return _finalize_stage(state, "runtime_validate", "skipped (analysis-only)")
-    candidates = list(state.get("selected_candidates") or state.get("candidates", []))
-    schedule_all = list(state.get("schedule_all_candidates") or candidates)
-    resume_filtered = {str(x) for x in state.get("resume_filtered_candidates", []) if str(x).strip()}
-    iteration = int((state.get("frontier_state") or {}).get("iteration", 0)) + 1
-    if state.get("had_semantic_candidates") and not candidates:
-        _persist_runtime_liveness_artifact(state, {
-            "run_id": state.get("run_id"), "iteration": iteration,
-            "reason": "no-selected-candidates", "had_semantic_candidates": True,
-            "schedule_all_candidate_ids": [c.candidate_id for c in schedule_all],
-            "resume_filtered_candidates": sorted(resume_filtered),
-            "scheduler_trace": state.get("planner_trace", {}).get("scheduler", {}),
-        })
-        raise RuntimeError("runtime validation invariant failed: semantic candidates present but none selected")
-    static_evidence = state.get("selected_static") or state.get("static_evidence", [])
-    bundles, decisions = validate_candidates_runtime(
-        config=state["config"], store=state["store"],
-        static_evidence=static_evidence, candidates=candidates,
-        run_id=state["run_id"],
-        plans_by_candidate=state.get("plans_by_candidate"),
-        planner_trace=state.get("planner_trace"),
-        discovery_trace=state.get("discovery_trace"),
-        artifact_refs=state.get("artifact_refs", []),
-        auth_state=state.get("auth_state"),
-    )
-    if candidates and not bundles:
-        _persist_runtime_liveness_artifact(state, {
-            "run_id": state.get("run_id"), "iteration": iteration,
-            "reason": "zero-bundles-for-selected-candidates",
-            "selected_candidate_ids": [c.candidate_id for c in candidates],
-            "schedule_all_candidate_ids": [c.candidate_id for c in schedule_all],
-            "resume_filtered_candidates": sorted(resume_filtered),
-            "plans_present": sorted((state.get("plans_by_candidate") or {}).keys()),
-            "scheduler_trace": state.get("planner_trace", {}).get("scheduler", {}),
-            "discovery_trace": state.get("discovery_trace", {}),
-        })
-        raise RuntimeError("runtime validation invariant failed: selected candidates produced zero bundles")
-
-    selected_ids = {c.candidate_id for c in candidates}
-    plans_by_candidate = state.get("plans_by_candidate", {})
-    scheduler_trace = state.get("planner_trace", {}).get("scheduler", {})
-    bundles_by_candidate = {
-        str(getattr(getattr(bundle, "candidate", None), "candidate_id", "")): bundle
-        for bundle in bundles
-    }
-    mapping_records = [
-        _build_mapping_record(
-            candidate, bundles_by_candidate.get(candidate.candidate_id),
-            iteration, plans_by_candidate, resume_filtered, selected_ids, scheduler_trace,
-        )
-        for candidate in schedule_all
-    ]
-    _persist_candidate_run_mapping(state, mapping_records)
-
-    state["iteration_bundles"] = list(bundles)
-    all_bundles = list(state.get("all_bundles", []))
-    all_bundles.extend(bundles)
-    state["all_bundles"] = all_bundles
-    state["bundles"] = all_bundles
-    state["decisions"] = decisions
-    return _finalize_stage(
-        state,
-        "runtime_validate",
-        f"iteration_bundles={len(bundles)} total_bundles={len(all_bundles)}",
-    )
-
-
-def _node_deterministic_gates(state: GraphState) -> GraphState:
-    # Gate evaluation is executed inside validate_candidates_runtime.
-    return _finalize_stage(state, "deterministic_gates", "evaluated in runtime_validate")
-
-
 def _node_dedup_topk(state: GraphState) -> GraphState:
     _emit_progress(state, "dedup_topk", "start")
     if state.get("all_bundles"):
@@ -2938,7 +2814,7 @@ def _node_dedup_topk(state: GraphState) -> GraphState:
         seen.add(key)
         deduped.append(bundle)
     state["bundles"] = deduped[: state["config"].budgets.max_candidates]
-    decisions = {"VALIDATED": 0, "DROPPED": 0, "NEEDS_HUMAN_SETUP": 0, "CONFIRMED_ANALYSIS_FINDING": 0}
+    decisions = _default_decisions()
     for bundle in state["bundles"]:
         decisions[bundle.gate_result.decision] = decisions.get(bundle.gate_result.decision, 0) + 1
     state["decisions"] = decisions
@@ -3252,7 +3128,7 @@ def run_with_graph(
         completed = datetime.now(tz=timezone.utc).isoformat()
 
         bundles = result.get("bundles", [])
-        decisions = result.get("decisions", {"VALIDATED": 0, "DROPPED": 0, "NEEDS_HUMAN_SETUP": 0, "CONFIRMED_ANALYSIS_FINDING": 0})
+        decisions = result.get("decisions", _default_decisions())
         summary = RunSummary(
             run_id=run_id,
             mode=mode,

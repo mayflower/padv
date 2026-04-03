@@ -790,7 +790,7 @@ def _merge_request_headers(headers: dict[str, str], request_spec: dict[str, Any]
 def _make_failed_runtime(req_id: str, exc: RequestError, cookie_jar: dict[str, str] | None = None) -> RuntimeEvidence:
     aux: dict[str, Any] = {"error": str(exc)}
     if cookie_jar is not None:
-        aux = {"auth_context": "authenticated" if cookie_jar else "anonymous"}
+        aux["auth_context"] = "authenticated" if cookie_jar else "anonymous"
     return RuntimeEvidence(
         request_id=req_id, status="request_failed", call_count=0, overflow=False,
         arg_truncated=False, result_truncated=False, correlation=None, calls=[],
@@ -901,11 +901,14 @@ def _run_negative_phase(
     return negative_runs, request_budget_remaining - budget
 
 
-def _extract_cookie_jar(request_spec: dict[str, Any]) -> dict[str, str]:
-    request_cookies = request_spec.get("cookies")
-    if isinstance(request_cookies, dict):
-        return {str(k): str(v) for k, v in request_cookies.items() if str(k).strip()}
+def _normalize_cookie_dict(raw: Any) -> dict[str, str]:
+    if isinstance(raw, dict):
+        return {str(k): str(v) for k, v in raw.items() if str(k).strip()}
     return {}
+
+
+def _extract_cookie_jar(request_spec: dict[str, Any]) -> dict[str, str]:
+    return _normalize_cookie_dict(request_spec.get("cookies"))
 
 
 def _execute_differential_request(
@@ -1137,10 +1140,8 @@ def _validate_single_candidate_runtime(
 
 
 def _extract_auth_cookie_jar(auth_state: dict[str, Any]) -> dict[str, str]:
-    cookie_jar_raw = auth_state.get("cookies", {}) if isinstance(auth_state, dict) else {}
-    if not isinstance(cookie_jar_raw, dict):
-        return {}
-    return {str(k): str(v) for k, v in cookie_jar_raw.items() if str(k).strip()}
+    raw = auth_state.get("cookies", {}) if isinstance(auth_state, dict) else {}
+    return _normalize_cookie_dict(raw)
 
 
 def _process_candidate(
@@ -1202,7 +1203,7 @@ def validate_candidates_runtime(
     for item in static_evidence:
         static_by_candidate.setdefault(item.candidate_id, []).append(item)
 
-    decisions: dict[str, int] = {"VALIDATED": 0, "DROPPED": 0, "NEEDS_HUMAN_SETUP": 0, "CONFIRMED_ANALYSIS_FINDING": 0}
+    decisions: dict[str, int] = dict.fromkeys(("VALIDATED", "DROPPED", "NEEDS_HUMAN_SETUP", "CONFIRMED_ANALYSIS_FINDING"), 0)
     bundles: list[EvidenceBundle] = []
     request_budget_remaining = config.budgets.max_requests
     run_deadline = monotonic() + float(config.budgets.max_run_seconds)
