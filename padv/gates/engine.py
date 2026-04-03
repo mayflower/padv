@@ -88,6 +88,10 @@ def _flag_set(runs: list[RuntimeEvidence]) -> set[str]:
         for flag in witness_flags:
             if isinstance(flag, str) and flag.strip():
                 out.add(flag.strip().casefold())
+        witness_data = getattr(witness, "witness_data", {}) or {}
+        for key, value in witness_data.items():
+            if value:
+                out.add(key.strip().casefold())
     return out
 
 

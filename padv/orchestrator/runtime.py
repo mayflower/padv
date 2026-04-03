@@ -1216,6 +1216,8 @@ def validate_candidates_runtime(
     for candidate in candidates:
         if monotonic() >= run_deadline:
             break
+        if request_budget_remaining <= 0:
+            break
         bundle, cost = _process_candidate(
             ctx, candidate, plans_by_candidate, static_by_candidate,
             request_budget_remaining, run_deadline,

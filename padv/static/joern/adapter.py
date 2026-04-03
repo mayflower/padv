@@ -19,6 +19,7 @@ from padv.discovery.budgeting import select_fair_share
 from padv.models import Candidate, StaticEvidence
 from padv.path_scope import is_app_candidate_path, normalize_repo_path
 from padv.static.joern.query_sets import VULN_CLASS_SPECS, VulnClassSpec, intercepts_for_class
+from padv.taxonomy import canonicalize_vuln_class
 
 
 class JoernExecutionError(RuntimeError):
@@ -93,6 +94,7 @@ def _make_candidate_and_evidence(
         auth_requirements=(["login"] if config.auth.enabled else []),
         web_path_hints=[],
     )
+    candidate.canonical_class = canonicalize_vuln_class(spec.vuln_class)
     evidence = StaticEvidence(
         candidate_id=candidate_id,
         query_profile=query_profile,

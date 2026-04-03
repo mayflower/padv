@@ -274,6 +274,10 @@ class FailurePattern:
     confidence_range: tuple[float, float]
     suggestion: str
 
+    def __post_init__(self) -> None:
+        if not isinstance(self.confidence_range, tuple):
+            self.confidence_range = tuple(self.confidence_range)
+
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 

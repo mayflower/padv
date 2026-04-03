@@ -17,6 +17,7 @@ from padv.discovery.budgeting import select_fair_share
 from padv.models import Candidate, StaticEvidence
 from padv.path_scope import is_app_candidate_path, normalize_repo_path
 from padv.static.joern.query_sets import VULN_CLASS_SPECS, VulnClassSpec
+from padv.taxonomy import canonicalize_vuln_class
 
 
 _RE_NON_ALNUM = r"[^a-z0-9_$]"
@@ -397,8 +398,7 @@ def discover_scip_candidates_with_meta(
             candidate_id = f"scip-{idx:05d}"
             evidence_id = f"scip::{hit.vuln_class}:{rel_path}:{hit.line}"
             snippet = hit.symbol[:240]
-            candidates.append(
-                Candidate(
+            cand = Candidate(
                     candidate_id=candidate_id,
                     vuln_class=spec.vuln_class,
                     title=f"{spec.owasp_id} {spec.description}",
@@ -415,7 +415,8 @@ def discover_scip_candidates_with_meta(
                     auth_requirements=(["login"] if config.auth.enabled else []),
                     web_path_hints=[],
                 )
-            )
+            cand.canonical_class = canonicalize_vuln_class(spec.vuln_class)
+            candidates.append(cand)
             evidence.append(
                 StaticEvidence(
                     candidate_id=candidate_id,
