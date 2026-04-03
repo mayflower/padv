@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -65,6 +66,7 @@ class EvidenceStore:
         try:
             data = json.loads(self.candidates_file.read_text())
         except json.JSONDecodeError:
+            sys.stderr.write(f"padv: corrupt JSON in {self.candidates_file}, ignoring\n")
             return []
         out: list[Candidate] = []
         for item in data:
@@ -82,6 +84,7 @@ class EvidenceStore:
         try:
             data = json.loads(self.static_evidence_file.read_text())
         except json.JSONDecodeError:
+            sys.stderr.write(f"padv: corrupt JSON in {self.static_evidence_file}, ignoring\n")
             return []
         out: list[StaticEvidence] = []
         for item in data:
@@ -101,6 +104,7 @@ class EvidenceStore:
         try:
             return json.loads(path.read_text())
         except json.JSONDecodeError:
+            sys.stderr.write(f"padv: corrupt JSON in {path}, ignoring\n")
             return None
 
     def list_bundle_ids(self) -> list[str]:
@@ -121,6 +125,7 @@ class EvidenceStore:
         try:
             return json.loads(path.read_text())
         except json.JSONDecodeError:
+            sys.stderr.write(f"padv: corrupt JSON in {path}, ignoring\n")
             return None
 
     def list_run_ids(self) -> list[str]:
@@ -139,6 +144,7 @@ class EvidenceStore:
         try:
             data = json.loads(self.frontier_file.read_text())
         except json.JSONDecodeError:
+            sys.stderr.write(f"padv: corrupt JSON in {self.frontier_file}, ignoring\n")
             return None
         if isinstance(data, dict):
             return data
@@ -158,6 +164,7 @@ class EvidenceStore:
         try:
             data = json.loads(path.read_text())
         except json.JSONDecodeError:
+            sys.stderr.write(f"padv: corrupt JSON in {path}, ignoring\n")
             return None
         if isinstance(data, (dict, list)):
             return data
@@ -176,6 +183,7 @@ class EvidenceStore:
         try:
             data = json.loads(path.read_text())
         except json.JSONDecodeError:
+            sys.stderr.write(f"padv: corrupt JSON in {path}, ignoring\n")
             return None
         if isinstance(data, dict):
             return data

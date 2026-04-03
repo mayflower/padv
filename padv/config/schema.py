@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -515,5 +516,32 @@ def load_config(path: str | Path) -> PadvConfig:
         raise ConfigError("llm.provider must be anthropic for browser-use agentic runs")
     if parsed.differential.body_length_tolerance > 1.0:
         raise ConfigError("differential.body_length_tolerance must be <= 1.0")
+    if parsed.differential.body_length_tolerance < 0.0:
+        raise ConfigError("differential.body_length_tolerance must be >= 0.0")
+
+    # Validate auth fields when auth is enabled
+    if parsed.auth.enabled:
+        if not parsed.auth.login_url:
+            raise ConfigError("auth.login_url is required when auth.enabled is true")
+        if not parsed.auth.username:
+            raise ConfigError("auth.username is required when auth.enabled is true")
+        if not parsed.auth.password:
+            raise ConfigError("auth.password is required when auth.enabled is true")
+
+    # Validate URL format for key URL fields
+    _validate_url("target.base_url", parsed.target.base_url)
+    if parsed.auth.enabled and parsed.auth.login_url:
+        _validate_url("auth.login_url", parsed.auth.login_url)
+    if parsed.joern.use_http_api:
+        _validate_url("joern.server_url", parsed.joern.server_url)
 
     return parsed
+
+
+def _validate_url(field_name: str, value: str) -> None:
+    """Validate that *value* is a well-formed HTTP(S) URL."""
+    parsed = urllib.parse.urlparse(value)
+    if parsed.scheme not in ("http", "https"):
+        raise ConfigError(f"{field_name} must start with http:// or https://")
+    if not parsed.netloc:
+        raise ConfigError(f"{field_name} is not a valid URL (missing host)")
