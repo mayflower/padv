@@ -1256,7 +1256,19 @@ def _handoff_work_guidance(role: str, category: str) -> str:
             "concrete validation plans with explicit positive/negative controls; do not spend turns on a general "
             "strategy essay once the requests and witness goals are clear."
         )
-    if category in {"orient", "select_objective", "continue_or_stop"}:
+    if category == "orient":
+        return (
+            "Use the shared objective/frontier tools to justify the next move. Start from the aggregate discovery "
+            "summary tools before drilling into raw candidate or evidence records. Prefer a backlog that spans "
+            "materially distinct vulnerability families present in discovery instead of collapsing to a top-4 shortlist. "
+            "The graph owns stop/continue decisions, not this turn. If this orient handoff is called, you must return at "
+            "least one objective and never return an empty objectives list. If information gain is diminishing, keep the "
+            "strongest remaining objective and explain the diminishing returns in notes instead of stopping. "
+            "Deterministic backfill will preserve wider coverage after your ranking. Do not block orient on unresolved "
+            "deployment/reachability questions; capture those uncertainties in the objective rationale and let later "
+            "research/skeptic phases test them explicitly. Persist a short worklog note if you change direction."
+        )
+    if category in {"select_objective", "continue_or_stop"}:
         return (
             "Use the shared objective/frontier tools to justify the next move. Start from the aggregate discovery "
             "summary tools before drilling into raw candidate or evidence records. Prefer a backlog that spans "
@@ -1307,7 +1319,20 @@ def _handoff_turn_checklist(category: str, turn: int) -> list[str]:
             "ensure requests, oracle functions, and witness goals align for the remaining plans",
             "finalize with the strongest 1-3 concrete plans",
         ]
-    if category in {"orient", "select_objective", "continue_or_stop"}:
+    if category == "orient":
+        if turn == 1:
+            return [
+                "review objectives/frontier state",
+                "persist a supervisor worklog checkpoint with the current decision framing",
+                "continue if competing priorities remain unresolved",
+            ]
+        return [
+            "review the prior supervisor worklog checkpoint",
+            "justify the next objective backlog against frontier history and expected information gain",
+            "encode unresolved deployment or reachability questions in the rationale instead of stalling",
+            "finalize only after at least one objective is explicit and externally inspectable",
+        ]
+    if category in {"select_objective", "continue_or_stop"}:
         if turn == 1:
             return [
                 "review objectives/frontier state",
@@ -3915,7 +3940,9 @@ def orient_root_agent(
     frontier_state: dict[str, Any],
     discovery_trace: dict[str, Any],
     run_validation: bool,
+    objective_queue: list[ObjectiveScore] | None = None,
 ) -> tuple[list[ObjectiveScore], dict[str, Any]]:
+    remaining_objectives = [item.to_dict() for item in (objective_queue or [])]
     parsed, handoff_meta = _invoke_agent_handoff(
         runtime,
         runtime.root,
@@ -3925,13 +3952,29 @@ def orient_root_agent(
             "run_validation": bool(run_validation),
             "discovery_trace": discovery_trace,
             "frontier_state": _compact_frontier_state(frontier_state),
+            "remaining_objectives": remaining_objectives,
         },
         response_contract='{"objectives":[{"objective_id":"...","title":"...","rationale":"...","expected_info_gain":0.0,"priority":0.0,"channels":["source","graph","web"],"related_hypothesis_ids":[...]}],"notes":[...]}',
     )
     objectives = _limit_primary_objectives(_normalize_objectives(parsed.get("objectives", [])))
     if not objectives:
-        raise AgentExecutionError("root agent returned zero objectives")
-    return objectives, {"engine": "deepagents", "notes": parsed.get("notes", []), "objective_ids": [o.objective_id for o in objectives], **handoff_meta}
+        fallback = _limit_primary_objectives(list(objective_queue or []))
+        if not fallback:
+            raise AgentExecutionError("root agent returned zero objectives")
+        objectives = fallback
+        notes = [
+            *[str(item).strip() for item in parsed.get("notes", []) if str(item).strip()],
+            "empty orient response replaced with remaining objective queue fallback",
+        ]
+        trace = {
+            "engine": "deepagents",
+            "notes": notes,
+            "objective_ids": [o.objective_id for o in objectives],
+            "fallback_used": True,
+            **handoff_meta,
+        }
+        return objectives, trace
+    return objectives, {"engine": "deepagents", "notes": parsed.get("notes", []), "objective_ids": [o.objective_id for o in objectives], "fallback_used": False, **handoff_meta}
 
 
 def select_objective_with_root_agent(

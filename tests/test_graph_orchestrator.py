@@ -147,7 +147,7 @@ def _install_agent_stubs(
             shared[key] = value
         rt.shared_context = shared
 
-    def _orient(_runtime, _config, *, frontier_state, discovery_trace, run_validation):
+    def _orient(_runtime, _config, *, frontier_state, discovery_trace, run_validation, objective_queue=None):
         return (
             [
                 ObjectiveScore(
@@ -1363,6 +1363,67 @@ def test_continue_or_stop_stops_deterministically_when_no_candidate_material_rem
     assert out["continue_reason"] == "no runnable candidates remain"
     assert out["planner_trace"]["continue"]["engine"] == "deterministic"
     assert out["planner_trace"]["continue"]["stop_rule"] == "no_runnable_candidates"
+
+
+def test_node_orient_passes_remaining_objective_queue_to_root_agent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runtime = SimpleNamespace(shared_context={})
+    config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
+    objective = ObjectiveScore(
+        objective_id="obj-authz",
+        title="AuthZ",
+        rationale="test",
+        expected_info_gain=0.3,
+        priority=0.3,
+        channels=["source"],
+    )
+    seen: dict[str, object] = {}
+
+    monkeypatch.setattr(graph_mod, "_state_runtime", lambda state: runtime)
+
+    def _fake_orient(_runtime, _config, *, frontier_state, discovery_trace, run_validation, objective_queue):
+        seen["frontier_state"] = frontier_state
+        seen["discovery_trace"] = discovery_trace
+        seen["run_validation"] = run_validation
+        seen["objective_ids"] = [item.objective_id for item in objective_queue]
+        return [objective], {"engine": "stub", "objective_ids": ["obj-authz"]}
+
+    monkeypatch.setattr(graph_mod, "orient_root_agent", _fake_orient)
+
+    state: graph_mod.GraphState = {
+        "config": config,
+        "repo_root": str(tmp_path),
+        "store": EvidenceStore(tmp_path / ".padv"),
+        "run_id": "run-orient-pass-queue",
+        "mode": "variant",
+        "run_validation": False,
+        "loop_continue": True,
+        "decisions": {},
+        "candidates": [],
+        "static_evidence": [],
+        "selected_candidates": [],
+        "selected_static": [],
+        "objective_queue": [objective],
+        "hypothesis_board": [],
+        "refutations": [],
+        "experiment_board": [],
+        "witness_bundles": [],
+        "bundles": [],
+        "all_bundles": [],
+        "iteration_bundles": [],
+        "artifact_refs": [],
+        "planner_trace": {},
+        "frontier_state": graph_mod._default_frontier_state(),
+        "discovery_trace": {"semantic_count": 2},
+        "agent_runtime": runtime,
+    }
+
+    out = graph_mod._node_orient(state)
+
+    assert seen["objective_ids"] == ["obj-authz"]
+    assert seen["run_validation"] is False
+    assert out["objective_queue"][0].objective_id == "obj-authz"
 
 
 def test_objective_schedule_does_not_fallback_when_resume_filter_empties_pool(

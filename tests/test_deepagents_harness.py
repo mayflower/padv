@@ -1266,6 +1266,7 @@ def test_orient_root_agent_uses_workspace_handoff_artifact(monkeypatch: pytest.M
         frontier_state={"coverage": {"files": ["src/a.php"]}},
         discovery_trace={"semantic_count": 1},
         run_validation=True,
+        objective_queue=[_objective()],
     )
 
     assert objectives[0].objective_id == "obj-001"
@@ -1275,6 +1276,7 @@ def test_orient_root_agent_uses_workspace_handoff_artifact(monkeypatch: pytest.M
     payload = json.loads(handoff_path.read_text(encoding="utf-8"))
     assert payload["category"] == "orient"
     assert payload["envelope"]["run_validation"] is True
+    assert payload["envelope"]["remaining_objectives"][0]["objective_id"] == "obj-001"
     assert "read the handoff artifact" not in seen["prompt"].lower()
     assert "handoff artifact" in seen["prompt"].lower()
     assert "\"semantic_count\": 1" not in seen["prompt"]
@@ -1346,6 +1348,7 @@ def test_orient_root_agent_compacts_frontier_in_handoff(monkeypatch: pytest.Monk
         frontier_state=large_frontier,
         discovery_trace={"semantic_count": 1},
         run_validation=False,
+        objective_queue=[_objective()],
     )
 
     handoff_path = Path(runtime.workspace_dir) / trace["handoff_ref"]
@@ -1359,6 +1362,55 @@ def test_orient_root_agent_compacts_frontier_in_handoff(monkeypatch: pytest.Monk
     assert compact["candidate_resume_size"] == 50
     assert "candidate_resume_sample" not in compact
     assert "agent_threads" not in compact
+
+
+def test_orient_root_agent_falls_back_to_remaining_objective_queue_on_empty_response(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
+    monkeypatch.setenv(config.llm.api_key_env, "test-key")
+
+    def _fake_create_deep_agent(*, model, tools, system_prompt, checkpointer=None, backend=None, store=None, subagents=None, **kwargs):
+        return SimpleNamespace(invoke=lambda *args, **kwargs: {"messages": [{"role": "assistant", "content": "{}"}]})
+
+    monkeypatch.setattr("deepagents.create_deep_agent", _fake_create_deep_agent)
+    runtime = ensure_agent_runtime(
+        config,
+        frontier_state={},
+        repo_root=str(tmp_path),
+        checkpoint_dir=str(tmp_path / "langgraph-store"),
+    )
+
+    fallback_objective = ObjectiveScore(
+        objective_id="obj-fallback",
+        title="Fallback objective",
+        rationale="keep exploring",
+        expected_info_gain=0.7,
+        priority=0.8,
+        channels=["source", "graph", "web"],
+    )
+
+    def _fake_invoke(session, prompt, _config):
+        _append_worklog(runtime, session.role, "root/worklog/orient-empty.json")
+        return {
+            "objectives": [],
+            "notes": ["diminishing returns"],
+        }
+
+    monkeypatch.setattr("padv.agents.deepagents_harness.invoke_agent_session_json", _fake_invoke)
+
+    objectives, trace = orient_root_agent(
+        runtime,
+        config,
+        frontier_state={},
+        discovery_trace={"semantic_count": 1},
+        run_validation=False,
+        objective_queue=[fallback_objective],
+    )
+
+    assert [item.objective_id for item in objectives] == ["obj-fallback"]
+    assert trace["fallback_used"] is True
+    assert "empty orient response replaced with remaining objective queue fallback" in trace["notes"]
 
 
 def test_compact_frontier_state_truncates_failed_path_reasons() -> None:
@@ -1826,7 +1878,8 @@ def test_root_guidance_and_checklist_do_not_block_on_reachability_uncertainty() 
     guidance = _handoff_work_guidance("root", "orient")
     checklist = _handoff_turn_checklist("orient", 2)
 
-    assert "Do not block orient or selection on unresolved deployment/reachability questions" in guidance
+    assert "Do not block orient on unresolved deployment/reachability questions" in guidance
+    assert "must return at least one objective" in guidance
     assert any("deployment or reachability" in item for item in checklist)
 
 

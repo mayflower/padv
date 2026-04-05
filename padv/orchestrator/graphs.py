@@ -1917,6 +1917,7 @@ def _node_orient(state: GraphState) -> GraphState:
         frontier_state=state.get("frontier_state", {}),
         discovery_trace=state.get("discovery_trace", {}),
         run_validation=bool(state.get("run_validation")),
+        objective_queue=state.get("objective_queue", []),
     )
     objectives, supplement_trace = _supplement_objectives_with_candidate_coverage(state, objectives)
     state["objective_queue"] = objectives
