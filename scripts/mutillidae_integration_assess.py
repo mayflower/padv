@@ -17,6 +17,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from padv.eval.integration_assessment import RequirementResult, classify_failure, matrix_to_gap_list
+from padv.store.evidence_store import EvidenceStore
 
 PADV_STORE = ROOT_DIR / ".padv"
 APP_COMPOSE_FILE = ROOT_DIR / "docker-compose.mutillidae.yml"
@@ -186,6 +187,46 @@ def _latest_graph_progress(prefix: str) -> dict[str, Any] | None:
     }
 
 
+def _graph_progress_for_run(run_id: str) -> dict[str, Any] | None:
+    run_id = str(run_id).strip()
+    if not run_id:
+        return None
+
+    candidate_roots = [PADV_STORE / "langgraph" / run_id, PADV_STORE / "runs" / run_id / "stages"]
+    snapshots: list[tuple[int, str, Path]] = []
+    for root in candidate_roots:
+        if not root.exists():
+            continue
+        for child in root.iterdir():
+            if not child.is_file():
+                continue
+            match = _GRAPH_STAGE_RE.match(child.name)
+            if match is None:
+                continue
+            snapshots.append((int(match.group("index")), match.group("stage"), child))
+    if not snapshots:
+        return None
+
+    snapshots.sort()
+    _, latest_stage, latest_path = snapshots[-1]
+    payload = _load_json(latest_path, {})
+    counts = payload.get("counts", {}) if isinstance(payload, dict) else {}
+    decisions = payload.get("decisions", {}) if isinstance(payload, dict) else {}
+    frontier = payload.get("frontier", {}) if isinstance(payload, dict) else {}
+    return {
+        "run_id": str(payload.get("run_id", "")).strip() or run_id,
+        "latest_stage": latest_stage,
+        "latest_stage_file": str(latest_path),
+        "completed": any(stage == "persist" for _, stage, _ in snapshots),
+        "candidates": int(counts.get("candidates", 0) or 0),
+        "static_evidence": int(counts.get("static_evidence", 0) or 0),
+        "bundle_count": int(counts.get("all_bundles", counts.get("bundles", 0)) or 0),
+        "counts": counts,
+        "decisions": decisions,
+        "frontier": frontier,
+    }
+
+
 def _attempt_failure_class(result: CmdResult) -> str:
     if result.returncode == 124:
         return "timeout"
@@ -327,13 +368,14 @@ def run_analyze_stabilization(output_dir: Path, max_attempts: int, analyze_timeo
     success = False
     final_payload: dict[str, Any] | None = None
     for idx in range(1, max_attempts + 1):
+        requested_run_id = f"analyze-mutillidae-{idx:02d}"
         res = _run(
             f"analyze_attempt_{idx}",
-            _scanner_padv_cmd("analyze", "--config", STRICT_CONFIG_PATH, "--repo-root", STRICT_REPO_ROOT, "--mode", "variant"),
+            _scanner_padv_cmd("analyze", "--config", STRICT_CONFIG_PATH, "--repo-root", STRICT_REPO_ROOT, "--mode", "variant", "--run-id", requested_run_id),
             timeout_seconds=analyze_timeout,
         )
         parsed = _safe_json_parse(res.stdout)
-        recovered = _latest_graph_progress("analyze")
+        recovered = _graph_progress_for_run(requested_run_id) or _latest_graph_progress("analyze")
         observed = parsed if isinstance(parsed, dict) else recovered
         has_counts = isinstance(observed, dict) and int(observed.get("candidates", 0)) > 0 and int(observed.get("static_evidence", 0)) > 0
         completed = isinstance(recovered, dict) and bool(recovered.get("completed"))
@@ -372,13 +414,14 @@ def run_strict_run_stabilization(output_dir: Path, max_attempts: int, run_timeou
     success = False
     final_payload: dict[str, Any] | None = None
     for idx in range(1, max_attempts + 1):
+        requested_run_id = f"run-mutillidae-{idx:02d}"
         res = _run(
             f"run_attempt_{idx}",
-            _scanner_padv_cmd("run", "--config", STRICT_CONFIG_PATH, "--repo-root", STRICT_REPO_ROOT, "--mode", "variant"),
+            _scanner_padv_cmd("run", "--config", STRICT_CONFIG_PATH, "--repo-root", STRICT_REPO_ROOT, "--mode", "variant", "--run-id", requested_run_id),
             timeout_seconds=run_timeout,
         )
         parsed = _safe_json_parse(res.stdout)
-        recovered = _latest_graph_progress("run")
+        recovered = _graph_progress_for_run(requested_run_id) or _latest_graph_progress("run")
         observed = parsed if isinstance(parsed, dict) else recovered
         has_run = isinstance(observed, dict) and str(observed.get("run_id", "")).strip() != ""
         completed = isinstance(recovered, dict) and bool(recovered.get("completed"))
@@ -444,15 +487,36 @@ def _load_gap_rows() -> list[dict[str, Any]]:
     return _load_json(GAP_CATALOG_PATH, [])
 
 
-def _load_candidates() -> list[dict[str, Any]]:
-    return _load_json(PADV_STORE / "candidates.json", [])
+def _store() -> EvidenceStore:
+    return EvidenceStore(PADV_STORE)
 
 
-def _load_bundles() -> list[dict[str, Any]]:
-    bundles_dir = PADV_STORE / "bundles"
+def _load_candidates(run_id: str) -> list[dict[str, Any]]:
+    store = _store().for_run(run_id)
+    return _load_json(store.root / "candidates.json", [])
+
+
+def _load_bundles(run_id: str) -> list[dict[str, Any]]:
+    store = _store().for_run(run_id)
+    bundles_dir = store.root / "bundles"
     if not bundles_dir.exists():
         return []
     return [_load_json(path, {}) for path in sorted(bundles_dir.glob("*.json"))]
+
+
+def _bundle_coverage_outcome(bundle: dict[str, Any]) -> str:
+    decision = str((bundle.get("gate_result") or {}).get("decision", "")).strip().upper()
+    bundle_type = str(bundle.get("bundle_type", "")).strip().lower()
+
+    if decision == "VALIDATED" or bundle_type == "validated_exploit":
+        return "VALIDATED"
+    if decision == "REFUTED" or bundle_type == "refuted":
+        return "REFUTED"
+    if decision in {"SKIPPED_BUDGET", "NEEDS_HUMAN_SETUP"} or bundle_type in {"skipped_budget", "skipped"}:
+        return "SKIPPED"
+    if decision == "ERROR" or bundle_type == "error":
+        return "ERROR"
+    return "ATTEMPTED"
 
 
 def run_phase_b(output_dir: Path, run_id: str, phase_a: dict[str, Any]) -> dict[str, Any]:
@@ -473,8 +537,8 @@ def run_phase_b(output_dir: Path, run_id: str, phase_a: dict[str, Any]) -> dict[
         RequirementResult("CORE-RUN", "strict run on Mutillidae", "run completed", str(output_dir / "a3-run-stabilization.json"), "FULL" if a3_ok else "FAIL", "" if a3_ok else "strict run did not finish successfully", "stabilize runtime validation path").to_dict()
     )
 
-    candidates = _load_candidates()
-    bundles = _load_bundles()
+    candidates = _load_candidates(run_id)
+    bundles = _load_bundles(run_id)
     for gap in _load_gap_rows():
         category = str(gap.get("category", ""))
         matched_candidates = [
@@ -496,22 +560,23 @@ def run_phase_b(output_dir: Path, run_id: str, phase_a: dict[str, Any]) -> dict[
         found_by_static = any(set(item.get("provenance", [])) & {"source", "joern", "scip"} for item in matched_candidates)
         found_by_web = any("web" in item.get("provenance", []) or item.get("web_path_hints") for item in matched_candidates)
         runtime_attempted = bool(matched_bundles)
-        validated_or_refuted = [str((item.get("gate_result") or {}).get("decision", "")) for item in matched_bundles]
+        runtime_outcomes = [_bundle_coverage_outcome(item) for item in matched_bundles]
+        runtime_conclusive = any(outcome in {"VALIDATED", "REFUTED"} for outcome in runtime_outcomes)
 
-        if matched_candidates and (not gap.get("runtime_validatable") or runtime_attempted):
+        if matched_candidates and (not gap.get("runtime_validatable") or runtime_conclusive):
             status = "FULL"
         elif matched_candidates:
             status = "PARTIAL"
         else:
             status = "FAIL"
 
-        evidence_path = str(PADV_STORE / "candidates.json") if matched_candidates else str(GAP_CATALOG_PATH)
+        evidence_path = str(_store().for_run(run_id).root / "candidates.json") if matched_candidates else str(GAP_CATALOG_PATH)
         observed = json.dumps(
             {
                 "found_by_static": found_by_static,
                 "found_by_web": found_by_web,
                 "runtime_attempted": runtime_attempted,
-                "validated_or_refuted": validated_or_refuted,
+                "runtime_outcomes": runtime_outcomes,
             },
             ensure_ascii=True,
         )

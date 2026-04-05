@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import threading
 import time
 import uuid
@@ -25,6 +26,8 @@ from padv.agents.deepagents_harness import (
     _compact_research_findings,
     _handoff_timeout_seconds,
     _handoff_cache_key,
+    _load_handoff_cache,
+    _store_handoff_cache,
     _handoff_turn_checklist,
     _handoff_work_guidance,
     _inject_canary_into_xml,
@@ -2872,7 +2875,7 @@ def test_research_handoff_inflight_deduplicates_identical_parallel_requests(
 def test_handoff_cache_key_ignores_run_volatile_frontier_metadata(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    _config, runtime = _runtime_config(tmp_path, monkeypatch)
+    config, runtime = _runtime_config(tmp_path, monkeypatch)
     session = runtime.root
     envelope_a = {
         "run_validation": False,
@@ -2897,6 +2900,7 @@ def test_handoff_cache_key_ignores_run_volatile_frontier_metadata(
 
     key_a = _handoff_cache_key(
         session,
+        config=config,
         category="orient",
         envelope=envelope_a,
         response_contract='{"objectives":[],"notes":[]}',
@@ -2905,6 +2909,7 @@ def test_handoff_cache_key_ignores_run_volatile_frontier_metadata(
     )
     key_b = _handoff_cache_key(
         session,
+        config=config,
         category="orient",
         envelope=envelope_b,
         response_contract='{"objectives":[],"notes":[]}',
@@ -2913,6 +2918,68 @@ def test_handoff_cache_key_ignores_run_volatile_frontier_metadata(
     )
 
     assert key_a == key_b
+
+
+def test_handoff_cache_key_changes_when_config_signature_changes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config_a, runtime = _runtime_config(tmp_path, monkeypatch)
+    config_b, _runtime2 = _runtime_config(tmp_path / "other", monkeypatch)
+    config_b.budgets.max_requests = config_a.budgets.max_requests + 1
+    session = runtime.root
+    envelope = {
+        "frontier_state": {"iteration": 1, "coverage": {"files": ["src/a.php"]}},
+        "discovery_trace": {"semantic_count": 1},
+    }
+
+    key_a = _handoff_cache_key(
+        session,
+        config=config_a,
+        category="source_research",
+        envelope=envelope,
+        response_contract='{"tasks":[],"findings":[],"notes":[]}',
+        workspace_role="source",
+        delegated_role=None,
+    )
+    key_b = _handoff_cache_key(
+        session,
+        config=config_b,
+        category="source_research",
+        envelope=envelope,
+        response_contract='{"tasks":[],"findings":[],"notes":[]}',
+        workspace_role="source",
+        delegated_role=None,
+    )
+
+    assert key_a != key_b
+
+
+def test_handoff_cache_ignores_stale_sqlite_entry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config, runtime = _runtime_config(tmp_path, monkeypatch)
+    session = runtime.root
+    key = _handoff_cache_key(
+        session,
+        config=config,
+        category="source_research",
+        envelope={"frontier_state": {}, "objective": {"objective_id": "obj-1"}},
+        response_contract='{"tasks":[],"findings":[],"notes":[]}',
+        workspace_role="source",
+        delegated_role=None,
+    )
+    _store_handoff_cache(runtime.checkpoint_dir, key, {"tasks": [], "findings": [], "notes": ["fresh"]})
+    db_path = Path(runtime.checkpoint_dir) / "handoff_cache.sqlite"
+    with sqlite3.connect(db_path) as conn:
+        conn.execute(
+            "UPDATE handoff_exact_cache SET created_at = ? WHERE cache_key = ?",
+            ("2000-01-01T00:00:00+00:00", key),
+        )
+        conn.commit()
+
+    monkeypatch.setattr("padv.agents.deepagents_harness._HANDOFF_CACHE_TTL_SECONDS", 1)
+
+    assert _load_handoff_cache(runtime.checkpoint_dir, key) is None
 
 
 def test_parallel_role_runtime_uses_isolated_shared_context_and_merge() -> None:

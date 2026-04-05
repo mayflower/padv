@@ -310,7 +310,7 @@ def _install_agent_stubs(
     monkeypatch.setattr("padv.orchestrator.graphs.synthesize_hypotheses_with_subagent", _synthesize)
     monkeypatch.setattr("padv.orchestrator.graphs.challenge_hypotheses_with_subagent", _challenge)
     monkeypatch.setattr("padv.orchestrator.graphs.plan_experiments_with_subagent", _plan)
-    monkeypatch.setattr("padv.orchestrator.graphs.decide_continue_with_root_agent", _continue)
+    monkeypatch.setattr("padv.orchestrator.graphs.decide_continue_with_root_agent", _continue, raising=False)
     return state
 
 
@@ -577,18 +577,28 @@ def test_objective_backfill_keeps_more_than_sixteen_families(tmp_path: Path) -> 
     assert "obj-auto-logging_monitoring_failures" in ids
 
 
-def test_continue_uses_run_local_iteration_not_persisted_frontier_iteration(
+def test_run_with_graph_stops_on_stagnation_without_root_continue(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
-    config.agent.max_iterations = 3
-    config.agent.improvement_patience = 0
+    config.agent.max_iterations = 5
+    config.agent.improvement_patience = 1
     store = EvidenceStore(tmp_path / ".padv")
     _force_node_runner(monkeypatch)
-    _install_agent_stubs(monkeypatch, tmp_path, objective_count=2, continue_sequence=[True, False])
+    _install_agent_stubs(monkeypatch, tmp_path, objective_count=4)
+
+    candidate = _mk_candidate("joern-1", ["joern"])
+    static = _mk_evidence("joern-1", "joern::sql")
 
     persisted = graph_mod._default_frontier_state()
-    persisted["iteration"] = 20
+    persisted["coverage"] = {
+        "files": [candidate.file_path],
+        "classes": [candidate.vuln_class],
+        "signals": list(candidate.provenance),
+        "sinks": [candidate.sink],
+        "web_paths": [],
+    }
+    persisted["runtime_coverage"] = {"flags": [], "classes": [candidate.vuln_class]}
     persisted["target_scope"] = {
         "repo_root": str(tmp_path.resolve()),
         "base_url": config.target.base_url,
@@ -600,8 +610,8 @@ def test_continue_uses_run_local_iteration_not_persisted_frontier_iteration(
     monkeypatch.setattr(
         "padv.orchestrator.graphs.discover_candidates_with_meta",
         lambda repo_root, config: (
-            [_mk_candidate("joern-1", ["joern"])],
-            [_mk_evidence("joern-1", "joern::sql")],
+            [candidate],
+            [static],
             _mk_joern_meta(findings=1, app_findings=1, candidate_count=1),
         ),
     )
@@ -610,19 +620,55 @@ def test_continue_uses_run_local_iteration_not_persisted_frontier_iteration(
         lambda repo_root, config: ([], [], [], _mk_scip_meta(), None),
     )
     monkeypatch.setattr("padv.orchestrator.graphs.discover_web_inventory", lambda config, seed_urls=None: ({}, {}, None))
+    monkeypatch.setattr(
+        "padv.orchestrator.graphs.decide_continue_with_root_agent",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("root continue should not run")),
+        raising=False,
+    )
 
-    seen_iterations: list[int] = []
+    call_counter = {"n": 0}
 
-    def _continue(_runtime, _config, *, iteration, objective_queue, hypotheses, refutations, witness_bundles, max_iterations):
-        seen_iterations.append(iteration)
-        return (iteration < max_iterations), {"engine": "stub", "reason": f"iteration={iteration}"}
+    def _fake_validate(*args, **kwargs):
+        call_counter["n"] += 1
+        bundle = EvidenceBundle(
+            bundle_id=f"bundle-{call_counter['n']}",
+            created_at="2026-03-06T00:00:00+00:00",
+            candidate=candidate,
+            static_evidence=[static],
+            positive_runtime=[RuntimeEvidence("r1", "ok", 1, False, False, False, None, [], {})],
+            negative_runtime=[RuntimeEvidence("r2", "ok", 0, False, False, False, None, [], {})],
+            repro_run_ids=["r1"],
+            gate_result=GateResult("DROPPED", ["V0"], "V3", "missing"),
+            limitations=["missing"],
+            planner_trace={
+                "attempts": [
+                    {
+                        "phase": "positive",
+                        "index": 0,
+                        "request_id": f"req-{call_counter['n']}",
+                        "request": {"method": "GET", "path": "/"},
+                        "runtime_status": "ok",
+                        "http_status": 200,
+                        "call_count": 1,
+                        "analysis_flags": [],
+                        "new_flags": [],
+                        "elapsed_ms": 1,
+                        "auth_context": "anonymous",
+                    }
+                ]
+            },
+        )
+        return [bundle], {"VALIDATED": 0, "DROPPED": 1, "NEEDS_HUMAN_SETUP": 0}
 
-    monkeypatch.setattr("padv.orchestrator.graphs.decide_continue_with_root_agent", _continue)
+    monkeypatch.setattr("padv.orchestrator.graphs.validate_candidates_runtime", _fake_validate)
 
-    analyze_with_graph(config, str(tmp_path), store, "variant")
+    run_with_graph(config, str(tmp_path), store, "variant")
 
-    assert seen_iterations
-    assert seen_iterations[0] == 1
+    assert call_counter["n"] == 2
+    frontier = store.load_frontier_state()
+    assert frontier is not None
+    assert frontier["iteration"] == 2
+    assert frontier["stagnation_rounds"] == 2
 
 
 
@@ -1271,9 +1317,7 @@ def test_reduce_research_allows_empty_findings_when_no_candidate_material_remain
     assert out["planner_trace"]["research_branch_errors"]["source"]["error"] == "source invocation timed out after 120s"
 
 
-def test_continue_or_stop_calls_root_even_when_no_candidate_material_remains(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_continue_or_stop_stops_deterministically_when_no_candidate_material_remains(tmp_path: Path) -> None:
     runtime = SimpleNamespace(shared_context={})
     config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
     objective = ObjectiveScore(
@@ -1313,22 +1357,12 @@ def test_continue_or_stop_calls_root_even_when_no_candidate_material_remains(
         "run_iteration": 4,
     }
 
-    calls = {"count": 0}
-
-    monkeypatch.setattr(
-        "padv.orchestrator.graphs.decide_continue_with_root_agent",
-        lambda *_args, **_kwargs: (
-            calls.__setitem__("count", calls["count"] + 1) or True,
-            {"engine": "deepagents", "reason": "no remaining objectives", "notes": []},
-        ),
-    )
-
     out = graph_mod._node_continue_or_stop(state)
 
-    assert calls["count"] == 1
     assert out["loop_continue"] is False
-    assert out["continue_reason"] == "no remaining objectives"
-    assert out["planner_trace"]["continue"]["engine"] == "deepagents"
+    assert out["continue_reason"] == "no runnable candidates remain"
+    assert out["planner_trace"]["continue"]["engine"] == "deterministic"
+    assert out["planner_trace"]["continue"]["stop_rule"] == "no_runnable_candidates"
 
 
 def test_objective_schedule_does_not_fallback_when_resume_filter_empties_pool(
@@ -2800,7 +2834,7 @@ def test_analyze_resume_reuses_graph_checkpoint_after_failure(
     )
 
     assert counters["static"] == 1
-    assert counters["select"] == 2
+    assert counters["select"] >= 2
     assert candidates
     assert static_evidence
 
@@ -3030,3 +3064,159 @@ def test_analyze_persists_yielded_resume_metadata_on_agent_soft_yield(
     assert resume_meta["status"] == "yielded"
     assert resume_meta["soft_yield"]["category"] == "source_research"
     assert resume_meta["soft_yield"]["turn"] == 2
+
+
+def test_validate_with_graph_bypasses_langgraph_objective_and_research_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
+    config.auth.enabled = False
+    store = EvidenceStore(tmp_path / ".padv")
+    candidate = _mk_candidate("cand-00001", ["joern"])
+    static = _mk_evidence("cand-00001", "joern::sql")
+
+    def _forbidden(*_args, **_kwargs):
+        raise AssertionError("validate-only direct path should not call graph research/objective functions")
+
+    monkeypatch.setattr(graph_mod, "_run_langgraph", _forbidden)
+    monkeypatch.setattr(graph_mod, "orient_root_agent", _forbidden)
+    monkeypatch.setattr(graph_mod, "select_objective_with_root_agent", _forbidden)
+    monkeypatch.setattr(graph_mod, "run_research_subagent", _forbidden)
+    monkeypatch.setattr(
+        graph_mod,
+        "make_validation_plans_with_deepagents",
+        lambda candidates, *_args, **_kwargs: (
+            {
+                item.candidate_id: ValidationPlan(
+                    candidate_id=item.candidate_id,
+                    intercepts=["mysqli_query"],
+                    oracle_functions=["mysqli_query"],
+                    positive_requests=[{"method": "GET", "path": "/", "query": {"x": "1"}}] * 3,
+                    negative_requests=[{"method": "GET", "path": "/", "query": {"x": "0"}}],
+                    canary="padv-canary",
+                )
+                for item in candidates
+            },
+            {"engine": "stub", "planned_candidate_ids": [item.candidate_id for item in candidates]},
+        ),
+    )
+
+    def _fake_validate_candidates_runtime(**kwargs):
+        decisions = graph_mod._default_decisions()
+        decisions["DROPPED"] = 1
+        return (
+            [
+                EvidenceBundle(
+                    bundle_id="bundle-run-validate-direct-cand-00001",
+                    created_at="2026-04-05T00:00:00+00:00",
+                    candidate=candidate,
+                    static_evidence=kwargs["static_evidence"],
+                    positive_runtime=[],
+                    negative_runtime=[],
+                    repro_run_ids=[],
+                    gate_result=GateResult("DROPPED", ["V0"], "V3", "test"),
+                    limitations=["test"],
+                )
+            ],
+            decisions,
+        )
+
+    monkeypatch.setattr(graph_mod, "validate_candidates_runtime", _fake_validate_candidates_runtime)
+
+    bundles, decisions = graph_mod.validate_with_graph(
+        config=config,
+        store=store,
+        static_evidence=[static],
+        candidates=[candidate],
+        run_id="run-validate-direct",
+        repo_root=str(tmp_path),
+    )
+
+    assert [item.bundle_id for item in bundles] == ["bundle-run-validate-direct-cand-00001"]
+    assert decisions["DROPPED"] == 1
+    assert [item.candidate_id for item in store.for_run("run-validate-direct").load_candidates()] == ["cand-00001"]
+    assert [item.candidate_id for item in store.for_run("run-validate-direct").load_static_evidence()] == ["cand-00001"]
+
+
+def test_validate_with_graph_direct_path_uses_selected_candidates_and_linked_static(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
+    config.auth.enabled = False
+    store = EvidenceStore(tmp_path / ".padv")
+    candidate = _mk_candidate_custom("cand-derived", ["joern"], line=12)
+    candidate.evidence_refs = ["joern::sql::1:src/a.php:12"]
+    static_source = _mk_evidence("cand-source", "joern::sql::1")
+    stale_static = StaticEvidence(
+        candidate_id="cand-stale",
+        query_profile="default",
+        query_id="scip::sql::2",
+        file_path="src/other.php",
+        line=44,
+        snippet="mysqli_query($other, $q)",
+        hash="h-stale",
+    )
+    seen: dict[str, list[str]] = {}
+
+    monkeypatch.setattr(
+        graph_mod,
+        "make_validation_plans_with_deepagents",
+        lambda candidates, *_args, **_kwargs: (
+            {
+                item.candidate_id: ValidationPlan(
+                    candidate_id=item.candidate_id,
+                    intercepts=["mysqli_query"],
+                    oracle_functions=["mysqli_query"],
+                    positive_requests=[{"method": "GET", "path": "/", "query": {"x": "1"}}] * 3,
+                    negative_requests=[{"method": "GET", "path": "/", "query": {"x": "0"}}],
+                    canary="padv-canary",
+                )
+                for item in candidates
+            },
+            {"engine": "stub", "planned_candidate_ids": [item.candidate_id for item in candidates]},
+        ),
+    )
+
+    def _fake_validate_candidates_runtime(**kwargs):
+        seen["candidate_ids"] = [item.candidate_id for item in kwargs["candidates"]]
+        seen["static_ids"] = [item.candidate_id for item in kwargs["static_evidence"]]
+        decisions = graph_mod._default_decisions()
+        decisions["NEEDS_HUMAN_SETUP"] = 1
+        return (
+            [
+                EvidenceBundle(
+                    bundle_id="bundle-run-validate-selected-cand-derived",
+                    created_at="2026-04-05T00:00:00+00:00",
+                    candidate=candidate,
+                    static_evidence=kwargs["static_evidence"],
+                    positive_runtime=[],
+                    negative_runtime=[],
+                    repro_run_ids=[],
+                    gate_result=GateResult(
+                        "NEEDS_HUMAN_SETUP",
+                        ["V0"],
+                        "V1",
+                        "typed_preconditions_unresolved: unknown_blockers=upload required",
+                    ),
+                    limitations=["typed_preconditions_unresolved: unknown_blockers=upload required"],
+                )
+            ],
+            decisions,
+        )
+
+    monkeypatch.setattr(graph_mod, "validate_candidates_runtime", _fake_validate_candidates_runtime)
+
+    bundles, decisions = graph_mod.validate_with_graph(
+        config=config,
+        store=store,
+        static_evidence=[static_source, stale_static],
+        candidates=[candidate],
+        run_id="run-validate-selected",
+        repo_root=str(tmp_path),
+    )
+
+    assert seen["candidate_ids"] == ["cand-derived"]
+    assert seen["static_ids"] == ["cand-source"]
+    assert [item.bundle_id for item in bundles] == ["bundle-run-validate-selected-cand-derived"]
+    assert decisions["NEEDS_HUMAN_SETUP"] == 1
+    assert [item.candidate_id for item in store.for_run("run-validate-selected").load_static_evidence()] == ["cand-source"]

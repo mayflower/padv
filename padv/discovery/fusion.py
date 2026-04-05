@@ -64,15 +64,26 @@ def _merge_candidate_fields(target: Candidate, incoming: Candidate) -> None:
         target.notes = f"{target.notes}; {incoming.notes}".strip("; ")
 
 
+def _primary_candidate_rank(candidate: Candidate) -> tuple[int, float, str, str]:
+    return (
+        _semantic_score(candidate),
+        candidate.confidence,
+        str(candidate.sink or "").strip().casefold(),
+        str(candidate.candidate_id or "").strip(),
+    )
+
+
 def _merge_candidates_by_key(
     candidates: list[Candidate],
-) -> tuple[dict[str, tuple[str, str, int]], dict[tuple[str, str, int], Candidate], int]:
+) -> tuple[dict[str, tuple[str, str, int]], dict[str, tuple[str, str, int]], dict[tuple[str, str, int], Candidate], int]:
     key_by_old_id: dict[str, tuple[str, str, int]] = {}
+    key_by_old_uid: dict[str, tuple[str, str, int]] = {}
     merged: dict[tuple[str, str, int], Candidate] = {}
     dropped_nonsemantic = 0
     for cand in candidates:
         key = (cand.vuln_class, cand.file_path, cand.line)
         key_by_old_id[cand.candidate_id] = key
+        key_by_old_uid[cand.candidate_uid] = key
         if _semantic_score(cand) == 0:
             dropped_nonsemantic += 1
             continue
@@ -80,14 +91,19 @@ def _merge_candidates_by_key(
         if current is None:
             merged[key] = replace(cand)
             continue
+        if _primary_candidate_rank(cand) > _primary_candidate_rank(current):
+            replacement = replace(cand)
+            _merge_candidate_fields(replacement, current)
+            merged[key] = replacement
+            continue
         _merge_candidate_fields(current, cand)
-    return key_by_old_id, merged, dropped_nonsemantic
+    return key_by_old_id, key_by_old_uid, merged, dropped_nonsemantic
 
 
 def _assign_ids_and_boost(
     merged: dict[tuple[str, str, int], Candidate],
     max_candidates: int,
-) -> tuple[list[Candidate], dict[tuple[str, str, int], str], int]:
+) -> tuple[list[Candidate], dict[tuple[str, str, int], tuple[str, str]], int]:
     merged_list = sorted(
         merged.items(),
         key=lambda item: (
@@ -100,12 +116,10 @@ def _assign_ids_and_boost(
     )[:max_candidates]
 
     new_candidates: list[Candidate] = []
-    remap: dict[tuple[str, str, int], str] = {}
+    remap: dict[tuple[str, str, int], tuple[str, str]] = {}
     dual_signal_candidates = 0
-    for idx, (key, cand) in enumerate(merged_list, start=1):
-        new_id = f"cand-{idx:05d}"
-        remap[key] = new_id
-        cand.candidate_id = new_id
+    for key, cand in merged_list:
+        remap[key] = (cand.candidate_id, cand.candidate_uid)
         if _semantic_score(cand) >= 2:
             dual_signal_candidates += 1
             cand.confidence = min(1.0, cand.confidence + 0.1)
@@ -118,18 +132,22 @@ def _assign_ids_and_boost(
 def _remap_static_evidence(
     static_evidence: list[StaticEvidence],
     key_by_old_id: dict[str, tuple[str, str, int]],
-    remap: dict[tuple[str, str, int], str],
+    key_by_old_uid: dict[str, tuple[str, str, int]],
+    remap: dict[tuple[str, str, int], tuple[str, str]],
 ) -> list[StaticEvidence]:
     new_static: list[StaticEvidence] = []
     seen_hashes: set[tuple[str, str]] = set()
     for item in static_evidence:
-        key = key_by_old_id.get(item.candidate_id)
+        key = key_by_old_uid.get(item.candidate_uid) if item.candidate_uid else None
+        if key is None:
+            key = key_by_old_id.get(item.candidate_id)
         if key is None:
             continue
-        candidate_id = remap.get(key)
-        if not candidate_id:
+        anchor = remap.get(key)
+        if not anchor:
             continue
-        dedup_key = (candidate_id, item.hash)
+        candidate_id, candidate_uid = anchor
+        dedup_key = (candidate_uid, item.hash)
         if dedup_key in seen_hashes:
             continue
         seen_hashes.add(dedup_key)
@@ -142,6 +160,7 @@ def _remap_static_evidence(
                 line=item.line,
                 snippet=item.snippet,
                 hash=item.hash,
+                candidate_uid=candidate_uid,
             )
         )
     return new_static
@@ -153,17 +172,18 @@ def _build_evidence_graph(
 ) -> dict[str, dict[str, object]]:
     static_refs: dict[str, list[str]] = {}
     for item in new_static:
-        static_refs.setdefault(item.candidate_id, []).append(item.query_id)
+        static_refs.setdefault(item.candidate_uid or item.candidate_id, []).append(item.query_id)
 
     evidence_graph: dict[str, dict[str, object]] = {}
     for cand in new_candidates:
         semantic = sorted(_semantic_signals(cand))
-        evidence_graph[cand.candidate_id] = {
+        evidence_graph[cand.candidate_uid] = {
+            "candidate_id": cand.candidate_id,
             "semantic_signals": semantic,
             "semantic_signal_count": len(semantic),
             "provenance": list(cand.provenance),
             "evidence_refs": list(cand.evidence_refs),
-            "static_query_ids": sorted(static_refs.get(cand.candidate_id, [])),
+            "static_query_ids": sorted(static_refs.get(cand.candidate_uid, [])),
             "has_dual_signal": len(semantic) >= 2,
         }
     return evidence_graph
@@ -177,9 +197,9 @@ def fuse_candidates_with_meta(
     if not candidates:
         return [], [], FusionMeta(0, 0, 0, 0, {})
 
-    key_by_old_id, merged, dropped_nonsemantic = _merge_candidates_by_key(candidates)
+    key_by_old_id, key_by_old_uid, merged, dropped_nonsemantic = _merge_candidates_by_key(candidates)
     new_candidates, remap, dual_signal_candidates = _assign_ids_and_boost(merged, config.budgets.max_candidates)
-    new_static = _remap_static_evidence(static_evidence, key_by_old_id, remap)
+    new_static = _remap_static_evidence(static_evidence, key_by_old_id, key_by_old_uid, remap)
     evidence_graph = _build_evidence_graph(new_candidates, new_static)
 
     meta = FusionMeta(

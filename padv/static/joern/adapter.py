@@ -103,6 +103,7 @@ def _make_candidate_and_evidence(
         line=line,
         snippet=snippet[:240],
         hash=_hash_for(file_path, line, snippet),
+        candidate_uid=candidate.candidate_uid,
     )
     return candidate, evidence
 

@@ -9,7 +9,7 @@ from typing import Any
 from dataclasses import dataclass
 
 from padv.config.schema import PadvConfig
-from padv.dynamic.http.runner import RequestError, send_request
+from padv.dynamic.http.runner import HttpSession, RequestError, send_request
 from padv.dynamic.sandbox import adapter as sandbox_adapter
 from padv.gates.engine import evaluate_candidate
 from padv.models import (
@@ -43,7 +43,14 @@ from padv.taxonomy import (
     canonicalize_vuln_class,
     contains_canary,
 )
-from padv.validation.contracts import apply_validation_profile, is_runtime_validatable, profile_for_vuln_class
+from padv.validation.contracts import (
+    apply_validation_profile,
+    build_runtime_witness,
+    is_runtime_validatable,
+    profile_for_vuln_class,
+    witness_contract_for_vuln_class,
+)
+from padv.validation.preconditions import GatePreconditions, parse_gate_preconditions, resolve_gate_preconditions
 
 
 _HTTP_SIGNAL_CLASSES = {
@@ -67,118 +74,6 @@ _AUTHZ_PROBE_CLASSES = {
 _ERROR_MARKERS = ("warning:", "notice:", "fatal error", "stack trace", "uncaught exception")
 _LOGIN_MARKERS = ("login", "sign in", "signin", "anmelden", "auth", "passwort", "password")
 _SQL_ERROR_MARKERS = SQL_ERROR_MARKERS
-_NONBLOCKING_PRECONDITION_EXACT = {
-    "runtime-oracle-not-applicable",
-    "auth-state-known",
-}
-_NONBLOCKING_PRECONDITION_PREFIXES = (
-    "content-type:",
-    "http post request",
-    "http get request",
-    "soapaction:",
-    "common payloads:",
-    "for level 0:",
-    "for level 1:",
-    "stage 1 -",
-    "stage 2 -",
-    "stage 3 -",
-    "optional:",
-    "post to ",
-    "get to ",
-    "get/post to ",
-    "response includes",
-    "response must",
-    "response should",
-    "base query returns",
-    "valid soap",
-    "valid json",
-    "shell metacharacters",
-    "sql injection in ",
-    "post request",
-    "get request",
-    "post or get request",
-    "request with ",
-    "request to ",
-)
-_NONBLOCKING_PRECONDITION_SUBSTRINGS = (
-    "security_level",
-    "security-level",
-    "security level",
-    "must be at security level",
-    "default security level",
-    "security level must be",
-    "$lprotectagainst",
-    "$lusesafejsonparser",
-    "gusesafejsonparser",
-    "public endpoint accessibility",
-    "no session uid validation",
-    "no authentication check",
-    "no session validation",
-    "mysql connection active",
-    "database must be accessible",
-    "error reporting must be enabled",
-    "direct endpoint access via post or get",
-    "post or get request with ",
-    "none - unauthenticated access allowed",
-    "none - endpoint accessible without authentication",
-    "active php session",
-    "session_start()",
-    "php session must be initiated",
-    "php session initialized",
-    "valid php session",
-    "php shell_exec() function must be enabled",
-    "shell_exec() enabled",
-    "shell_exec() function enabled",
-    "no jwt token required",
-    "no special permissions",
-    "no username/password required",
-    "server must accept post requests",
-    "soapaction header",
-    "soap request must be well-formed xml",
-    "parameter in soap body",
-    "parameter with payload",
-    "json body with ",
-    "multipart/form-data",
-    "valid json format",
-    "get or post request with ",
-    "query must return ",
-    "satisfying precondition",
-    "for union-based:",
-    "for boolean-blind:",
-    "for error-based:",
-    "for special uuid:",
-    "for time-based:",
-    "unix/linux system with /etc/passwd readable by web server",
-    "apache/nginx serves .php files",
-    "apache web server with allowoverride",
-    "allowoverride all",
-    "allowoverride fileinfo",
-    "mod_mime enabled in apache",
-    "syntax varies for other databases",
-    "mysql database backend",
-    "response returned as json",
-    "must not equal special uuid",
-    "matching 5 columns",
-    "webroot path known",
-    "write permissions to webroot",
-    "writable by www-data",
-    "uid cookie",
-    "upload_directory hidden field",
-    "extract permanent file path",
-    "uploaded_file_path",
-    "query string (?cmd=",
-    "file_exists() check",
-    "require_once() executes php code",
-)
-_AUTH_PRECONDITION_HINTS = (
-    "login",
-    "logged in",
-    "authenticated",
-    "session required",
-    "admin session",
-    "admin role",
-    "privileged",
-)
 
 _CLASS_ORACLE_WITNESS_FLAGS = CLASS_ORACLE_WITNESS_FLAGS
 
@@ -371,8 +266,24 @@ def _bundle_type_for_decision(decision: str) -> str:
         "CONFIRMED_ANALYSIS_FINDING": "confirmed_analysis_finding",
         "DROPPED": "dropped",
         "NEEDS_HUMAN_SETUP": "needs_human_setup",
+        "SKIPPED_BUDGET": "skipped_budget",
+        "ERROR": "error",
     }
     return mapping.get(str(decision).strip(), "dropped")
+
+
+_RUNTIME_DECISION_KEYS = (
+    "VALIDATED",
+    "DROPPED",
+    "NEEDS_HUMAN_SETUP",
+    "CONFIRMED_ANALYSIS_FINDING",
+    "SKIPPED_BUDGET",
+    "ERROR",
+)
+
+
+def _default_runtime_decisions() -> dict[str, int]:
+    return dict.fromkeys(_RUNTIME_DECISION_KEYS, 0)
 
 
 def _deserialize_runtime_evidence(item: dict[str, Any]) -> RuntimeEvidence:
@@ -425,7 +336,7 @@ def _deserialize_differential_pairs(payload: dict[str, Any]) -> list[Differentia
 
 
 def _load_existing_bundle(store: EvidenceStore, run_id: str, candidate_id: str) -> EvidenceBundle | None:
-    payload = store.load_bundle(f"bundle-{run_id}-{candidate_id}")
+    payload = store.load_bundle(f"bundle-{run_id}-{candidate_id}", run_id=run_id)
     if not isinstance(payload, dict):
         return None
     try:
@@ -505,44 +416,15 @@ def _looks_like_login(response: Any) -> bool:
     return any(marker in body for marker in _LOGIN_MARKERS)
 
 
-def _is_nonblocking_precondition(lowered: str, cookie_jar: dict[str, str], config: PadvConfig) -> bool:
-    if lowered in _NONBLOCKING_PRECONDITION_EXACT:
-        return True
-    if any(lowered.startswith(prefix) for prefix in _NONBLOCKING_PRECONDITION_PREFIXES):
-        return True
-    if any(fragment in lowered for fragment in _NONBLOCKING_PRECONDITION_SUBSTRINGS):
-        return True
-    if "web server" in lowered and "running" in lowered:
-        return True
-    if cookie_jar and any(hint in lowered for hint in _AUTH_PRECONDITION_HINTS):
-        return True
-    if not config.auth.enabled and ("anonymous" in lowered or "no auth" in lowered):
-        return True
-    return False
-
-
 def _normalize_gate_preconditions(
     candidate: Candidate,
     cookie_jar: dict[str, str],
     config: PadvConfig,
-) -> list[str]:
-    out: list[str] = []
-    seen: set[str] = set()
-    raw_values = list(candidate.preconditions)
-    if candidate.auth_requirements and not cookie_jar:
-        raw_values.extend(candidate.auth_requirements)
-
-    for raw in raw_values:
-        value = str(raw).strip()
-        if not value:
-            continue
-        if _is_nonblocking_precondition(value.casefold(), cookie_jar, config):
-            continue
-        if value in seen:
-            continue
-        seen.add(value)
-        out.append(value)
-    return out
+) -> GatePreconditions:
+    del config
+    raw_values = [str(item) for item in [*candidate.preconditions, *candidate.auth_requirements] if str(item).strip()]
+    parsed = parse_gate_preconditions(raw_values)
+    return resolve_gate_preconditions(parsed, cookie_jar=cookie_jar)
 
 
 def _contains_canary(arg: str, canary: str, config: PadvConfig) -> bool:
@@ -848,6 +730,7 @@ def _try_anonymous_probe(
             timeout_seconds=config.target.request_timeout_seconds,
             query=request_spec.get("query"),
             body=request_spec.get("body", request_spec.get("body_text")), cookie_jar={},
+            session=HttpSession(),
         )
         return probe, 1
     except RequestError:
@@ -858,6 +741,7 @@ def _run_positive_phase(
     ctx: _ValidationContext, candidate: Candidate, plan: ValidationPlan,
     request_budget_remaining: int, candidate_deadline: float,
     attempts: list[dict[str, Any]], seen_flags: set[str],
+    session: HttpSession,
 ) -> tuple[list[RuntimeEvidence], list[str], int]:
     config = ctx.config
     cookie_jar = ctx.cookie_jar
@@ -878,6 +762,7 @@ def _run_positive_phase(
                 timeout_seconds=config.target.request_timeout_seconds,
                 query=request_spec.get("query"),
                 body=request_spec.get("body", request_spec.get("body_text")), cookie_jar=cookie_jar,
+                session=session,
             )
             runtime = parse_response_headers(req_id, response.headers, config.oracle)
             anonymous_probe, probe_cost = _try_anonymous_probe(config, request_spec, candidate, cookie_jar, budget, candidate_deadline)
@@ -905,6 +790,7 @@ def _run_negative_phase(
     ctx: _ValidationContext, candidate: Candidate, plan: ValidationPlan,
     request_budget_remaining: int, candidate_deadline: float,
     attempts: list[dict[str, Any]], seen_flags: set[str],
+    session: HttpSession,
 ) -> tuple[list[RuntimeEvidence], int]:
     config = ctx.config
     cookie_jar = ctx.cookie_jar
@@ -924,6 +810,7 @@ def _run_negative_phase(
                 timeout_seconds=config.target.request_timeout_seconds,
                 query=request_spec.get("query"),
                 body=request_spec.get("body", request_spec.get("body_text")), cookie_jar=cookie_jar,
+                session=session,
             )
             runtime = parse_response_headers(req_id, response.headers, config.oracle)
             runtime = _annotate_runtime_evidence(
@@ -961,6 +848,7 @@ def _execute_differential_request(
     headers = _validation_headers(config, _oracle_functions(plan), req_id)
     _merge_request_headers(headers, unpriv_request)
     unpriv_cookie_jar = _extract_cookie_jar(unpriv_request)
+    session = HttpSession.from_cookie_jar(unpriv_cookie_jar)
     try:
         req_started = monotonic()
         response = send_request(
@@ -969,6 +857,7 @@ def _execute_differential_request(
             timeout_seconds=config.target.request_timeout_seconds,
             query=unpriv_request.get("query"),
             body=unpriv_request.get("body", unpriv_request.get("body_text")), cookie_jar=unpriv_cookie_jar,
+            session=session,
         )
         unpriv_runtime = parse_response_headers(req_id, response.headers, config.oracle)
         unpriv_runtime = _annotate_runtime_evidence(
@@ -1065,6 +954,91 @@ def _build_analysis_only_bundle(
     )
 
 
+def _default_plan_for_target(target: _PreparedValidationTarget) -> ValidationPlan:
+    if target.plan is not None:
+        return target.plan
+    candidate = target.candidate
+    return ValidationPlan(
+        candidate_id=candidate.candidate_id,
+        intercepts=[],
+        positive_requests=[],
+        negative_requests=[],
+        canary="",
+        validation_mode=str(getattr(target.profile, "validation_mode", "") or candidate.validation_mode or "runtime"),
+        canonical_class=str(candidate.canonical_class or candidate.vuln_class),
+        class_contract_id=str(getattr(target.profile, "class_contract_id", "") or ""),
+    )
+
+
+def _build_skipped_bundle(
+    ctx: _ValidationContext,
+    target: _PreparedValidationTarget,
+    *,
+    decision: str,
+    reason: str,
+) -> EvidenceBundle:
+    candidate = target.candidate
+    plan = _default_plan_for_target(target)
+    gate_result = GateResult(decision, [], None, reason)
+    bundle = EvidenceBundle(
+        bundle_id=f"bundle-{ctx.run_id}-{candidate.candidate_id}",
+        created_at=utc_now_iso(),
+        candidate=candidate,
+        static_evidence=target.static_evidence,
+        positive_runtime=[],
+        negative_runtime=[],
+        repro_run_ids=[],
+        gate_result=gate_result,
+        limitations=[reason],
+        differential_pairs=[],
+        artifact_refs=ctx.artifact_refs,
+        discovery_trace=ctx.discovery_trace,
+        planner_trace={
+            "skipped": True,
+            "skip_reason": reason,
+            "validation_plan": {
+                "candidate_id": plan.candidate_id,
+                "validation_mode": plan.validation_mode,
+                "canonical_class": plan.canonical_class,
+                "class_contract_id": plan.class_contract_id,
+                "positive_request_count": len(plan.positive_requests),
+                "negative_request_count": len(plan.negative_requests),
+            },
+        },
+        bundle_type=_bundle_type_for_decision(decision),
+        validation_contract={
+            "profile": target.profile.to_dict(),
+            "class_contract_id": plan.class_contract_id,
+            "validation_mode": plan.validation_mode,
+            "skip_reason": reason,
+        },
+        environment_facts=_environment_facts(candidate, ctx.auth_state, plan),
+    )
+    ctx.store.save_bundle(bundle, run_id=ctx.run_id)
+    return bundle
+
+
+def _append_skipped_targets(
+    ctx: _ValidationContext,
+    targets: list[_PreparedValidationTarget],
+    *,
+    decisions: dict[str, int],
+    bundles: list[EvidenceBundle],
+    decision: str,
+    reason: str,
+) -> None:
+    for target in targets:
+        existing_bundle = _load_existing_bundle(ctx.store, ctx.run_id, target.candidate.candidate_id)
+        bundle = existing_bundle if existing_bundle is not None else _build_skipped_bundle(
+            ctx,
+            target,
+            decision=decision,
+            reason=reason,
+        )
+        decisions[bundle.gate_result.decision] = decisions.get(bundle.gate_result.decision, 0) + 1
+        bundles.append(bundle)
+
+
 def _sanitize_exports(
     config: PadvConfig, positive_runs: list[RuntimeEvidence],
     negative_runs: list[RuntimeEvidence], differential_pairs: list[DifferentialPair],
@@ -1128,7 +1102,7 @@ class _PreparedValidationTarget:
     plan: ValidationPlan | None
     static_evidence: list[StaticEvidence]
     evidence_signals: list[str]
-    preconditions: list[str]
+    preconditions: GatePreconditions
 
 
 def _validate_single_candidate_runtime(
@@ -1148,14 +1122,15 @@ def _validate_single_candidate_runtime(
         raise RuntimeError(f"missing agent-generated validation plan for candidate: {candidate.candidate_id}")
     candidate_deadline = min(run_deadline, monotonic() + float(config.budgets.max_seconds_per_candidate))
     total_cost = 0
+    session = HttpSession.from_cookie_jar(ctx.cookie_jar)
 
     positive_runs, repro_ids, pos_cost = _run_positive_phase(
-        ctx, candidate, plan, request_budget_remaining, candidate_deadline, attempts, seen_flags,
+        ctx, candidate, plan, request_budget_remaining, candidate_deadline, attempts, seen_flags, session,
     )
     total_cost += pos_cost
 
     negative_runs, neg_cost = _run_negative_phase(
-        ctx, candidate, plan, request_budget_remaining - total_cost, candidate_deadline, attempts, seen_flags,
+        ctx, candidate, plan, request_budget_remaining - total_cost, candidate_deadline, attempts, seen_flags, session,
     )
     total_cost += neg_cost
 
@@ -1163,6 +1138,16 @@ def _validate_single_candidate_runtime(
         ctx, candidate, plan, positive_runs, request_budget_remaining - total_cost, candidate_deadline, attempts, seen_flags,
     )
     total_cost += diff_cost
+    witness_contract = witness_contract_for_vuln_class(candidate.canonical_class or candidate.vuln_class)
+    witness = build_runtime_witness(
+        config=config,
+        vuln_class=candidate.canonical_class or candidate.vuln_class,
+        positive_runs=positive_runs,
+        negative_runs=negative_runs,
+        intercepts=_oracle_functions(plan),
+        canary=plan.canary,
+        differential_pairs=differential_pairs,
+    )
 
     gate_result = evaluate_candidate(
         config=config, candidate=candidate, static_evidence=candidate_static,
@@ -1171,6 +1156,8 @@ def _validate_single_candidate_runtime(
         preconditions=target.preconditions,
         evidence_signals=evidence_signals, vuln_class=candidate.vuln_class,
         differential_pairs=differential_pairs,
+        witness=witness,
+        witness_contract=witness_contract,
     )
 
     positive_export, negative_export, differential_export = _sanitize_exports(config, positive_runs, negative_runs, differential_pairs)
@@ -1190,10 +1177,12 @@ def _validate_single_candidate_runtime(
             "required_request_shape": list(profile.required_request_shape),
             "required_witnesses": list(profile.required_witnesses),
             "required_negative_controls": list(profile.required_negative_controls),
+            "witness_contract": witness_contract.to_dict(),
+            "witness": witness.to_dict(),
         },
         environment_facts=_environment_facts(candidate, ctx.auth_state, plan),
     )
-    ctx.store.save_bundle(bundle)
+    ctx.store.save_bundle(bundle, run_id=ctx.run_id)
     return bundle, total_cost
 
 
@@ -1237,7 +1226,7 @@ def _process_candidate(
             ctx.run_id, candidate, target.static_evidence, target.evidence_signals,
             ctx.artifact_refs, ctx.discovery_trace, ctx.auth_state, target.profile,
         )
-        ctx.store.save_bundle(bundle)
+        ctx.store.save_bundle(bundle, run_id=ctx.run_id)
         return bundle, 0
 
     return _validate_single_candidate_runtime(
@@ -1265,7 +1254,7 @@ def validate_candidates_runtime(
     auth_state = auth_state or {}
     cookie_jar = _extract_auth_cookie_jar(auth_state)
 
-    decisions: dict[str, int] = dict.fromkeys(("VALIDATED", "DROPPED", "NEEDS_HUMAN_SETUP", "CONFIRMED_ANALYSIS_FINDING"), 0)
+    decisions: dict[str, int] = _default_runtime_decisions()
     bundles: list[EvidenceBundle] = []
     request_budget_remaining = config.budgets.max_requests
     run_deadline = monotonic() + float(config.budgets.max_run_seconds)
@@ -1286,10 +1275,26 @@ def validate_candidates_runtime(
         for candidate in candidates
     ]
 
-    for target in targets:
+    for idx, target in enumerate(targets):
         if monotonic() >= run_deadline:
+            _append_skipped_targets(
+                ctx,
+                targets[idx:],
+                decisions=decisions,
+                bundles=bundles,
+                decision="SKIPPED_BUDGET",
+                reason="run deadline exhausted before candidate execution",
+            )
             break
         if request_budget_remaining <= 0:
+            _append_skipped_targets(
+                ctx,
+                targets[idx:],
+                decisions=decisions,
+                bundles=bundles,
+                decision="SKIPPED_BUDGET",
+                reason="request budget exhausted before candidate execution",
+            )
             break
         bundle, cost = _process_candidate(
             ctx, target,

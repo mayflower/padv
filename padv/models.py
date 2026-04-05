@@ -4,6 +4,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
+from padv.identity import candidate_uid_for_fields
+
 
 CandidateStatus = str
 GateDecision = str
@@ -29,6 +31,16 @@ class Candidate:
     validation_mode: str = ""
     canonical_class: str = ""
     canonical_issue_id: str = ""
+    candidate_uid: str = ""
+
+    def __post_init__(self) -> None:
+        self.candidate_uid = str(self.candidate_uid or "").strip() or candidate_uid_for_fields(
+            vuln_class=self.vuln_class,
+            file_path=self.file_path,
+            line=self.line,
+            sink=self.sink,
+            provenance=self.provenance,
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -43,6 +55,7 @@ class StaticEvidence:
     line: int
     snippet: str
     hash: str
+    candidate_uid: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -108,6 +121,28 @@ class WitnessEvidence:
     class_name: str
     witness_flags: list[str] = field(default_factory=list)
     witness_data: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class Witness:
+    canonical_class: str
+    positive_flags: list[str] = field(default_factory=list)
+    negative_flags: list[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class WitnessContract:
+    canonical_class: str
+    required_all: list[str] = field(default_factory=list)
+    required_any: list[str] = field(default_factory=list)
+    negative_must_not_include: list[str] = field(default_factory=list)
+    enforce_negative_clean: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -223,11 +258,16 @@ class EvidenceBundle:
     bundle_type: str = "validated_exploit"
     validation_contract: dict[str, Any] = field(default_factory=dict)
     environment_facts: EnvironmentFacts | None = None
+    candidate_uid: str = ""
+
+    def __post_init__(self) -> None:
+        self.candidate_uid = str(self.candidate_uid or "").strip() or self.candidate.candidate_uid
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "bundle_id": self.bundle_id,
             "created_at": self.created_at,
+            "candidate_uid": self.candidate_uid,
             "candidate": self.candidate.to_dict(),
             "static_evidence": [e.to_dict() for e in self.static_evidence],
             "positive_runtime": [e.to_dict() for e in self.positive_runtime],

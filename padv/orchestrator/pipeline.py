@@ -17,6 +17,7 @@ def analyze(
     mode: str,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
     resume_run_id: str | None = None,
+    run_id: str | None = None,
 ) -> tuple[list[Candidate], list[StaticEvidence]]:
     candidates, static_evidence, _ = analyze_with_graph(
         config,
@@ -25,6 +26,7 @@ def analyze(
         mode,
         progress_callback=progress_callback,
         resume_run_id=resume_run_id,
+        run_id=run_id,
     )
     return candidates, static_evidence
 
@@ -59,6 +61,7 @@ def run_pipeline(
     mode: str,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
     resume_run_id: str | None = None,
+    run_id: str | None = None,
 ) -> RunSummary:
     return run_with_graph(
         config=config,
@@ -67,6 +70,7 @@ def run_pipeline(
         mode=mode,
         progress_callback=progress_callback,
         resume_run_id=resume_run_id,
+        run_id=run_id,
     )
 
 

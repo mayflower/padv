@@ -426,6 +426,7 @@ def discover_scip_candidates_with_meta(
                     line=hit.line,
                     snippet=snippet,
                     hash=_hash_for(rel_path, hit.line, snippet),
+                    candidate_uid=cand.candidate_uid,
                 )
             )
 

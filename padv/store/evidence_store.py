@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import json
-import sys
+import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -9,6 +10,53 @@ from typing import Any
 from padv.models import Candidate, EvidenceBundle, RunSummary, StaticEvidence
 
 _JSON_GLOB = "*.json"
+
+
+class CorruptStoreArtifactError(RuntimeError):
+    def __init__(self, path: Path, artifact_kind: str) -> None:
+        self.path = path
+        self.artifact_kind = str(artifact_kind)
+        super().__init__(f"corrupt {self.artifact_kind} JSON at {self.path}")
+
+
+@dataclass(slots=True)
+class RunScopedEvidenceStore:
+    store: "EvidenceStore"
+    run_id: str
+
+    @property
+    def root(self) -> Path:
+        return self.store.run_dir(self.run_id)
+
+    def ensure(self) -> None:
+        self.store.ensure_run(self.run_id)
+
+    def save_candidates(self, candidates: list[Candidate]) -> None:
+        self.store.save_candidates(candidates, run_id=self.run_id)
+
+    def load_candidates(self) -> list[Candidate]:
+        return self.store.load_candidates(run_id=self.run_id)
+
+    def save_static_evidence(self, static_evidence: list[StaticEvidence]) -> None:
+        self.store.save_static_evidence(static_evidence, run_id=self.run_id)
+
+    def load_static_evidence(self) -> list[StaticEvidence]:
+        return self.store.load_static_evidence(run_id=self.run_id)
+
+    def save_bundle(self, bundle: EvidenceBundle) -> Path:
+        return self.store.save_bundle(bundle, run_id=self.run_id)
+
+    def load_bundle(self, bundle_id: str) -> dict[str, Any] | None:
+        return self.store.load_bundle(bundle_id, run_id=self.run_id)
+
+    def list_bundle_ids(self) -> list[str]:
+        return self.store.list_bundle_ids(run_id=self.run_id)
+
+    def save_json_artifact(self, relative_path: str, payload: dict[str, Any] | list[Any]) -> Path:
+        return self.store.save_json_artifact(relative_path, payload, run_id=self.run_id)
+
+    def load_json_artifact(self, relative_path: str) -> dict[str, Any] | list[Any] | None:
+        return self.store.load_json_artifact(relative_path, run_id=self.run_id)
 
 
 @dataclass(slots=True)
@@ -55,78 +103,169 @@ class EvidenceStore:
         self.langgraph_dir.mkdir(parents=True, exist_ok=True)
         self.resume_dir.mkdir(parents=True, exist_ok=True)
 
-    def save_candidates(self, candidates: list[Candidate]) -> None:
-        self.ensure()
-        payload = [c.to_dict() for c in candidates]
-        self.candidates_file.write_text(json.dumps(payload, indent=2, ensure_ascii=True))
+    def run_dir(self, run_id: str) -> Path:
+        return self.runs_dir / run_id
 
-    def load_candidates(self) -> list[Candidate]:
-        if not self.candidates_file.exists():
-            return []
+    def for_run(self, run_id: str) -> RunScopedEvidenceStore:
+        return RunScopedEvidenceStore(store=self, run_id=run_id)
+
+    def ensure_run(self, run_id: str) -> Path:
+        self.ensure()
+        run_root = self.run_dir(run_id)
+        run_root.mkdir(parents=True, exist_ok=True)
+        (run_root / "bundles").mkdir(parents=True, exist_ok=True)
+        return run_root
+
+    @staticmethod
+    def _write_json_atomic(path: Path, payload: Any) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        data = json.dumps(payload, indent=2, ensure_ascii=True).encode("utf-8")
+        fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
         try:
-            data = json.loads(self.candidates_file.read_text())
+            with os.fdopen(fd, "wb") as tmp:
+                tmp.write(data)
+                tmp.flush()
+                os.fsync(tmp.fileno())
+            os.replace(tmp_name, path)
+            try:
+                dir_fd = os.open(str(path.parent), os.O_RDONLY)
+            except OSError:
+                return
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        finally:
+            if os.path.exists(tmp_name):
+                os.unlink(tmp_name)
+
+    @staticmethod
+    def _load_json(path: Path, *, artifact_kind: str, raise_on_corrupt: bool) -> Any | None:
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
-            sys.stderr.write(f"padv: corrupt JSON in {self.candidates_file}, ignoring\n")
+            if raise_on_corrupt:
+                raise CorruptStoreArtifactError(path, artifact_kind) from None
+            return None
+
+    def _candidates_file(self, run_id: str | None = None) -> Path:
+        if run_id:
+            return self.run_dir(run_id) / "candidates.json"
+        return self.candidates_file
+
+    def _static_evidence_file(self, run_id: str | None = None) -> Path:
+        if run_id:
+            return self.run_dir(run_id) / "static_evidence.json"
+        return self.static_evidence_file
+
+    def _bundles_dir(self, run_id: str | None = None) -> Path:
+        if run_id:
+            return self.run_dir(run_id) / "bundles"
+        return self.bundles_dir
+
+    def save_candidates(self, candidates: list[Candidate], *, run_id: str | None = None) -> None:
+        if run_id:
+            self.ensure_run(run_id)
+        else:
+            self.ensure()
+        payload = [c.to_dict() for c in candidates]
+        self._write_json_atomic(self._candidates_file(run_id), payload)
+
+    def load_candidates(self, *, run_id: str | None = None) -> list[Candidate]:
+        path = self._candidates_file(run_id)
+        if not path.exists():
+            return []
+        data = self._load_json(path, artifact_kind="candidates", raise_on_corrupt=True)
+        if not isinstance(data, list):
             return []
         out: list[Candidate] = []
         for item in data:
             out.append(Candidate(**item))
         return out
 
-    def save_static_evidence(self, static_evidence: list[StaticEvidence]) -> None:
-        self.ensure()
+    def save_static_evidence(self, static_evidence: list[StaticEvidence], *, run_id: str | None = None) -> None:
+        if run_id:
+            self.ensure_run(run_id)
+        else:
+            self.ensure()
         payload = [e.to_dict() for e in static_evidence]
-        self.static_evidence_file.write_text(json.dumps(payload, indent=2, ensure_ascii=True))
+        self._write_json_atomic(self._static_evidence_file(run_id), payload)
 
-    def load_static_evidence(self) -> list[StaticEvidence]:
-        if not self.static_evidence_file.exists():
+    def load_static_evidence(self, *, run_id: str | None = None) -> list[StaticEvidence]:
+        path = self._static_evidence_file(run_id)
+        if not path.exists():
             return []
-        try:
-            data = json.loads(self.static_evidence_file.read_text())
-        except json.JSONDecodeError:
-            sys.stderr.write(f"padv: corrupt JSON in {self.static_evidence_file}, ignoring\n")
+        data = self._load_json(path, artifact_kind="static_evidence", raise_on_corrupt=True)
+        if not isinstance(data, list):
             return []
         out: list[StaticEvidence] = []
         for item in data:
             out.append(StaticEvidence(**item))
         return out
 
-    def save_bundle(self, bundle: EvidenceBundle) -> Path:
-        self.ensure()
-        path = self.bundles_dir / f"{bundle.bundle_id}.json"
-        path.write_text(json.dumps(bundle.to_dict(), indent=2, ensure_ascii=True))
+    def save_bundle(self, bundle: EvidenceBundle, *, run_id: str | None = None) -> Path:
+        if run_id:
+            self.ensure_run(run_id)
+        else:
+            self.ensure()
+        path = self._bundles_dir(run_id) / f"{bundle.bundle_id}.json"
+        self._write_json_atomic(path, bundle.to_dict())
         return path
 
-    def load_bundle(self, bundle_id: str) -> dict[str, Any] | None:
-        path = self.bundles_dir / f"{bundle_id}.json"
+    def load_bundle(self, bundle_id: str, *, run_id: str | None = None) -> dict[str, Any] | None:
+        path = self._bundles_dir(run_id) / f"{bundle_id}.json"
         if not path.exists():
+            if run_id is not None:
+                legacy_path = self.bundles_dir / f"{bundle_id}.json"
+                if not legacy_path.exists():
+                    return None
+                path = legacy_path
+            else:
+                for candidate in self.runs_dir.iterdir() if self.runs_dir.exists() else []:
+                    if not candidate.is_dir():
+                        continue
+                    scoped = candidate / "bundles" / f"{bundle_id}.json"
+                    if scoped.exists():
+                        path = scoped
+                        break
+                else:
+                    return None
+        payload = self._load_json(path, artifact_kind="bundle", raise_on_corrupt=True)
+        if isinstance(payload, dict):
+            return payload
+        if payload is None:
             return None
-        try:
-            return json.loads(path.read_text())
-        except json.JSONDecodeError:
-            sys.stderr.write(f"padv: corrupt JSON in {path}, ignoring\n")
-            return None
+        return None
 
-    def list_bundle_ids(self) -> list[str]:
-        if not self.bundles_dir.exists():
-            return []
-        return sorted(p.stem for p in self.bundles_dir.glob(_JSON_GLOB))
+    def list_bundle_ids(self, *, run_id: str | None = None) -> list[str]:
+        bundles_dir = self._bundles_dir(run_id)
+        if run_id is not None:
+            if not bundles_dir.exists():
+                return []
+            return sorted(p.stem for p in bundles_dir.glob(_JSON_GLOB))
+
+        ids: set[str] = set()
+        if self.bundles_dir.exists():
+            ids.update(p.stem for p in self.bundles_dir.glob(_JSON_GLOB))
+        if self.runs_dir.exists():
+            for run_root in self.runs_dir.iterdir():
+                if not run_root.is_dir():
+                    continue
+                ids.update(p.stem for p in (run_root / "bundles").glob(_JSON_GLOB))
+        return sorted(ids)
 
     def save_run_summary(self, summary: RunSummary) -> Path:
         self.ensure()
         path = self.runs_dir / f"{summary.run_id}.json"
-        path.write_text(json.dumps(summary.to_dict(), indent=2, ensure_ascii=True))
+        self._write_json_atomic(path, summary.to_dict())
         return path
 
     def load_run_summary(self, run_id: str) -> dict[str, Any] | None:
         path = self.runs_dir / f"{run_id}.json"
         if not path.exists():
             return None
-        try:
-            return json.loads(path.read_text())
-        except json.JSONDecodeError:
-            sys.stderr.write(f"padv: corrupt JSON in {path}, ignoring\n")
-            return None
+        data = self._load_json(path, artifact_kind="run_summary", raise_on_corrupt=True)
+        return data if isinstance(data, dict) else None
 
     def list_run_ids(self) -> list[str]:
         if not self.runs_dir.exists():
@@ -135,36 +274,40 @@ class EvidenceStore:
 
     def save_frontier_state(self, state: dict[str, Any]) -> Path:
         self.ensure()
-        self.frontier_file.write_text(json.dumps(state, indent=2, ensure_ascii=True))
+        self._write_json_atomic(self.frontier_file, state)
         return self.frontier_file
 
     def load_frontier_state(self) -> dict[str, Any] | None:
         if not self.frontier_file.exists():
             return None
-        try:
-            data = json.loads(self.frontier_file.read_text())
-        except json.JSONDecodeError:
-            sys.stderr.write(f"padv: corrupt JSON in {self.frontier_file}, ignoring\n")
-            return None
+        data = self._load_json(self.frontier_file, artifact_kind="frontier_state", raise_on_corrupt=True)
         if isinstance(data, dict):
             return data
         return None
 
-    def save_json_artifact(self, relative_path: str, payload: dict[str, Any] | list[Any]) -> Path:
-        self.ensure()
-        path = self.root / relative_path
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload, indent=2, ensure_ascii=True))
+    def save_json_artifact(
+        self,
+        relative_path: str,
+        payload: dict[str, Any] | list[Any],
+        *,
+        run_id: str | None = None,
+    ) -> Path:
+        if run_id:
+            base = self.ensure_run(run_id)
+        else:
+            self.ensure()
+            base = self.root
+        path = base / relative_path
+        self._write_json_atomic(path, payload)
         return path
 
-    def load_json_artifact(self, relative_path: str) -> dict[str, Any] | list[Any] | None:
-        path = self.root / relative_path
+    def load_json_artifact(self, relative_path: str, *, run_id: str | None = None) -> dict[str, Any] | list[Any] | None:
+        base = self.run_dir(run_id) if run_id else self.root
+        path = base / relative_path
         if not path.exists():
             return None
-        try:
-            data = json.loads(path.read_text())
-        except json.JSONDecodeError:
-            sys.stderr.write(f"padv: corrupt JSON in {path}, ignoring\n")
+        data = self._load_json(path, artifact_kind="json_artifact", raise_on_corrupt=True)
+        if data is None:
             return None
         if isinstance(data, (dict, list)):
             return data
@@ -173,18 +316,14 @@ class EvidenceStore:
     def save_resume_metadata(self, run_id: str, payload: dict[str, Any]) -> Path:
         self.ensure()
         path = self.resume_dir / f"{run_id}.json"
-        path.write_text(json.dumps(payload, indent=2, ensure_ascii=True))
+        self._write_json_atomic(path, payload)
         return path
 
     def load_resume_metadata(self, run_id: str) -> dict[str, Any] | None:
         path = self.resume_dir / f"{run_id}.json"
         if not path.exists():
             return None
-        try:
-            data = json.loads(path.read_text())
-        except json.JSONDecodeError:
-            sys.stderr.write(f"padv: corrupt JSON in {path}, ignoring\n")
-            return None
+        data = self._load_json(path, artifact_kind="resume_metadata", raise_on_corrupt=True)
         if isinstance(data, dict):
             return data
         return None

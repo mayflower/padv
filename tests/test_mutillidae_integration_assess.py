@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -104,3 +105,197 @@ def test_run_analyze_stabilization_accepts_recovered_completed_graph(monkeypatch
     assert out["success"] is True
     assert out["final_output"]["run_id"] == "analyze-test123"
     assert out["attempts"][0]["ok"] is True
+
+
+def test_graph_progress_for_run_ignores_newer_directory(monkeypatch, tmp_path: Path) -> None:
+    assess = _load_assess_module()
+    padv_store = tmp_path / ".padv"
+    monkeypatch.setattr(assess, "PADV_STORE", padv_store)
+
+    target_dir = padv_store / "langgraph" / "run-target"
+    newer_dir = padv_store / "langgraph" / "run-newer"
+    target_dir.mkdir(parents=True)
+    newer_dir.mkdir(parents=True)
+
+    (target_dir / "001-research.json").write_text(
+        json.dumps({"run_id": "run-target", "counts": {"candidates": 1}, "decisions": {}, "frontier": {}}),
+        encoding="utf-8",
+    )
+    (newer_dir / "999-persist.json").write_text(
+        json.dumps({"run_id": "run-newer", "counts": {"candidates": 9}, "decisions": {}, "frontier": {}}),
+        encoding="utf-8",
+    )
+
+    progress = assess._graph_progress_for_run("run-target")
+
+    assert progress is not None
+    assert progress["run_id"] == "run-target"
+    assert progress["latest_stage"] == "research"
+
+
+def test_run_phase_b_reads_only_requested_run_artifacts(monkeypatch, tmp_path: Path) -> None:
+    assess = _load_assess_module()
+    padv_store = tmp_path / ".padv"
+    gap_catalog = tmp_path / "gap-catalog.json"
+    output_dir = tmp_path / "assessment"
+
+    monkeypatch.setattr(assess, "PADV_STORE", padv_store)
+    monkeypatch.setattr(assess, "GAP_CATALOG_PATH", gap_catalog)
+
+    (padv_store / "runs" / "run-a").mkdir(parents=True)
+    (padv_store / "runs" / "run-b").mkdir(parents=True)
+    (padv_store / "runs" / "run-a" / "bundles").mkdir(parents=True)
+    (padv_store / "runs" / "run-b" / "bundles").mkdir(parents=True)
+
+    (padv_store / "runs" / "run-a" / "candidates.json").write_text(
+        json.dumps(
+            [
+                {
+                    "candidate_id": "cand-a",
+                    "vuln_class": "sql_injection",
+                    "title": "SQL injection in run A",
+                    "file_path": "src/a.php",
+                    "sink": "mysqli_query",
+                    "provenance": ["scip"],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (padv_store / "runs" / "run-a" / "bundles" / "bundle-run-a-cand-a.json").write_text(
+        json.dumps(
+            [
+                {
+                    "bundle_id": "bundle-run-a-cand-a",
+                    "candidate": {
+                        "candidate_id": "cand-a",
+                        "vuln_class": "sql_injection",
+                        "title": "SQL injection in run A",
+                        "file_path": "src/a.php",
+                        "sink": "mysqli_query",
+                    },
+                    "gate_result": {"decision": "VALIDATED"},
+                }
+            ][0]
+        ),
+        encoding="utf-8",
+    )
+    (padv_store / "runs" / "run-b" / "candidates.json").write_text(
+        json.dumps(
+            [
+                {
+                    "candidate_id": "cand-b",
+                    "vuln_class": "cross_site_scripting",
+                    "title": "XSS in run B",
+                    "file_path": "src/b.php",
+                    "sink": "echo",
+                    "provenance": ["web"],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (padv_store / "runs" / "run-b" / "bundles" / "bundle-run-b-cand-b.json").write_text(
+        json.dumps(
+            {
+                "bundle_id": "bundle-run-b-cand-b",
+                "candidate": {
+                    "candidate_id": "cand-b",
+                    "vuln_class": "cross_site_scripting",
+                    "title": "XSS in run B",
+                    "file_path": "src/b.php",
+                    "sink": "echo",
+                },
+                "gate_result": {"decision": "VALIDATED"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    gap_catalog.write_text(
+        json.dumps(
+            [
+                {
+                    "gap_id": "GAP-SQL",
+                    "category": "sql_injection",
+                    "runtime_validatable": True,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    phase_a = {"a1": {"summary": {"all_passed": True}}, "a2": {"success": True}, "a3": {"success": True}}
+
+    output = assess.run_phase_b(output_dir, run_id="run-a", phase_a=phase_a)
+
+    sql_row = next(item for item in output["matrix"] if item["requirement_id"] == "GAP-SQL")
+    assert sql_row["status"] == "FULL"
+    assert sql_row["evidence_path"].endswith("/runs/run-a/candidates.json")
+
+
+def test_run_phase_b_dropped_runtime_bundle_does_not_count_as_full(monkeypatch, tmp_path: Path) -> None:
+    assess = _load_assess_module()
+    padv_store = tmp_path / ".padv"
+    gap_catalog = tmp_path / "gap-catalog.json"
+    output_dir = tmp_path / "assessment"
+
+    monkeypatch.setattr(assess, "PADV_STORE", padv_store)
+    monkeypatch.setattr(assess, "GAP_CATALOG_PATH", gap_catalog)
+
+    run_root = padv_store / "runs" / "run-a"
+    (run_root / "bundles").mkdir(parents=True)
+
+    (run_root / "candidates.json").write_text(
+        json.dumps(
+            [
+                {
+                    "candidate_id": "cand-a",
+                    "vuln_class": "sql_injection",
+                    "title": "SQL injection in run A",
+                    "file_path": "src/a.php",
+                    "sink": "mysqli_query",
+                    "provenance": ["scip"],
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (run_root / "bundles" / "bundle-run-a-cand-a.json").write_text(
+        json.dumps(
+            {
+                "bundle_id": "bundle-run-a-cand-a",
+                "bundle_type": "dropped",
+                "candidate": {
+                    "candidate_id": "cand-a",
+                    "vuln_class": "sql_injection",
+                    "title": "SQL injection in run A",
+                    "file_path": "src/a.php",
+                    "sink": "mysqli_query",
+                },
+                "gate_result": {"decision": "DROPPED"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    gap_catalog.write_text(
+        json.dumps(
+            [
+                {
+                    "gap_id": "GAP-SQL",
+                    "category": "sql_injection",
+                    "runtime_validatable": True,
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    phase_a = {"a1": {"summary": {"all_passed": True}}, "a2": {"success": True}, "a3": {"success": True}}
+
+    output = assess.run_phase_b(output_dir, run_id="run-a", phase_a=phase_a)
+
+    sql_row = next(item for item in output["matrix"] if item["requirement_id"] == "GAP-SQL")
+    observed = json.loads(sql_row["observed_result"])
+
+    assert sql_row["status"] == "PARTIAL"
+    assert observed["runtime_outcomes"] == ["ATTEMPTED"]

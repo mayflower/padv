@@ -13,11 +13,12 @@ import threading
 import traceback
 import urllib.parse
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from padv import __version__ as PADV_VERSION
 from padv.agents.checkpoints import FileBackedMemorySaver
 from padv.analytics.failure_patterns import failure_penalty
 from padv.config.schema import PadvConfig
@@ -82,6 +83,18 @@ class AgentSoftYield(RuntimeError):
 
 _INFLIGHT_HANDOFFS: dict[str, dict[str, Any]] = {}
 _INFLIGHT_HANDOFFS_LOCK = threading.Lock()
+_HANDOFF_CACHE_TTL_SECONDS = 3600
+_HANDOFF_CACHE_PROMPT_VERSION = "2026-04-05"
+_RUN_SCOPED_HANDOFF_CATEGORIES = frozenset(
+    {
+        "orient",
+        "select_objective",
+        "continue_or_stop",
+        "hypothesis_synthesis",
+        "skeptic_challenge",
+        "experiment_plan",
+    }
+)
 
 
 @dataclass(slots=True)
@@ -704,6 +717,7 @@ def _normalize_cache_value(value: Any) -> Any:
 def _handoff_cache_key(
     session: AgentSession,
     *,
+    config: PadvConfig,
     category: str,
     envelope: dict[str, Any],
     response_contract: str,
@@ -718,10 +732,29 @@ def _handoff_cache_key(
         "workspace_role": workspace_role,
         "delegated_role": delegated_role or "",
         "response_contract": response_contract,
+        "config_signature": _handoff_config_signature(config),
+        "code_version": PADV_VERSION,
+        "prompt_version": _HANDOFF_CACHE_PROMPT_VERSION,
+        "run_scope": _handoff_cache_run_scope(session, category),
         "envelope": _normalize_cache_value(envelope),
     }
     serialized = json.dumps(payload, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _handoff_config_signature(config: PadvConfig) -> str:
+    payload = asdict(config)
+    serialized = json.dumps(payload, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:16]
+
+
+def _handoff_cache_run_scope(session: AgentSession, category: str) -> str:
+    if category not in _RUN_SCOPED_HANDOFF_CATEGORIES:
+        return ""
+    checkpoint_dir = str(session.checkpoint_dir or "").strip()
+    if not checkpoint_dir:
+        return ""
+    return Path(checkpoint_dir).name
 
 
 def _load_handoff_cache(checkpoint_dir: str | None, cache_key: str) -> dict[str, Any] | None:
@@ -731,16 +764,38 @@ def _load_handoff_cache(checkpoint_dir: str | None, cache_key: str) -> dict[str,
     _ensure_handoff_cache_db(db_path)
     with sqlite3.connect(db_path) as conn:
         row = conn.execute(
-            "SELECT response_json FROM handoff_exact_cache WHERE cache_key = ?",
+            "SELECT response_json, created_at FROM handoff_exact_cache WHERE cache_key = ?",
             (cache_key,),
         ).fetchone()
-    if row is None:
-        return None
+        if row is None:
+            return None
+        created_at = _parse_cache_created_at(row[1])
+        if created_at is None or _cache_entry_expired(created_at):
+            conn.execute("DELETE FROM handoff_exact_cache WHERE cache_key = ?", (cache_key,))
+            conn.commit()
+            return None
     try:
         payload = json.loads(str(row[0]))
     except Exception:
         return None
     return payload if isinstance(payload, dict) else None
+
+
+def _parse_cache_created_at(raw: Any) -> datetime | None:
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _cache_entry_expired(created_at: datetime) -> bool:
+    age = (datetime.now(tz=timezone.utc) - created_at).total_seconds()
+    return age > float(_HANDOFF_CACHE_TTL_SECONDS)
 
 
 def _store_handoff_cache(checkpoint_dir: str | None, cache_key: str, payload: dict[str, Any]) -> None:
@@ -2191,6 +2246,7 @@ def _invoke_agent_handoff(
     artifact_role = workspace_role or session.role
     cache_key = _handoff_cache_key(
         session,
+        config=config,
         category=category,
         envelope=envelope,
         response_contract=response_contract,

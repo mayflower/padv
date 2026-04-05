@@ -27,6 +27,7 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--repo-root", required=True)
     run.add_argument("--mode", default="variant", choices=["variant", "delta", "batch"])
     run.add_argument("--no-progress", action="store_true", help=_HELP_NO_PROGRESS)
+    run.add_argument("--run-id", default=None, help="Explicit run id for persisted artifacts")
     run.add_argument("--resume", nargs="?", const="latest", default=None, help="Resume an interrupted run by run id or latest compatible run")
 
     analyze_cmd = sub.add_parser("analyze", help="Static discovery/detection only")
@@ -34,6 +35,7 @@ def _build_parser() -> argparse.ArgumentParser:
     analyze_cmd.add_argument("--repo-root", required=True)
     analyze_cmd.add_argument("--mode", default="variant", choices=["variant", "delta", "batch"])
     analyze_cmd.add_argument("--no-progress", action="store_true", help=_HELP_NO_PROGRESS)
+    analyze_cmd.add_argument("--run-id", default=None, help="Explicit run id for persisted artifacts")
     analyze_cmd.add_argument("--resume", nargs="?", const="latest", default=None, help="Resume an interrupted analyze run by run id or latest compatible run")
 
     analyze_failures_cmd = sub.add_parser("analyze-failures", help="Analyze historical failure patterns")
@@ -47,6 +49,7 @@ def _build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--repo-root", default=None)
     validate.add_argument("--mode", default="variant", choices=["variant", "delta", "batch"])
     validate.add_argument("--no-progress", action="store_true", help=_HELP_NO_PROGRESS)
+    validate.add_argument("--run-id", default=None, help="Run id to load persisted candidates and evidence from")
     validate.add_argument("--resume", nargs="?", const="latest", default=None, help="Resume an interrupted validate run by run id or latest compatible run")
 
     sandbox = sub.add_parser("sandbox", help="Sandbox helper commands")
@@ -55,16 +58,19 @@ def _build_parser() -> argparse.ArgumentParser:
 
     list_cmd = sub.add_parser("list", help="List artifacts")
     list_cmd.add_argument("--config", default=None, help=_HELP_CONFIG_PATH)
+    list_cmd.add_argument("--run-id", default=None, help="Run id to inspect")
     list_cmd.add_argument("kind", choices=["candidates", "bundles", "runs", "resumes"])
 
     show = sub.add_parser("show", help="Show artifact details")
     show.add_argument("--config", default=None, help=_HELP_CONFIG_PATH)
+    show.add_argument("--scope-run-id", default=None, help="Run id to read scoped candidates or bundles from")
     show.add_argument("--bundle-id")
     show.add_argument("--run-id")
     show.add_argument("--candidate-id")
 
     export = sub.add_parser("export", help="Export bundle to a file")
     export.add_argument("--config", default=None, help=_HELP_CONFIG_PATH)
+    export.add_argument("--run-id", default=None, help="Run id to read the bundle from")
     export.add_argument("--bundle-id", required=True)
     export.add_argument("--output", required=True)
 
@@ -132,6 +138,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
             mode=args.mode,
             progress_callback=_progress_callback(not args.no_progress),
             resume_run_id=args.resume,
+            run_id=args.run_id,
         )
         _print_json(summary.to_dict())
         return 0
@@ -151,6 +158,7 @@ def _cmd_analyze(args: argparse.Namespace) -> int:
             mode=args.mode,
             progress_callback=_progress_callback(not args.no_progress),
             resume_run_id=args.resume,
+            run_id=args.run_id,
         )
         _print_json(
             {
@@ -193,10 +201,12 @@ def _cmd_validate(args: argparse.Namespace) -> int:
                 store=store,
                 mode=args.mode,
                 progress_callback=progress_cb,
+                run_id=args.run_id,
             )
         else:
-            candidates = store.load_candidates()
-            static_evidence = store.load_static_evidence()
+            source_store = store.for_run(args.run_id) if args.run_id else store
+            candidates = source_store.load_candidates()
+            static_evidence = source_store.load_static_evidence()
 
         selected = candidates
         if args.candidate_ids:
@@ -221,6 +231,8 @@ def _cmd_validate(args: argparse.Namespace) -> int:
                 "confirmed_analysis": decisions.get("CONFIRMED_ANALYSIS_FINDING", 0),
                 "dropped": decisions.get("DROPPED", 0),
                 "needs_human_setup": decisions.get("NEEDS_HUMAN_SETUP", 0),
+                "skipped_budget": decisions.get("SKIPPED_BUDGET", 0),
+                "error": decisions.get("ERROR", 0),
                 "bundle_ids": [b.bundle_id for b in bundles],
             }
         )
@@ -249,11 +261,12 @@ def _cmd_sandbox(args: argparse.Namespace) -> int:
 def _cmd_list(args: argparse.Namespace) -> int:
     config = _load_config_or_exit(_resolve_config_path(args))
     store = _store_from_root(config.store.root)
+    scoped_store = store.for_run(args.run_id) if args.run_id else store
 
     if args.kind == "candidates":
-        _print_json([c.to_dict() for c in store.load_candidates()])
+        _print_json([c.to_dict() for c in scoped_store.load_candidates()])
     elif args.kind == "bundles":
-        _print_json(store.list_bundle_ids())
+        _print_json(scoped_store.list_bundle_ids())
     elif args.kind == "resumes":
         _print_json(store.list_resume_metadata())
     else:
@@ -271,7 +284,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
         return 2
 
     if args.bundle_id:
-        bundle = store.load_bundle(args.bundle_id)
+        bundle = store.for_run(args.scope_run_id).load_bundle(args.bundle_id) if args.scope_run_id else store.load_bundle(args.bundle_id)
         if bundle is None:
             _print_json({"error": f"bundle not found: {args.bundle_id}"})
             return 1
@@ -286,7 +299,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
         _print_json(run)
         return 0
 
-    for candidate in store.load_candidates():
+    candidate_source = store.for_run(args.scope_run_id).load_candidates() if args.scope_run_id else store.load_candidates()
+    for candidate in candidate_source:
         if candidate.candidate_id == args.candidate_id:
             _print_json(candidate.to_dict())
             return 0
@@ -297,8 +311,9 @@ def _cmd_show(args: argparse.Namespace) -> int:
 def _cmd_export(args: argparse.Namespace) -> int:
     config = _load_config_or_exit(_resolve_config_path(args))
     store = _store_from_root(config.store.root)
+    bundle_store = store.for_run(args.run_id) if args.run_id else store
     try:
-        out = export_bundle(store, args.bundle_id, args.output)
+        out = export_bundle(bundle_store, args.bundle_id, args.output)
     except FileNotFoundError as exc:
         _print_json({"error": str(exc)})
         return 1

@@ -3,8 +3,9 @@ from __future__ import annotations
 from pathlib import Path
 
 from padv.config.schema import load_config
-from padv.gates.engine import _CLASS_WITNESS_RULES, _RUNTIME_VALIDATABLE_CLASSES, evaluate_candidate
-from padv.models import RuntimeCall, RuntimeEvidence, StaticEvidence
+from padv.gates.engine import _RUNTIME_VALIDATABLE_CLASSES, evaluate_candidate
+from padv.models import RuntimeCall, RuntimeEvidence, StaticEvidence, WitnessContract
+from padv.validation.contracts import runtime_witness_contracts
 
 
 def _static() -> list[StaticEvidence]:
@@ -116,8 +117,42 @@ def test_gate_sql_negative_control_rejects_oracle_hit() -> None:
 
 
 def test_runtime_validatable_classes_have_witness_rules() -> None:
-    missing = sorted(_RUNTIME_VALIDATABLE_CLASSES - set(_CLASS_WITNESS_RULES.keys()))
+    missing = sorted(_RUNTIME_VALIDATABLE_CLASSES - set(runtime_witness_contracts().keys()))
     assert not missing
+
+
+def test_gate_uses_shared_witness_contract_provider(monkeypatch) -> None:
+    config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
+
+    monkeypatch.setattr(
+        "padv.gates.engine.witness_contract_for_vuln_class",
+        lambda vuln_class: WitnessContract(
+            canonical_class=str(vuln_class),
+            required_all=["custom_contract_only"],
+            required_any=[],
+            negative_must_not_include=["custom_contract_only"],
+            enforce_negative_clean=True,
+        ),
+    )
+
+    result = evaluate_candidate(
+        config=config,
+        static_evidence=_static(),
+        positive_runs=[
+            _runtime_call("p1", function="curl_exec", arg="http://127.0.0.1/internal"),
+            _runtime_call("p2", function="curl_exec", arg="http://127.0.0.1/internal"),
+            _runtime_call("p3", function="curl_exec", arg="http://127.0.0.1/internal"),
+        ],
+        negative_runs=[_runtime_call("n1", function="curl_exec", arg="https://example.org/safe")],
+        intercepts=["curl_exec"],
+        canary="padv-canary",
+        preconditions=[],
+        evidence_signals=["joern", "scip"],
+        vuln_class="ssrf",
+    )
+
+    assert result.decision == "DROPPED"
+    assert result.failed_gate == "V3"
 
 
 def _runtime_call(

@@ -16,7 +16,6 @@ from padv.agents.deepagents_harness import (
     AgentSoftYield,
     challenge_hypotheses_with_subagent,
     clone_runtime_for_parallel_role,
-    decide_continue_with_root_agent,
     ensure_agent_runtime,
     finalize_parallel_role_runtime,
     make_validation_plans_with_deepagents,
@@ -60,7 +59,14 @@ from padv.static.joern.query_sets import VULN_CLASS_SPECS
 from padv.store.evidence_store import EvidenceStore
 from padv.taxonomy import runtime_validatable_classes
 
-_DECISION_KEYS = ("VALIDATED", "DROPPED", "NEEDS_HUMAN_SETUP", "CONFIRMED_ANALYSIS_FINDING")
+_DECISION_KEYS = (
+    "VALIDATED",
+    "DROPPED",
+    "NEEDS_HUMAN_SETUP",
+    "CONFIRMED_ANALYSIS_FINDING",
+    "SKIPPED_BUDGET",
+    "ERROR",
+)
 
 
 def _default_decisions() -> dict[str, int]:
@@ -2381,20 +2387,54 @@ def _node_continue_or_stop(state: GraphState) -> GraphState:
     _emit_progress(state, "continue_or_stop", "start")
     remaining = [item for item in state.get("objective_queue", []) if state.get("active_objective") is None or item.objective_id != state["active_objective"].objective_id]
     state["objective_queue"] = remaining
-    should_continue, trace = decide_continue_with_root_agent(
-        _state_runtime(state),
-        state["config"],
-        iteration=int(state.get("run_iteration", 0) or 0),
-        objective_queue=remaining,
-        hypotheses=state.get("hypothesis_board", []),
-        refutations=state.get("refutations", []),
-        witness_bundles=state.get("witness_bundles", []),
-        max_iterations=state["config"].agent.max_iterations,
-    )
-    state["loop_continue"] = should_continue and bool(remaining)
+    should_continue, trace = _deterministic_continue_decision(state, remaining)
+    state["loop_continue"] = should_continue
     state["continue_reason"] = str(trace.get("reason", "")).strip()
     state.setdefault("planner_trace", {})["continue"] = trace
     return _finalize_stage(state, "continue_or_stop", f"continue={state['loop_continue']}")
+
+
+def _deterministic_continue_decision(
+    state: GraphState,
+    remaining: list[ObjectiveScore],
+) -> tuple[bool, dict[str, Any]]:
+    iteration = int(state.get("run_iteration", 0) or 0)
+    max_iterations = int(state["config"].agent.max_iterations)
+    patience = int(state["config"].agent.improvement_patience)
+    frontier = state.get("frontier_state", {})
+    stagnation_rounds = int(frontier.get("stagnation_rounds", 0) if isinstance(frontier, dict) else 0)
+    decisions = state.get("decisions", {}) if isinstance(state.get("decisions", {}), dict) else {}
+
+    trace: dict[str, Any] = {
+        "engine": "deterministic",
+        "iteration": iteration,
+        "remaining_objectives": len(remaining),
+        "max_iterations": max_iterations,
+        "stagnation_rounds": stagnation_rounds,
+        "improvement_patience": patience,
+        "decisions": dict(decisions),
+    }
+
+    if int(decisions.get("SKIPPED_BUDGET", 0) or 0) > 0:
+        trace["stop_rule"] = "budget_exhausted"
+        trace["reason"] = "budget exhausted"
+        return False, trace
+    if not remaining:
+        trace["stop_rule"] = "no_runnable_candidates"
+        trace["reason"] = "no runnable candidates remain"
+        return False, trace
+    if iteration >= max_iterations:
+        trace["stop_rule"] = "max_iterations"
+        trace["reason"] = "max iterations reached"
+        return False, trace
+    if stagnation_rounds > patience:
+        trace["stop_rule"] = "stagnation"
+        trace["reason"] = f"stagnation detected after {stagnation_rounds} no-op rounds"
+        return False, trace
+
+    trace["stop_rule"] = "continue"
+    trace["reason"] = "runnable candidates remain"
+    return True, trace
 
 
 def _node_candidate_synthesis(state: GraphState) -> GraphState:
@@ -2796,23 +2836,30 @@ def _node_dedup_topk(state: GraphState) -> GraphState:
 def _node_persist(state: GraphState) -> GraphState:
     _emit_progress(state, "persist", "start")
     store = state["store"]
-    store.save_candidates(state.get("candidates", []))
-    store.save_static_evidence(state.get("static_evidence", []))
-    store.save_json_artifact(
-        "agent_workspace/latest.json",
-        {
-            "run_id": state.get("run_id"),
-            "objective_queue": [item.to_dict() for item in state.get("objective_queue", [])],
-            "research_tasks": [item.to_dict() for item in state.get("research_tasks", [])],
-            "research_findings": [item.to_dict() for item in state.get("research_findings", [])],
-            "hypotheses": [item.to_dict() for item in state.get("hypothesis_board", [])],
-            "refutations": [item.to_dict() for item in state.get("refutations", [])],
-            "experiment_board": [item.to_dict() for item in state.get("experiment_board", [])],
-            "witness_bundles": [item.to_dict() for item in state.get("witness_bundles", [])],
-            "gate_history": list(state.get("gate_history", [])),
-            "artifact_index": dict(state.get("artifact_index", {})),
-        },
-    )
+    run_id = str(state.get("run_id") or "").strip()
+    run_store = store.for_run(run_id) if run_id else None
+    if run_store is not None:
+        run_store.save_candidates(state.get("candidates", []))
+        run_store.save_static_evidence(state.get("static_evidence", []))
+        save_json_artifact = run_store.save_json_artifact
+    else:
+        store.save_candidates(state.get("candidates", []))
+        store.save_static_evidence(state.get("static_evidence", []))
+    payload = {
+        "run_id": state.get("run_id"),
+        "objective_queue": [item.to_dict() for item in state.get("objective_queue", [])],
+        "research_tasks": [item.to_dict() for item in state.get("research_tasks", [])],
+        "research_findings": [item.to_dict() for item in state.get("research_findings", [])],
+        "hypotheses": [item.to_dict() for item in state.get("hypothesis_board", [])],
+        "refutations": [item.to_dict() for item in state.get("refutations", [])],
+        "experiment_board": [item.to_dict() for item in state.get("experiment_board", [])],
+        "witness_bundles": [item.to_dict() for item in state.get("witness_bundles", [])],
+        "gate_history": list(state.get("gate_history", [])),
+        "artifact_index": dict(state.get("artifact_index", {})),
+    }
+    store.save_json_artifact("agent_workspace/latest.json", payload)
+    if run_store is not None:
+        run_store.save_json_artifact("agent_workspace/latest.json", payload)
     if state.get("frontier_state"):
         store.save_frontier_state(state["frontier_state"])
     return _finalize_stage(state, "persist", "evidence persisted")
@@ -3021,10 +3068,11 @@ def _state_from_resume_meta(
     mode: str,
     run_validation: bool,
     run_id_prefix: str,
+    explicit_run_id: str | None = None,
 ) -> GraphState:
     """Build the initial GraphState from optional resume metadata."""
     meta = resume_meta or {}
-    run_id = str(meta.get("run_id") or new_run_id(run_id_prefix))
+    run_id = str(meta.get("run_id") or explicit_run_id or new_run_id(run_id_prefix))
     return {
         "config": config,
         "repo_root": resolved_repo_root,
@@ -3047,6 +3095,7 @@ def analyze_with_graph(
     mode: str,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
     resume_run_id: str | None = None,
+    run_id: str | None = None,
 ) -> tuple[list[Candidate], list[StaticEvidence], dict[str, Any]]:
     resolved_repo_root = str(Path(repo_root).resolve())
     resume_meta = _resolve_resume_metadata(
@@ -3057,7 +3106,7 @@ def analyze_with_graph(
     state = _state_from_resume_meta(
         resume_meta,
         config=config, resolved_repo_root=resolved_repo_root, store=store,
-        mode=mode, run_validation=False, run_id_prefix="analyze",
+        mode=mode, run_validation=False, run_id_prefix="analyze", explicit_run_id=run_id,
     )
     run_id = str(state["run_id"])
     _set_progress_callback(run_id, progress_callback)
@@ -3076,6 +3125,7 @@ def run_with_graph(
     mode: str,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
     resume_run_id: str | None = None,
+    run_id: str | None = None,
 ) -> RunSummary:
     resolved_repo_root = str(Path(repo_root).resolve())
     resume_meta = _resolve_resume_metadata(
@@ -3086,7 +3136,7 @@ def run_with_graph(
     state = _state_from_resume_meta(
         resume_meta,
         config=config, resolved_repo_root=resolved_repo_root, store=store,
-        mode=mode, run_validation=True, run_id_prefix="run",
+        mode=mode, run_validation=True, run_id_prefix="run", explicit_run_id=run_id,
     )
     run_id = str(state["run_id"])
     started = str(state.get("started_at") or _now_iso())
@@ -3140,28 +3190,96 @@ def validate_with_graph(
     if resume_meta is not None:
         run_id = str(resume_meta.get("run_id") or run_id)
     _set_progress_callback(run_id, progress_callback)
-    state: GraphState = {
-        "config": config,
-        "repo_root": resolved_repo_root,
-        "store": store,
-        "mode": "variant",
-        "run_id": run_id,
-        "run_validation": True,
-        "candidates": candidates,
-        "static_evidence": static_evidence,
-        "selected_candidates": candidates,
-        "selected_static": static_evidence,
-        "discovery_trace": {"mode": "validate-only"},
-        "skip_discovery": True,
-        "resume_mode": bool(resume_meta),
-        "resume_requested_run_id": str((resume_meta or {}).get("run_id") or ""),
-        "graph_thread_id": str((resume_meta or {}).get("thread_id") or ""),
-        "graph_checkpoint_id": str((resume_meta or {}).get("checkpoint_id") or ""),
-        "started_at": str((resume_meta or {}).get("started_at") or _now_iso()),
-    }
+    progress_state: GraphState = {"run_id": run_id}
+    started = str((resume_meta or {}).get("started_at") or _now_iso())
     try:
-        result = _run_langgraph(state, include_validation=True)
-        return result.get("bundles", []), result.get("decisions", {})
+        _emit_progress(progress_state, "graph", "start", "include_validation=direct")
+
+        selected_candidates = _normalize_candidate_intercepts([_safe_copy_candidate(item) for item in candidates])
+        selection = select_linked_evidence(selected_candidates, list(static_evidence))
+        selected_candidates = selection.candidates
+        selected_static = selection.static_evidence
+
+        discovery_trace: dict[str, Any] = {
+            "mode": "validate-only",
+            "execution_path": "direct-validate",
+            "missing_candidate_ids": list(selection.missing_candidate_ids),
+        }
+
+        run_store = store.for_run(run_id)
+        _emit_progress(progress_state, "auth_setup", "start")
+        if not config.auth.enabled:
+            auth_state: dict[str, Any] = {"auth_enabled": False, "cookies": {}}
+            discovery_trace["auth"] = {"enabled": False, "resolved": True, "cookies": 0}
+            _emit_progress(progress_state, "auth_setup", "done", "auth disabled")
+        else:
+            auth_state = establish_auth_state(config)
+            cookies = auth_state.get("cookies", {}) if isinstance(auth_state, dict) else {}
+            cookie_count = len(cookies) if isinstance(cookies, dict) else 0
+            discovery_trace["auth"] = {
+                "enabled": True,
+                "resolved": cookie_count > 0,
+                "cookies": cookie_count,
+                "login_url": config.auth.login_url,
+            }
+            _resolve_auth_preconditions(selected_candidates, auth_known=cookie_count > 0)
+            _emit_progress(progress_state, "auth_setup", "done", f"cookies={cookie_count}")
+
+        _emit_progress(progress_state, "validation_plan", "start")
+        plans_by_candidate, validation_trace = make_validation_plans_with_deepagents(
+            selected_candidates,
+            config,
+            repo_root=resolved_repo_root,
+            session=None,
+        )
+        planner_trace: dict[str, Any] = {"validation_plan": validation_trace}
+        _emit_progress(progress_state, "validation_plan", "done", f"planned={len(plans_by_candidate)}")
+
+        _emit_progress(progress_state, "runtime_execute", "start")
+        bundles, decisions = validate_candidates_runtime(
+            config=config,
+            store=store,
+            static_evidence=selected_static,
+            candidates=selected_candidates,
+            run_id=run_id,
+            plans_by_candidate=plans_by_candidate,
+            planner_trace=planner_trace,
+            discovery_trace=discovery_trace,
+            artifact_refs=[],
+            auth_state=auth_state,
+        )
+        _emit_progress(progress_state, "runtime_execute", "done", f"bundles={len(bundles)}")
+
+        _emit_progress(progress_state, "persist", "start")
+        run_store.save_candidates(selected_candidates)
+        run_store.save_static_evidence(selected_static)
+        run_store.save_json_artifact(
+            "agent_workspace/latest.json",
+            {
+                "run_id": run_id,
+                "candidates": [item.to_dict() for item in selected_candidates],
+                "static_evidence": [item.to_dict() for item in selected_static],
+                "bundle_ids": [str(getattr(item, "bundle_id", "")) for item in bundles],
+                "planner_trace": planner_trace,
+                "discovery_trace": discovery_trace,
+            },
+        )
+        summary = RunSummary(
+            run_id=run_id,
+            mode="variant",
+            started_at=started,
+            completed_at=datetime.now(tz=timezone.utc).isoformat(),
+            total_candidates=len(selected_candidates),
+            decisions=decisions,
+            bundle_ids=[str(getattr(item, "bundle_id", "")) for item in bundles],
+            discovery_trace=discovery_trace,
+            planner_trace=planner_trace,
+            frontier_state={},
+        )
+        store.save_run_summary(summary)
+        _emit_progress(progress_state, "persist", "done", "evidence persisted")
+        _emit_progress(progress_state, "graph", "done", "validate-only direct path complete")
+        return bundles, decisions
     finally:
         _clear_state_runtime(run_id)
         _set_progress_callback(run_id, None)
