@@ -1411,6 +1411,51 @@ def test_objective_schedule_does_not_fallback_when_scheduler_returns_empty_selec
     assert "fallback_selected" not in result["planner_trace"]["scheduler"]
 
 
+def test_objective_schedule_retains_static_evidence_matched_by_evidence_refs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
+    runtime = SimpleNamespace(root=SimpleNamespace(thread_id="root-thread"), shared_context={})
+    candidate = _mk_candidate_custom("cand-derived", ["joern"], line=12)
+    candidate.evidence_refs = ["joern::sql::1:src/a.php:12"]
+    static_source = _mk_evidence("cand-source", "joern::sql::1")
+    stale_static = StaticEvidence(
+        candidate_id="cand-stale",
+        query_profile="default",
+        query_id="scip::sql::2",
+        file_path="src/other.php",
+        line=44,
+        snippet="mysqli_query($other, $q)",
+        hash="h-stale",
+    )
+
+    monkeypatch.setattr(graph_mod, "_state_runtime", lambda state: runtime)
+    monkeypatch.setattr(
+        graph_mod,
+        "schedule_actions_with_deepagents",
+        lambda *_args, **_kwargs: ([candidate], {candidate.candidate_id: 1.0}, {"engine": "stub"}),
+    )
+
+    state: graph_mod.GraphState = {
+        "config": config,
+        "repo_root": str(tmp_path),
+        "store": EvidenceStore(tmp_path / ".padv"),
+        "run_id": "run-objective-derived-static",
+        "run_validation": True,
+        "had_semantic_candidates": True,
+        "candidates": [candidate],
+        "static_evidence": [static_source, stale_static],
+        "frontier_state": graph_mod._default_frontier_state(),
+        "planner_trace": {},
+    }
+
+    result = graph_mod._node_objective_schedule(state)
+
+    assert [item.candidate_id for item in result["selected_candidates"]] == ["cand-derived"]
+    assert [item.candidate_id for item in result["selected_static"]] == ["cand-source"]
+    assert [item.candidate_id for item in result["static_evidence"]] == ["cand-source"]
+
+
 def test_analyze_writes_stage_and_checkpoint_snapshots(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
     store = EvidenceStore(tmp_path / ".padv")
@@ -1957,6 +2002,85 @@ def test_experiment_plan_rehydrates_from_selected_pool_when_current_candidates_a
     assert sorted(result["plans_by_candidate"].keys()) == ["cand-00001"]
 
 
+def test_experiment_plan_retains_static_evidence_matched_by_evidence_refs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
+    candidate = _mk_candidate_custom("cand-derived", ["joern"], line=12)
+    candidate.evidence_refs = ["joern::sql::1:src/a.php:12"]
+    static_source = _mk_evidence("cand-source", "joern::sql::1")
+    stale_static = StaticEvidence(
+        candidate_id="cand-stale",
+        query_profile="default",
+        query_id="scip::sql::2",
+        file_path="src/other.php",
+        line=44,
+        snippet="mysqli_query($other, $q)",
+        hash="h-stale",
+    )
+    hypothesis = Hypothesis(
+        hypothesis_id="hyp-derived",
+        objective_id="obj-0001",
+        vuln_class=candidate.vuln_class,
+        title=candidate.title,
+        rationale="keep derived candidate",
+        evidence_refs=["src/a.php:12"],
+        candidate=candidate,
+        confidence=0.9,
+    )
+    runtime = SimpleNamespace(shared_context={}, checkpoint_dir=str(tmp_path / ".padv" / "langgraph"))
+
+    monkeypatch.setattr(graph_mod, "_state_runtime", lambda state: runtime)
+    monkeypatch.setattr(graph_mod, "update_agent_runtime_context", lambda *args, **kwargs: None)
+    monkeypatch.setattr(graph_mod, "_persist_agent_workspace_artifact", lambda *args, **kwargs: "artifact.json")
+    monkeypatch.setattr(
+        graph_mod,
+        "plan_experiments_with_subagent",
+        lambda *_args, **_kwargs: (
+            {
+                candidate.candidate_id: ValidationPlan(
+                    candidate_id=candidate.candidate_id,
+                    intercepts=["mysqli_query"],
+                    oracle_functions=["mysqli_query"],
+                    positive_requests=[{"method": "GET", "path": "/", "query": {"x": "1"}}] * 3,
+                    negative_requests=[{"method": "GET", "path": "/", "query": {"x": "0"}}],
+                    canary="x",
+                )
+            },
+            [
+                ExperimentAttempt(
+                    attempt_id="attempt-derived",
+                    hypothesis_id="hyp-derived",
+                    plan_id="plan-derived",
+                    request_refs=[],
+                    witness_goal="sql_injection_boundary",
+                    status="planned",
+                )
+            ],
+            {"engine": "stub"},
+        ),
+    )
+
+    state: graph_mod.GraphState = {
+        "config": config,
+        "run_id": "run-plan-derived-static",
+        "repo_root": str(tmp_path),
+        "store": EvidenceStore(tmp_path / ".padv"),
+        "run_validation": True,
+        "candidates": [candidate],
+        "static_evidence": [static_source, stale_static],
+        "hypothesis_board": [hypothesis],
+        "frontier_state": {},
+        "artifact_refs": [],
+    }
+
+    result = graph_mod._node_experiment_plan(state)
+
+    assert [item.candidate_id for item in result["candidates"]] == ["cand-derived"]
+    assert [item.candidate_id for item in result["static_evidence"]] == ["cand-source"]
+    assert sorted(result["plans_by_candidate"].keys()) == ["cand-derived"]
+
+
 def test_experiment_plan_does_not_short_circuit_on_stale_plans(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -2268,6 +2392,174 @@ def test_runtime_execute_filters_resumed_candidates_to_planned_subset(
     assert seen["static_ids"] == ["cand-00001"]
     assert [item.candidate_id for item in result["candidates"]] == ["cand-00001"]
     assert [item.candidate_id for item in result["static_evidence"]] == ["cand-00001"]
+
+
+def test_selected_static_for_hypotheses_matches_rewritten_candidate_refs() -> None:
+    candidate = _mk_candidate_custom("cand-derived", ["joern"], line=101, file_path="src/ws.php")
+    candidate.evidence_refs = ["joern::command_injection_boundary:src/ws.php:101"]
+    hypothesis = Hypothesis(
+        hypothesis_id="hyp-1",
+        objective_id="obj-1",
+        vuln_class="command_injection_boundary",
+        title="derived cmdi",
+        rationale="copied from research evidence",
+        evidence_refs=["src/ws.php:93-107"],
+        candidate=candidate,
+    )
+    matching_static = StaticEvidence(
+        candidate_id="cand-source",
+        query_profile="default",
+        query_id="joern::command_injection_boundary",
+        file_path="src/ws.php",
+        line=101,
+        snippet="shell_exec($target)",
+        hash="h-cmdi",
+    )
+    stale_static = StaticEvidence(
+        candidate_id="cand-other",
+        query_profile="default",
+        query_id="joern::command_injection_boundary",
+        file_path="src/other.php",
+        line=44,
+        snippet="shell_exec($other)",
+        hash="h-other",
+    )
+
+    selected = graph_mod._selected_static_for_hypotheses([hypothesis], [matching_static, stale_static])
+
+    assert [(item.candidate_id, item.hash) for item in selected] == [("cand-source", "h-cmdi")]
+
+
+def test_runtime_execute_retains_static_evidence_matched_by_evidence_refs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
+    candidate = _mk_candidate_custom("cand-derived", ["joern"], line=12)
+    candidate.evidence_refs = ["joern::sql::1:src/a.php:12"]
+    static_source = _mk_evidence("cand-source", "joern::sql::1")
+    stale_static = StaticEvidence(
+        candidate_id="cand-stale",
+        query_profile="default",
+        query_id="scip::sql::2",
+        file_path="src/other.php",
+        line=44,
+        snippet="mysqli_query($other, $q)",
+        hash="h-stale",
+    )
+    seen: dict[str, list[str]] = {}
+
+    monkeypatch.setattr(
+        graph_mod,
+        "validate_candidates_runtime",
+        lambda **kwargs: (
+            seen.setdefault("candidate_ids", [item.candidate_id for item in kwargs["candidates"]]),
+            seen.setdefault("static_ids", [item.candidate_id for item in kwargs["static_evidence"]]),
+            [EvidenceBundle(
+                bundle_id="bundle-0002",
+                created_at="2026-03-14T00:00:00+00:00",
+                candidate=candidate,
+                static_evidence=[static_source],
+                positive_runtime=[],
+                negative_runtime=[],
+                repro_run_ids=[],
+                gate_result=GateResult("DROPPED", ["V0"], "V3", "test"),
+                limitations=[],
+            )],
+            {"VALIDATED": 0, "DROPPED": 1, "NEEDS_HUMAN_SETUP": 0},
+        )[2:],
+    )
+
+    state: graph_mod.GraphState = {
+        "config": config,
+        "run_id": "run-runtime-derived-static",
+        "repo_root": str(tmp_path),
+        "store": EvidenceStore(tmp_path / ".padv"),
+        "run_validation": True,
+        "candidates": [candidate],
+        "static_evidence": [static_source, stale_static],
+        "plans_by_candidate": {
+            candidate.candidate_id: ValidationPlan(
+                candidate_id=candidate.candidate_id,
+                intercepts=["mysqli_query"],
+                oracle_functions=["mysqli_query"],
+                positive_requests=[{"method": "GET", "path": "/", "query": {"x": "1"}}] * 3,
+                negative_requests=[{"method": "GET", "path": "/", "query": {"x": "0"}}],
+                canary="x",
+            )
+        },
+        "planner_trace": {},
+        "discovery_trace": {},
+        "artifact_refs": [],
+        "auth_state": {},
+    }
+
+    result = graph_mod._node_runtime_execute(state)
+
+    assert seen["candidate_ids"] == ["cand-derived"]
+    assert seen["static_ids"] == ["cand-source"]
+
+
+def test_runtime_execute_recovers_candidates_from_selected_pool(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
+    candidate = _mk_candidate_custom("cand-derived", ["joern"], line=12)
+    candidate.evidence_refs = ["plan-alias", "joern::sql::1:src/a.php:12"]
+    static_source = _mk_evidence("cand-source", "joern::sql::1")
+    seen: dict[str, list[str]] = {}
+
+    monkeypatch.setattr(
+        graph_mod,
+        "validate_candidates_runtime",
+        lambda **kwargs: (
+            seen.setdefault("candidate_ids", [item.candidate_id for item in kwargs["candidates"]]),
+            seen.setdefault("static_ids", [item.candidate_id for item in kwargs["static_evidence"]]),
+            [EvidenceBundle(
+                bundle_id="bundle-runtime-recover",
+                created_at="2026-03-14T00:00:00+00:00",
+                candidate=candidate,
+                static_evidence=[static_source],
+                positive_runtime=[],
+                negative_runtime=[],
+                repro_run_ids=[],
+                gate_result=GateResult("DROPPED", ["V0"], "V3", "test"),
+                limitations=[],
+            )],
+            {"VALIDATED": 0, "DROPPED": 1, "NEEDS_HUMAN_SETUP": 0},
+        )[2:],
+    )
+
+    state: graph_mod.GraphState = {
+        "config": config,
+        "run_id": "run-runtime-selected-pool",
+        "repo_root": str(tmp_path),
+        "store": EvidenceStore(tmp_path / ".padv"),
+        "candidates": [],
+        "selected_candidates": [candidate],
+        "static_evidence": [],
+        "selected_static": [static_source],
+        "plans_by_candidate": {
+            candidate.candidate_id: ValidationPlan(
+                candidate_id=candidate.candidate_id,
+                intercepts=["mysqli_query"],
+                positive_requests=[{"method": "GET", "path": "/", "query": {"x": "1"}}],
+                negative_requests=[{"method": "GET", "path": "/", "query": {"x": "0"}}],
+                canary="x",
+            )
+        },
+        "planner_trace": {},
+        "discovery_trace": {},
+        "artifact_refs": [],
+        "auth_state": {},
+        "run_validation": True,
+    }
+
+    result = graph_mod._node_runtime_execute(state)
+
+    assert seen["candidate_ids"] == ["cand-derived"]
+    assert seen["static_ids"] == ["cand-source"]
+    assert result["decisions"]["DROPPED"] == 1
+    assert [item.candidate_id for item in result["static_evidence"]] == ["cand-source"]
 
 
 def test_evidence_reduce_does_not_reuse_stale_witness_bundles(tmp_path: Path) -> None:

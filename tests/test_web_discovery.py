@@ -6,7 +6,14 @@ import asyncio
 import pytest
 
 from padv.config.schema import load_config
-from padv.discovery.web import _install_dialog_guards, _safe_dismiss_dialog, discover_web_hints, discover_web_inventory
+from padv.discovery.web import (
+    _anthropic_cached_prompt_input,
+    _canonicalize_url,
+    _install_dialog_guards,
+    _safe_dismiss_dialog,
+    discover_web_hints,
+    discover_web_inventory,
+)
 
 
 def test_web_discovery_http_extract(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -132,3 +139,34 @@ def test_install_dialog_guards_wires_page_and_future_pages() -> None:
     page_handler(popup)
     assert "dialog" in popup.handlers
     assert seen == ["root:dialog", "popup:dialog"]
+
+
+def test_canonicalize_url_skips_session_mutating_targets() -> None:
+    base_url = "http://127.0.0.1:18080/index.php"
+
+    assert (
+        _canonicalize_url(
+            "http://127.0.0.1:18080/index.php?do=toggle-enforce-ssl&page=/var/www/mutillidae/home.php",
+            base_url=base_url,
+        )
+        is None
+    )
+    assert _canonicalize_url("http://127.0.0.1:18080/logout.php", base_url=base_url) is None
+    assert _canonicalize_url("http://127.0.0.1:18080/index.php?page=about.php", base_url=base_url) == (
+        "http://127.0.0.1:18080/index.php?page=about.php"
+    )
+
+
+def test_anthropic_cached_prompt_input_marks_last_block_ephemeral() -> None:
+    assert _anthropic_cached_prompt_input("Return strict JSON only") == [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Return strict JSON only",
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+        }
+    ]

@@ -24,9 +24,9 @@ allow_url_decode = true
 
 [budgets]
 max_candidates = 60
-max_requests = 400
+max_requests = 600
 max_seconds_per_candidate = 90
-max_run_seconds = 3600
+max_run_seconds = 5400
 
 [sandbox]
 deploy_cmd = ""
@@ -39,10 +39,10 @@ root = "/workspace/haxor/.padv"
 store_raw_reports = false
 
 [auth]
-enabled = false
-login_url = ""
-username = ""
-password = ""
+enabled = true
+login_url = "http://host.docker.internal:18080/index.php?page=login.php"
+username = "admin"
+password = "adminpass"
 profile_path = ""
 
 [joern]
@@ -68,7 +68,7 @@ timeout_seconds = 240
 use_deepagents = true
 hard_fail = true
 require_langgraph = true
-max_iterations = 12
+max_iterations = 18
 improvement_patience = 2
 skeptic_rounds = 1
 thread_prefix = "padv"
@@ -85,11 +85,11 @@ hard_fail = true
 enabled = true
 use_browser_use = true
 headless = true
-max_pages = 12
-max_actions = 48
+max_pages = 24
+max_actions = 96
 request_timeout_seconds = 15
 
 [differential]
 enabled = true
-auth_levels = ["anonymous"]
+auth_levels = ["anonymous", "default"]
 body_length_tolerance = 0.10

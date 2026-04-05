@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
@@ -78,5 +79,12 @@ def send_request(
                 headers=dict(resp.headers.items()),
                 body=body_text,
             )
+    except urllib.error.HTTPError as exc:
+        body_text = exc.read().decode("utf-8", errors="replace")
+        return HttpResponse(
+            status_code=int(exc.code),
+            headers=dict(exc.headers.items()),
+            body=body_text,
+        )
     except Exception as exc:  # pragma: no cover
         raise RequestError(f"request_failed:{exc}") from exc

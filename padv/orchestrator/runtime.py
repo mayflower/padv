@@ -35,6 +35,7 @@ from padv.orchestrator.differential import (
     needs_differential,
     resolve_auth_state_for_level,
 )
+from padv.orchestrator.evidence_linking import group_static_evidence_by_candidate
 from padv.store.evidence_store import EvidenceStore
 from padv.taxonomy import (
     CLASS_ORACLE_WITNESS_FLAGS,
@@ -72,12 +73,25 @@ _NONBLOCKING_PRECONDITION_EXACT = {
 }
 _NONBLOCKING_PRECONDITION_PREFIXES = (
     "content-type:",
+    "http post request",
+    "http get request",
     "soapaction:",
     "common payloads:",
+    "for level 0:",
+    "for level 1:",
+    "stage 1 -",
+    "stage 2 -",
+    "stage 3 -",
+    "optional:",
+    "post to ",
+    "get to ",
+    "get/post to ",
     "response includes",
     "response must",
     "response should",
+    "base query returns",
     "valid soap",
+    "valid json",
     "shell metacharacters",
     "sql injection in ",
     "post request",
@@ -87,10 +101,9 @@ _NONBLOCKING_PRECONDITION_PREFIXES = (
     "request to ",
 )
 _NONBLOCKING_PRECONDITION_SUBSTRINGS = (
-    "security_level=",
-    "security level ",
-    "security_level in [",
-    "security level in [",
+    "security_level",
+    "security-level",
+    "security level",
     "must be at security level",
     "default security level",
     "security level must be",
@@ -111,9 +124,23 @@ _NONBLOCKING_PRECONDITION_SUBSTRINGS = (
     "active php session",
     "session_start()",
     "php session must be initiated",
+    "php session initialized",
+    "valid php session",
+    "php shell_exec() function must be enabled",
+    "shell_exec() enabled",
+    "shell_exec() function enabled",
     "no jwt token required",
     "no special permissions",
     "no username/password required",
+    "server must accept post requests",
+    "soapaction header",
+    "soap request must be well-formed xml",
+    "parameter in soap body",
+    "parameter with payload",
+    "json body with ",
+    "multipart/form-data",
+    "valid json format",
+    "get or post request with ",
     "query must return ",
     "satisfying precondition",
     "for union-based:",
@@ -121,6 +148,27 @@ _NONBLOCKING_PRECONDITION_SUBSTRINGS = (
     "for error-based:",
     "for special uuid:",
     "for time-based:",
+    "unix/linux system with /etc/passwd readable by web server",
+    "apache/nginx serves .php files",
+    "apache web server with allowoverride",
+    "allowoverride all",
+    "allowoverride fileinfo",
+    "mod_mime enabled in apache",
+    "syntax varies for other databases",
+    "mysql database backend",
+    "response returned as json",
+    "must not equal special uuid",
+    "matching 5 columns",
+    "webroot path known",
+    "write permissions to webroot",
+    "writable by www-data",
+    "uid cookie",
+    "upload_directory hidden field",
+    "extract permanent file path",
+    "uploaded_file_path",
+    "query string (?cmd=",
+    "file_exists() check",
+    "require_once() executes php code",
 )
 _AUTH_PRECONDITION_HINTS = (
     "login",
@@ -1073,16 +1121,31 @@ class _ValidationContext:
     artifact_refs: list[str]
 
 
+@dataclass(frozen=True)
+class _PreparedValidationTarget:
+    candidate: Candidate
+    profile: Any
+    plan: ValidationPlan | None
+    static_evidence: list[StaticEvidence]
+    evidence_signals: list[str]
+    preconditions: list[str]
+
+
 def _validate_single_candidate_runtime(
     ctx: _ValidationContext,
-    candidate: Candidate, plan: ValidationPlan,
-    candidate_static: list[StaticEvidence], evidence_signals: list[str],
-    profile: Any,
+    target: _PreparedValidationTarget,
     request_budget_remaining: int, run_deadline: float,
 ) -> tuple[EvidenceBundle, int]:
     attempts: list[dict[str, Any]] = []
     seen_flags: set[str] = set()
     config = ctx.config
+    candidate = target.candidate
+    plan = target.plan
+    profile = target.profile
+    candidate_static = target.static_evidence
+    evidence_signals = target.evidence_signals
+    if plan is None:
+        raise RuntimeError(f"missing agent-generated validation plan for candidate: {candidate.candidate_id}")
     candidate_deadline = min(run_deadline, monotonic() + float(config.budgets.max_seconds_per_candidate))
     total_cost = 0
 
@@ -1105,7 +1168,7 @@ def _validate_single_candidate_runtime(
         config=config, candidate=candidate, static_evidence=candidate_static,
         positive_runs=positive_runs, negative_runs=negative_runs,
         intercepts=_oracle_functions(plan), canary=plan.canary,
-        preconditions=_normalize_gate_preconditions(candidate, ctx.cookie_jar, config),
+        preconditions=target.preconditions,
         evidence_signals=evidence_signals, vuln_class=candidate.vuln_class,
         differential_pairs=differential_pairs,
     )
@@ -1139,38 +1202,46 @@ def _extract_auth_cookie_jar(auth_state: dict[str, Any]) -> dict[str, str]:
     return _normalize_cookie_dict(raw)
 
 
-def _process_candidate(
+def _prepare_validation_target(
     ctx: _ValidationContext,
     candidate: Candidate,
     plans_by_candidate: dict[str, ValidationPlan],
     static_by_candidate: dict[str, list[StaticEvidence]],
+) -> _PreparedValidationTarget:
+    prepared = apply_validation_profile(candidate)
+    candidate_static = static_by_candidate.get(prepared.candidate_id, [])
+    return _PreparedValidationTarget(
+        candidate=prepared,
+        profile=profile_for_vuln_class(prepared.canonical_class or prepared.vuln_class),
+        plan=plans_by_candidate.get(prepared.candidate_id),
+        static_evidence=candidate_static,
+        evidence_signals=_collect_evidence_signals(candidate_static, prepared),
+        preconditions=_normalize_gate_preconditions(prepared, ctx.cookie_jar, ctx.config),
+    )
+
+
+def _process_candidate(
+    ctx: _ValidationContext,
+    target: _PreparedValidationTarget,
     request_budget_remaining: int,
     run_deadline: float,
 ) -> tuple[EvidenceBundle, int]:
-    candidate = apply_validation_profile(candidate)
-    profile = profile_for_vuln_class(candidate.canonical_class or candidate.vuln_class)
+    candidate = target.candidate
 
     existing_bundle = _load_existing_bundle(ctx.store, ctx.run_id, candidate.candidate_id)
     if existing_bundle is not None:
         return existing_bundle, 0
 
-    candidate_static = static_by_candidate.get(candidate.candidate_id, [])
-    evidence_signals = _collect_evidence_signals(candidate_static, candidate)
-
     if not is_runtime_validatable(candidate):
         bundle = _build_analysis_only_bundle(
-            ctx.run_id, candidate, candidate_static, evidence_signals,
-            ctx.artifact_refs, ctx.discovery_trace, ctx.auth_state, profile,
+            ctx.run_id, candidate, target.static_evidence, target.evidence_signals,
+            ctx.artifact_refs, ctx.discovery_trace, ctx.auth_state, target.profile,
         )
         ctx.store.save_bundle(bundle)
         return bundle, 0
 
-    plan = plans_by_candidate.get(candidate.candidate_id)
-    if plan is None:
-        raise RuntimeError(f"missing agent-generated validation plan for candidate: {candidate.candidate_id}")
-
     return _validate_single_candidate_runtime(
-        ctx, candidate, plan, candidate_static, evidence_signals, profile,
+        ctx, target,
         request_budget_remaining, run_deadline,
     )
 
@@ -1194,10 +1265,6 @@ def validate_candidates_runtime(
     auth_state = auth_state or {}
     cookie_jar = _extract_auth_cookie_jar(auth_state)
 
-    static_by_candidate: dict[str, list[StaticEvidence]] = {}
-    for item in static_evidence:
-        static_by_candidate.setdefault(item.candidate_id, []).append(item)
-
     decisions: dict[str, int] = dict.fromkeys(("VALIDATED", "DROPPED", "NEEDS_HUMAN_SETUP", "CONFIRMED_ANALYSIS_FINDING"), 0)
     bundles: list[EvidenceBundle] = []
     request_budget_remaining = config.budgets.max_requests
@@ -1213,13 +1280,19 @@ def validate_candidates_runtime(
         artifact_refs=artifact_refs,
     )
 
-    for candidate in candidates:
+    static_by_candidate = group_static_evidence_by_candidate(candidates, static_evidence)
+    targets = [
+        _prepare_validation_target(ctx, candidate, plans_by_candidate, static_by_candidate)
+        for candidate in candidates
+    ]
+
+    for target in targets:
         if monotonic() >= run_deadline:
             break
         if request_budget_remaining <= 0:
             break
         bundle, cost = _process_candidate(
-            ctx, candidate, plans_by_candidate, static_by_candidate,
+            ctx, target,
             request_budget_remaining, run_deadline,
         )
         request_budget_remaining -= cost

@@ -10,6 +10,8 @@ from typing import Any, TypedDict
 from padv.config.schema import PadvConfig
 
 _JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
+_SESSION_EXIT_TOKENS = ("logout", "signout", "sign-out", "log-out")
+_SESSION_MUTATING_DO_VALUES = frozenset({"toggle-enforce-ssl", "toggle-security", "toggle-hints"})
 
 
 class _LLMState(TypedDict, total=False):
@@ -32,6 +34,21 @@ class _WebState(TypedDict, total=False):
     candidate_params: list[str]
 
 
+def _anthropic_cached_prompt_input(prompt: str) -> list[dict[str, Any]]:
+    return [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": str(prompt),
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+        }
+    ]
+
+
 def _normalize_path(url: str) -> tuple[str, list[str]]:
     parsed = urllib.parse.urlsplit(url)
     params = sorted(urllib.parse.parse_qs(parsed.query, keep_blank_values=True).keys())
@@ -44,6 +61,25 @@ def _base_origin(url: str) -> tuple[str, str]:
     return parsed.scheme, parsed.netloc
 
 
+def _is_state_mutating_url(parsed: urllib.parse.SplitResult) -> bool:
+    lower_path = (parsed.path or "").casefold()
+    if any(token in lower_path for token in _SESSION_EXIT_TOKENS):
+        return True
+
+    query = urllib.parse.parse_qs(parsed.query, keep_blank_values=True)
+    for key, values in query.items():
+        key_lower = str(key).casefold()
+        if any(token in key_lower for token in _SESSION_EXIT_TOKENS):
+            return True
+        for value in values:
+            value_lower = str(value).casefold()
+            if key_lower == "do" and value_lower in _SESSION_MUTATING_DO_VALUES:
+                return True
+            if any(token in value_lower for token in _SESSION_EXIT_TOKENS):
+                return True
+    return False
+
+
 def _canonicalize_url(raw: str, *, base_url: str) -> str | None:
     value = str(raw or "").strip()
     if not value:
@@ -54,6 +90,8 @@ def _canonicalize_url(raw: str, *, base_url: str) -> str | None:
     absolute = urllib.parse.urljoin(base_url, value)
     parsed = urllib.parse.urlsplit(absolute)
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return None
+    if _is_state_mutating_url(parsed):
         return None
 
     base_scheme, base_netloc = _base_origin(base_url)
@@ -155,7 +193,7 @@ async def _invoke_llm_json_via_langgraph(config: PadvConfig, prompt: str) -> dic
     llm = _build_llm(config)
 
     async def _node_infer(state: _LLMState) -> _LLMState:
-        response = await llm.ainvoke(state.get("prompt", ""))
+        response = await llm.ainvoke(_anthropic_cached_prompt_input(state.get("prompt", "")))
         parsed = _extract_json_object(_extract_text_from_langchain_message(response))
         if parsed is None:
             raise RuntimeError("web discovery llm returned non-JSON response")
@@ -189,7 +227,7 @@ async def _llm_select_next_urls(
     prompt = (
         "You are a web security discovery planner for a PHP target. "
         "Select next URLs to visit for maximum information gain and likely exploitability. "
-        "Avoid logout/signout and already-visited URLs. "
+        "Avoid logout/signout, session-setting toggles such as enforce-ssl/security/hints, and already-visited URLs. "
         "Return strict JSON only with this schema: "
         '{"next_urls":["..."],"likely_params":["..."]}. '
         f"Current URL: {current_url}\n"
@@ -354,17 +392,13 @@ async def _inject_cookies(context: Any, auth_state: dict[str, Any] | None, base_
     cookie_map = auth_state.get("cookies", {}) if isinstance(auth_state, dict) else {}
     if not isinstance(cookie_map, dict) or not cookie_map:
         return
-    scheme, host, secure = _cookie_origin_fields(base_url)
+    parsed = urllib.parse.urlsplit(base_url)
+    origin = f"{parsed.scheme or 'http'}://{parsed.netloc}/"
     cookies_payload = [
         {
             "name": str(name),
             "value": str(value),
-            "domain": host,
-            "path": "/",
-            "httpOnly": False,
-            "secure": secure,
-            "sameSite": "Lax",
-            "url": f"{scheme}://{host}/",
+            "url": origin,
         }
         for name, value in cookie_map.items()
         if str(name).strip()

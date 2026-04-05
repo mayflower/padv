@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+from collections.abc import Iterable
 from dataclasses import asdict, is_dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -52,6 +53,7 @@ from padv.models import (
     WitnessBundle,
     utc_now_iso as _now_iso,
 )
+from padv.orchestrator.evidence_linking import select_linked_evidence
 from padv.orchestrator.runtime import new_run_id, validate_candidates_runtime
 from padv.static.joern.adapter import discover_candidates_with_meta
 from padv.static.joern.query_sets import VULN_CLASS_SPECS
@@ -1806,25 +1808,14 @@ def _candidate_from_hypothesis(hypothesis: Hypothesis) -> Candidate:
 def _selected_static_for_hypotheses(hypotheses: list[Hypothesis], static_evidence: list[StaticEvidence]) -> list[StaticEvidence]:
     if not hypotheses:
         return []
-    selected_ids = {item.candidate.candidate_id for item in hypotheses}
-    selected_refs = {
-        ref
-        for item in hypotheses
-        for ref in (list(item.evidence_refs) + list(item.candidate.evidence_refs))
-        if isinstance(ref, str) and ref.strip()
-    }
-    out: list[StaticEvidence] = []
-    seen: set[tuple[str, str]] = set()
-    for item in static_evidence:
-        matches = item.candidate_id in selected_ids or item.hash in selected_refs or item.query_id in selected_refs
-        if not matches:
-            continue
-        key = (item.candidate_id, item.hash)
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(item)
-    return out
+    extra_refs_by_candidate: dict[str, list[str]] = {}
+    for item in hypotheses:
+        extra_refs_by_candidate.setdefault(item.candidate.candidate_id, []).extend(list(item.evidence_refs))
+    return select_linked_evidence(
+        [item.candidate for item in hypotheses],
+        static_evidence,
+        extra_refs_by_candidate=extra_refs_by_candidate,
+    ).static_evidence
 
 
 def _full_candidate_pool(state: GraphState) -> list[Candidate]:
@@ -1859,6 +1850,22 @@ def _full_static_evidence_pool(state: GraphState) -> list[StaticEvidence]:
             if out:
                 return out
     return list(static_evidence)
+
+
+def _align_selected_candidates(
+    candidate_source: list[Candidate],
+    static_source: list[StaticEvidence],
+    *,
+    selected_candidate_ids: Iterable[str] = (),
+    extra_refs_by_candidate: dict[str, Iterable[str]] | None = None,
+) -> tuple[list[Candidate], list[StaticEvidence], list[str]]:
+    selection = select_linked_evidence(
+        candidate_source,
+        static_source,
+        selected_candidate_ids=selected_candidate_ids,
+        extra_refs_by_candidate=extra_refs_by_candidate,
+    )
+    return selection.candidates, selection.static_evidence, selection.missing_candidate_ids
 
 
 def _active_hypotheses_without_high_refutation(state: GraphState) -> list[Hypothesis]:
@@ -2198,12 +2205,15 @@ def _node_experiment_plan(state: GraphState) -> GraphState:
     if planned_ids:
         candidate_source = list(state.get("candidates", [])) or list(state.get("selected_candidates", [])) or _full_candidate_pool(state)
         static_source = list(state.get("static_evidence", [])) or list(state.get("selected_static", [])) or _full_static_evidence_pool(state)
-        state["candidates"] = [
-            item for item in candidate_source if item.candidate_id in planned_ids
-        ]
-        state["static_evidence"] = [
-            item for item in static_source if item.candidate_id in planned_ids
-        ]
+        planned_candidates, planned_static, missing_ids = _align_selected_candidates(
+            candidate_source,
+            static_source,
+            selected_candidate_ids=planned_ids,
+        )
+        state["candidates"] = planned_candidates
+        state["static_evidence"] = planned_static
+        if missing_ids:
+            state["validation_board"]["missing_plans"] = missing_ids
     state.setdefault("planner_trace", {})["experiment"] = trace
     runtime = _state_runtime(state)
     update_agent_runtime_context(
@@ -2252,11 +2262,17 @@ def _node_runtime_execute(state: GraphState) -> GraphState:
     candidates = list(state.get("candidates", []))
     planned_ids = set((state.get("plans_by_candidate") or {}).keys())
     if planned_ids:
-        candidates = [item for item in candidates if item.candidate_id in planned_ids]
+        candidate_source = candidates or list(state.get("selected_candidates", [])) or _full_candidate_pool(state)
+        static_source = list(state.get("static_evidence", [])) or list(state.get("selected_static", [])) or _full_static_evidence_pool(state)
+        candidates, static_evidence, missing_ids = _align_selected_candidates(
+            candidate_source,
+            static_source,
+            selected_candidate_ids=planned_ids,
+        )
         state["candidates"] = candidates
-        state["static_evidence"] = [
-            item for item in state.get("static_evidence", []) if item.candidate_id in planned_ids
-        ]
+        state["static_evidence"] = static_evidence
+        if missing_ids:
+            state.setdefault("validation_board", {})["missing_runtime_candidates"] = missing_ids
     bundles, decisions = validate_candidates_runtime(
         config=state["config"],
         store=state["store"],
@@ -2547,10 +2563,10 @@ def _node_objective_schedule(state: GraphState) -> GraphState:
     scheduler_trace["schedule_pool_size"] = len(scheduler_input)
     scheduler_trace["resume_filtered_candidates"] = list(state.get("resume_filtered_candidates", []))
 
-    selected_ids = {c.candidate_id for c in selected}
-    selected_static = [
-        item for item in state.get("static_evidence", []) if item.candidate_id in selected_ids
-    ]
+    selected_static = _align_selected_candidates(
+        selected,
+        list(state.get("static_evidence", [])),
+    )[1]
 
     state["objective_scores"] = scores
     state["selected_candidates"] = selected

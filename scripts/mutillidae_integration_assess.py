@@ -125,6 +125,73 @@ def _safe_json_parse(text: str) -> dict[str, Any] | None:
     return None
 
 
+_GRAPH_STAGE_RE = re.compile(r"^(?P<index>\d+)-(?P<stage>[^.]+)\.json$")
+
+
+def _latest_graph_progress(prefix: str) -> dict[str, Any] | None:
+    root = PADV_STORE / "langgraph"
+    if not root.exists():
+        return None
+
+    candidates = [path for path in root.iterdir() if path.is_dir() and path.name.startswith(f"{prefix}-")]
+    if not candidates:
+        return None
+
+    def _latest_snapshot(path: Path) -> tuple[float, Path | None]:
+        latest_ts = path.stat().st_mtime
+        latest_path: Path | None = None
+        for child in path.iterdir():
+            if not child.is_file():
+                continue
+            match = _GRAPH_STAGE_RE.match(child.name)
+            if match is None:
+                continue
+            if child.stat().st_mtime >= latest_ts:
+                latest_ts = child.stat().st_mtime
+                latest_path = child
+        return latest_ts, latest_path
+
+    latest_dir = max(candidates, key=lambda item: _latest_snapshot(item)[0])
+    snapshots: list[tuple[int, str, Path]] = []
+    for child in latest_dir.iterdir():
+        if not child.is_file():
+            continue
+        match = _GRAPH_STAGE_RE.match(child.name)
+        if match is None:
+            continue
+        snapshots.append((int(match.group("index")), match.group("stage"), child))
+    if not snapshots:
+        return None
+
+    snapshots.sort()
+    _, latest_stage, latest_path = snapshots[-1]
+    payload = _load_json(latest_path, {})
+    counts = payload.get("counts", {}) if isinstance(payload, dict) else {}
+    decisions = payload.get("decisions", {}) if isinstance(payload, dict) else {}
+    frontier = payload.get("frontier", {}) if isinstance(payload, dict) else {}
+    run_id = str(payload.get("run_id", "")).strip() if isinstance(payload, dict) else ""
+    if not run_id:
+        run_id = latest_dir.name
+    return {
+        "run_id": run_id,
+        "latest_stage": latest_stage,
+        "latest_stage_file": str(latest_path),
+        "completed": any(stage == "persist" for _, stage, _ in snapshots),
+        "candidates": int(counts.get("candidates", 0) or 0),
+        "static_evidence": int(counts.get("static_evidence", 0) or 0),
+        "bundle_count": int(counts.get("all_bundles", counts.get("bundles", 0)) or 0),
+        "counts": counts,
+        "decisions": decisions,
+        "frontier": frontier,
+    }
+
+
+def _attempt_failure_class(result: CmdResult) -> str:
+    if result.returncode == 124:
+        return "timeout"
+    return classify_failure(f"{result.stdout}\n{result.stderr}")
+
+
 def _scanner_padv_cmd(*args: str) -> list[str]:
     return [
         "docker",
@@ -266,20 +333,34 @@ def run_analyze_stabilization(output_dir: Path, max_attempts: int, analyze_timeo
             timeout_seconds=analyze_timeout,
         )
         parsed = _safe_json_parse(res.stdout)
-        has_counts = isinstance(parsed, dict) and int(parsed.get("candidates", 0)) > 0 and int(parsed.get("static_evidence", 0)) > 0
-        ok = res.returncode == 0 and isinstance(parsed, dict) and "error" not in parsed and has_counts
+        recovered = _latest_graph_progress("analyze")
+        observed = parsed if isinstance(parsed, dict) else recovered
+        has_counts = isinstance(observed, dict) and int(observed.get("candidates", 0)) > 0 and int(observed.get("static_evidence", 0)) > 0
+        completed = isinstance(recovered, dict) and bool(recovered.get("completed"))
+        ok = (
+            res.returncode == 0
+            and isinstance(parsed, dict)
+            and "error" not in parsed
+            and has_counts
+        ) or (
+            completed
+            and isinstance(observed, dict)
+            and "error" not in observed
+            and has_counts
+        )
+        if observed:
+            final_payload = observed
         attempts.append(
             {
                 "attempt": idx,
                 "ok": ok,
-                "failure_class": "" if ok else classify_failure(f"{res.stdout}\n{res.stderr}"),
+                "failure_class": "" if ok else _attempt_failure_class(res),
                 "result": res.to_dict(),
-                "parsed_output": parsed,
+                "parsed_output": observed or {},
             }
         )
         if ok:
             success = True
-            final_payload = parsed
             break
     output = {"phase": "A2", "generated_at": _now_iso(), "attempts": attempts, "success": success, "final_output": final_payload or {}}
     _write_json(output_dir / "a2-analyze-stabilization.json", output)
@@ -297,20 +378,34 @@ def run_strict_run_stabilization(output_dir: Path, max_attempts: int, run_timeou
             timeout_seconds=run_timeout,
         )
         parsed = _safe_json_parse(res.stdout)
-        has_run = isinstance(parsed, dict) and str(parsed.get("run_id", "")).strip() != ""
-        ok = res.returncode == 0 and isinstance(parsed, dict) and "error" not in parsed and has_run
+        recovered = _latest_graph_progress("run")
+        observed = parsed if isinstance(parsed, dict) else recovered
+        has_run = isinstance(observed, dict) and str(observed.get("run_id", "")).strip() != ""
+        completed = isinstance(recovered, dict) and bool(recovered.get("completed"))
+        ok = (
+            res.returncode == 0
+            and isinstance(parsed, dict)
+            and "error" not in parsed
+            and has_run
+        ) or (
+            completed
+            and isinstance(observed, dict)
+            and "error" not in observed
+            and has_run
+        )
+        if observed:
+            final_payload = observed
         attempts.append(
             {
                 "attempt": idx,
                 "ok": ok,
-                "failure_class": "" if ok else classify_failure(f"{res.stdout}\n{res.stderr}"),
+                "failure_class": "" if ok else _attempt_failure_class(res),
                 "result": res.to_dict(),
-                "parsed_output": parsed,
+                "parsed_output": observed or {},
             }
         )
         if ok:
             success = True
-            final_payload = parsed
             break
     output = {"phase": "A3", "generated_at": _now_iso(), "attempts": attempts, "success": success, "final_output": final_payload or {}}
     _write_json(output_dir / "a3-run-stabilization.json", output)

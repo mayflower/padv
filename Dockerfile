@@ -1,4 +1,4 @@
-FROM ghcr.io/joernio/joern:v4.0.228 AS joerncli
+FROM ghcr.io/joernio/joern:master AS joerncli
 
 FROM python:3.12-slim
 
@@ -34,7 +34,7 @@ COPY docker /workspace/haxor/docker
 RUN python -c "import pathlib, tomllib; payload = tomllib.loads(pathlib.Path('/workspace/haxor/pyproject.toml').read_text(encoding='utf-8')); pathlib.Path('/tmp/requirements.txt').write_text('\\n'.join(payload.get('project', {}).get('dependencies', [])) + '\\n', encoding='utf-8')" \
     && pip install --upgrade pip && pip install -r /tmp/requirements.txt \
     && playwright install --with-deps chromium \
-    && GOBIN=/usr/local/bin go install github.com/sourcegraph/scip/cmd/scip@latest \
+    && GOBIN=/usr/local/bin go install github.com/sourcegraph/scip/cmd/scip@v0.6.0 \
     && rm -rf /opt/scip-php \
     && git clone --depth 1 https://github.com/davidrjenni/scip-php.git /opt/scip-php \
     && git -C /opt/scip-php apply /workspace/haxor/docker/scip-loader.patch \

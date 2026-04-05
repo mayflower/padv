@@ -18,6 +18,7 @@ from padv.agents.deepagents_harness import (
     AgentRuntime,
     AgentSession,
     TaskDelegationTraceMiddleware,
+    _agent_middleware_for_role,
     _compact_frontier_state,
     _compact_research_frontier_state,
     _compact_hypotheses,
@@ -26,8 +27,10 @@ from padv.agents.deepagents_harness import (
     _handoff_cache_key,
     _handoff_turn_checklist,
     _handoff_work_guidance,
+    _inject_canary_into_xml,
     _invoke_agent_session_with_timeout,
     _limit_primary_objectives,
+    _normalize_plan_request,
     clone_runtime_for_parallel_role,
     _extract_json,
     _normalize_experiment_attempts,
@@ -785,6 +788,25 @@ def test_ensure_agent_runtime_uses_persistent_checkpointer(monkeypatch: pytest.M
     assert any(isinstance(item, TaskDelegationTraceMiddleware) for item in root_call["middleware"])
 
 
+def test_agent_middleware_for_role_adds_root_trace_only(tmp_path: Path) -> None:
+    config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
+    root_middleware = _agent_middleware_for_role(
+        config=config,
+        role="root",
+        shared_context={},
+        checkpoint_dir=str(tmp_path / "langgraph-store"),
+    )
+    source_middleware = _agent_middleware_for_role(
+        config=config,
+        role="source",
+        shared_context={},
+        checkpoint_dir=str(tmp_path / "langgraph-store"),
+    )
+
+    assert any(isinstance(item, TaskDelegationTraceMiddleware) for item in root_middleware)
+    assert source_middleware == []
+
+
 def test_ensure_agent_runtime_uses_persistent_sqlite_store(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
     monkeypatch.setenv(config.llm.api_key_env, "test-key")
@@ -1472,6 +1494,49 @@ def test_compact_hypotheses_truncates_and_limits_payload() -> None:
     assert len(compact[0]["candidate"]["sink"]) == 180
     assert len(compact[0]["candidate"]["expected_intercepts"]) == 4
     assert len(compact[0]["candidate"]["evidence_refs"]) == 4
+
+
+def test_inject_canary_into_xml_updates_element_text() -> None:
+    body = (
+        "<?xml version='1.0'?>"
+        "<SOAP-ENV:Envelope>"
+        "<SOAP-ENV:Body><ns1:lookupDNS><targetHost>127.0.0.1; id</targetHost>"
+        "</ns1:lookupDNS></SOAP-ENV:Body></SOAP-ENV:Envelope>"
+    )
+
+    mutated = _inject_canary_into_xml(body, "padv-canary-123")
+
+    assert "127.0.0.1; id padv-canary-123" in mutated
+
+
+def test_normalize_plan_request_injects_canary_into_xml_body_text() -> None:
+    candidate = _candidate()
+    candidate.vuln_class = "command_injection"
+    candidate.web_path_hints = ["/webservices/soap/ws-dns-lookup.php"]
+    req = {
+        "method": "POST",
+        "path": "/webservices/soap/ws-dns-lookup.php",
+        "headers": {"Content-Type": "text/xml; charset=utf-8"},
+        "body": (
+            "<?xml version='1.0'?>"
+            "<SOAP-ENV:Envelope><SOAP-ENV:Body><ns1:lookupDNS>"
+            "<targetHost>127.0.0.1; id</targetHost>"
+            "</ns1:lookupDNS></SOAP-ENV:Body></SOAP-ENV:Envelope>"
+        ),
+    }
+
+    normalized = _normalize_plan_request(
+        req,
+        "padv-canary-xml",
+        candidate,
+        ["POST to /webservices/soap/ws-dns-lookup.php", "SOAP envelope with lookupDNS method"],
+        {"padv_canary"},
+        "padv_canary",
+    )
+
+    assert normalized["query"]["padv_canary"] == "padv-canary-xml"
+    assert "padv-canary-xml" in normalized["body_text"]
+    assert "127.0.0.1; id padv-canary-xml" in normalized["body_text"]
 
 
 def test_orient_root_agent_rejects_non_final_continue_response(

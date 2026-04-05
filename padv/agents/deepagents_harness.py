@@ -417,6 +417,27 @@ def _resolve_model(config: PadvConfig) -> str:
     return f"{config.llm.provider}:{config.llm.model}"
 
 
+def _anthropic_prompt_caching_middleware(config: PadvConfig) -> Any | None:
+    if str(config.llm.provider).strip().lower() != "anthropic":
+        return None
+    middleware_cls = None
+    try:
+        from langchain_anthropic import AnthropicPromptCachingMiddleware  # type: ignore[import-not-found]
+
+        middleware_cls = AnthropicPromptCachingMiddleware
+    except Exception:
+        try:
+            from langchain_anthropic.middleware import AnthropicPromptCachingMiddleware  # type: ignore[import-not-found]
+
+            middleware_cls = AnthropicPromptCachingMiddleware
+        except Exception:
+            return None
+    try:
+        return middleware_cls()
+    except Exception:
+        return None
+
+
 def _checkpoint_path(checkpoint_dir: str | Path, role: str, thread_id: str) -> Path:
     base = Path(checkpoint_dir)
     base.mkdir(parents=True, exist_ok=True)
@@ -497,12 +518,14 @@ def ensure_agent_session(
     )
     tools = _build_filesystem_tools(repo_root) if repo_root and role != "root" else []
     checkpointer = FileBackedMemorySaver(_checkpoint_path(Path(".padv") / "langgraph", "legacy", thread_id))
+    middleware = []
     try:
         agent = create_deep_agent(
             model=model,
             tools=tools,
             system_prompt=system_prompt,
             checkpointer=checkpointer,
+            middleware=middleware,
         )
     except Exception as exc:
         raise AgentExecutionError(f"deepagents agent creation failed: {exc}") from exc
@@ -1887,13 +1910,16 @@ def _runtime_subagent_specs(sessions: dict[str, AgentSession]) -> list[dict[str,
 
 def _agent_middleware_for_role(
     *,
+    config: PadvConfig,
     role: str,
     shared_context: dict[str, Any],
     checkpoint_dir: str,
 ) -> list[Any]:
-    if role != "root":
-        return []
-    return [TaskDelegationTraceMiddleware(shared_context=shared_context, checkpoint_dir=checkpoint_dir)]
+    del config
+    middleware: list[Any] = []
+    if role == "root":
+        middleware.append(TaskDelegationTraceMiddleware(shared_context=shared_context, checkpoint_dir=checkpoint_dir))
+    return middleware
 
 
 def _create_agent_session(
@@ -1922,7 +1948,12 @@ def _create_agent_session(
     thread_id = _agent_thread_id(frontier_state, role=role, prefix=config.agent.thread_prefix)
     tools = _build_shared_context_tools(shared_context, repo_root, role=role)
     checkpointer = FileBackedMemorySaver(_checkpoint_path(checkpoint_dir, role, thread_id))
-    middleware = _agent_middleware_for_role(role=role, shared_context=shared_context, checkpoint_dir=checkpoint_dir)
+    middleware = _agent_middleware_for_role(
+        config=config,
+        role=role,
+        shared_context=shared_context,
+        checkpoint_dir=checkpoint_dir,
+    )
     try:
         agent = create_deep_agent(
             model=model,
@@ -3333,13 +3364,13 @@ def _inject_canary_into_mapping(mapping: dict[str, str], canary_value: str, rese
 
 def _inject_canary_into_xml(body_text: str, canary_value: str) -> str:
     def _replace(match: re.Match[str]) -> str:
-        opening, content, closing = match.group(1), match.group(2), match.group(3)
+        opening, content, closing = match.group(1), match.group(3), match.group(4)
         content = content.strip()
         if not content or canary_value in content:
             return match.group(0)
         return f"{opening}{_inject_canary_value(content, canary_value)}{closing}"
 
-    return re.sub(r"(<([A-Za-z0-9:_-]+)[^>]*>)([^<]+)(</\\2>)", _replace, body_text)
+    return re.sub(r"(<([A-Za-z0-9:_-]+)[^>]*>)([^<]+)(</\2>)", _replace, body_text)
 
 
 _ALLOWED_HTTP_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
@@ -3923,7 +3954,8 @@ def synthesize_hypotheses_with_subagent(
     )
     hypotheses = _normalize_hypotheses(parsed.get("hypotheses", []))
     if findings and not hypotheses:
-        raise AgentExecutionError("exploit subagent returned zero hypotheses")
+        import sys
+        print("WARNING: exploit subagent returned zero hypotheses for objective; skipping", file=sys.stderr)
     return hypotheses, {"engine": "deepagents", "notes": parsed.get("notes", []), "hypothesis_ids": [h.hypothesis_id for h in hypotheses], **handoff_meta}
 
 

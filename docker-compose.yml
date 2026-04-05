@@ -1,6 +1,6 @@
 services:
   joern:
-    image: ${JOERN_IMAGE:-ghcr.io/joernio/joern:v4.0.228}
+    image: ${JOERN_IMAGE:-ghcr.io/joernio/joern:master}
     command: ["joern", "--server", "--server-host", "0.0.0.0", "--server-port", "8080"]
     working_dir: /workspace
     ports:

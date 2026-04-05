@@ -27,6 +27,7 @@ from padv.config.schema import (
 from padv.models import (
     Candidate,
     DifferentialPair,
+    EnvironmentFacts,
     EvidenceBundle,
     ExperimentAttempt,
     FailureAnalysis,
@@ -34,9 +35,12 @@ from padv.models import (
     GateResult,
     Hypothesis,
     ObjectiveScore,
+    OracleEvidence,
     Refutation,
+    RequestEvidence,
     ResearchFinding,
     ResearchTask,
+    ResponseEvidence,
     RunSummary,
     RuntimeCall,
     RuntimeEvidence,
@@ -44,6 +48,7 @@ from padv.models import (
     ValidationContext,
     ValidationPlan,
     WitnessBundle,
+    WitnessEvidence,
 )
 from padv.store.evidence_store import EvidenceStore
 
@@ -110,6 +115,11 @@ _ALLOWED_MSGPACK_TYPES = (
     Refutation,
     ExperimentAttempt,
     WitnessBundle,
+    WitnessEvidence,
+    RequestEvidence,
+    ResponseEvidence,
+    OracleEvidence,
+    EnvironmentFacts,
 )
 
 
