@@ -37,6 +37,19 @@ def test_requirement_result_normalizes_invalid_status() -> None:
     assert result["status"] == "FAIL"
 
 
+def test_requirement_result_preserves_none_status() -> None:
+    result = RequirementResult(
+        requirement_id="X",
+        scenario="s",
+        observed_result="o",
+        evidence_path="e",
+        status="none",
+        root_cause="r",
+        next_fix="n",
+    ).to_dict()
+    assert result["status"] == "NONE"
+
+
 def test_matrix_to_gap_list_sorts_priorities() -> None:
     matrix = [
         {"requirement_id": "E1", "status": "FAIL", "root_cause": "missing", "next_fix": "implement"},

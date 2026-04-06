@@ -4,9 +4,15 @@ from dataclasses import dataclass
 from dataclasses import replace
 
 from padv.config.schema import PadvConfig
+from padv.identity import (
+    candidate_sink_signature_for_fields,
+    candidate_slice_signature_for_fields,
+    candidate_uid_for_fields,
+)
 from padv.models import Candidate, StaticEvidence
 
 _SEMANTIC_SIGNALS = frozenset({"joern", "scip"})
+_PROVENANCE_PRIORITY = {"joern": 0, "scip": 1}
 
 
 @dataclass(slots=True)
@@ -19,14 +25,22 @@ class FusionMeta:
 
 
 def _merge_lists(a: list[str], b: list[str]) -> list[str]:
-    out = list(a)
-    seen = set(a)
-    for item in b:
-        if item in seen:
-            continue
-        seen.add(item)
-        out.append(item)
-    return out
+    merged = {
+        str(item).strip()
+        for item in [*a, *b]
+        if isinstance(item, str) and str(item).strip()
+    }
+    return sorted(merged, key=lambda item: (item.casefold(), item))
+
+
+def _merge_notes(a: str, b: str) -> str:
+    parts = {
+        segment.strip()
+        for value in (a, b)
+        for segment in str(value or "").split(";")
+        if segment.strip()
+    }
+    return "; ".join(sorted(parts, key=lambda item: (item.casefold(), item)))
 
 
 def _semantic_signals(candidate: Candidate) -> set[str]:
@@ -49,39 +63,60 @@ def _merge_candidate_fields(target: Candidate, incoming: Candidate) -> None:
     target.auth_requirements = _merge_lists(target.auth_requirements, incoming.auth_requirements)
     target.web_path_hints = _merge_lists(target.web_path_hints, incoming.web_path_hints)
 
-    # Prefer the stronger semantic signal candidate as primary sink/position anchor.
-    target_score = (_semantic_score(target), target.confidence)
-    incoming_score = (_semantic_score(incoming), incoming.confidence)
-    if incoming_score > target_score and incoming.sink:
-        target.sink = incoming.sink
-        target.line = incoming.line
-
     if incoming.confidence > target.confidence:
         target.confidence = incoming.confidence
     if not target.entrypoint_hint and incoming.entrypoint_hint:
         target.entrypoint_hint = incoming.entrypoint_hint
-    if incoming.notes and incoming.notes not in target.notes:
-        target.notes = f"{target.notes}; {incoming.notes}".strip("; ")
+    target.notes = _merge_notes(target.notes, incoming.notes)
 
 
-def _primary_candidate_rank(candidate: Candidate) -> tuple[int, float, str, str]:
+def _provenance_priority(candidate: Candidate) -> tuple[int, ...]:
+    semantic = _semantic_signals(candidate)
+    if not semantic:
+        return (len(_PROVENANCE_PRIORITY) + 1,)
+    return tuple(sorted(_PROVENANCE_PRIORITY.get(signal.casefold(), len(_PROVENANCE_PRIORITY) + 1) for signal in semantic))
+
+
+def _primary_candidate_rank(candidate: Candidate) -> tuple[int, tuple[int, ...], float, str, str]:
     return (
-        _semantic_score(candidate),
-        candidate.confidence,
-        str(candidate.sink or "").strip().casefold(),
+        -_semantic_score(candidate),
+        _provenance_priority(candidate),
+        -float(candidate.confidence),
+        str(candidate.candidate_uid or "").strip(),
         str(candidate.candidate_id or "").strip(),
+    )
+
+
+def _sink_signature(candidate: Candidate) -> str:
+    return candidate_sink_signature_for_fields(
+        sink=candidate.sink,
+        expected_intercepts=candidate.expected_intercepts,
+    )
+
+
+def _slice_signature(candidate: Candidate) -> str:
+    return candidate_slice_signature_for_fields(entrypoint_hint=candidate.entrypoint_hint)
+
+
+def _merge_key(candidate: Candidate) -> tuple[str, str, int, str, str]:
+    return (
+        str(candidate.vuln_class).strip(),
+        str(candidate.file_path).strip(),
+        int(candidate.line),
+        _sink_signature(candidate),
+        _slice_signature(candidate),
     )
 
 
 def _merge_candidates_by_key(
     candidates: list[Candidate],
-) -> tuple[dict[str, tuple[str, str, int]], dict[str, tuple[str, str, int]], dict[tuple[str, str, int], Candidate], int]:
-    key_by_old_id: dict[str, tuple[str, str, int]] = {}
-    key_by_old_uid: dict[str, tuple[str, str, int]] = {}
-    merged: dict[tuple[str, str, int], Candidate] = {}
+) -> tuple[dict[str, tuple[str, str, int, str, str]], dict[str, tuple[str, str, int, str, str]], dict[tuple[str, str, int, str, str], Candidate], int]:
+    key_by_old_id: dict[str, tuple[str, str, int, str, str]] = {}
+    key_by_old_uid: dict[str, tuple[str, str, int, str, str]] = {}
+    merged: dict[tuple[str, str, int, str, str], Candidate] = {}
     dropped_nonsemantic = 0
     for cand in candidates:
-        key = (cand.vuln_class, cand.file_path, cand.line)
+        key = _merge_key(cand)
         key_by_old_id[cand.candidate_id] = key
         key_by_old_uid[cand.candidate_uid] = key
         if _semantic_score(cand) == 0:
@@ -91,7 +126,7 @@ def _merge_candidates_by_key(
         if current is None:
             merged[key] = replace(cand)
             continue
-        if _primary_candidate_rank(cand) > _primary_candidate_rank(current):
+        if _primary_candidate_rank(cand) < _primary_candidate_rank(current):
             replacement = replace(cand)
             _merge_candidate_fields(replacement, current)
             merged[key] = replacement
@@ -101,39 +136,50 @@ def _merge_candidates_by_key(
 
 
 def _assign_ids_and_boost(
-    merged: dict[tuple[str, str, int], Candidate],
+    merged: dict[tuple[str, str, int, str, str], Candidate],
     max_candidates: int,
-) -> tuple[list[Candidate], dict[tuple[str, str, int], tuple[str, str]], int]:
+) -> tuple[list[Candidate], dict[tuple[str, str, int, str, str], tuple[str, str]], int]:
+    for cand in merged.values():
+        cand.candidate_uid = candidate_uid_for_fields(
+            vuln_class=cand.vuln_class,
+            file_path=cand.file_path,
+            line=cand.line,
+            sink=cand.sink,
+            expected_intercepts=cand.expected_intercepts,
+            entrypoint_hint=cand.entrypoint_hint,
+            provenance=cand.provenance,
+        )
     merged_list = sorted(
         merged.items(),
         key=lambda item: (
-            -_semantic_score(item[1]),
-            -item[1].confidence,
+            _primary_candidate_rank(item[1]),
+            item[0],
             item[1].file_path,
             item[1].line,
             item[1].vuln_class,
+            item[1].candidate_uid,
+            item[1].candidate_id,
         ),
     )[:max_candidates]
 
     new_candidates: list[Candidate] = []
-    remap: dict[tuple[str, str, int], tuple[str, str]] = {}
+    remap: dict[tuple[str, str, int, str, str], tuple[str, str]] = {}
     dual_signal_candidates = 0
     for key, cand in merged_list:
         remap[key] = (cand.candidate_id, cand.candidate_uid)
         if _semantic_score(cand) >= 2:
             dual_signal_candidates += 1
             cand.confidence = min(1.0, cand.confidence + 0.1)
-            if "multi-signal-semantic" not in cand.notes:
-                cand.notes = f"{cand.notes}; multi-signal-semantic".strip("; ")
+            cand.notes = _merge_notes(cand.notes, "multi-signal-semantic")
         new_candidates.append(cand)
     return new_candidates, remap, dual_signal_candidates
 
 
 def _remap_static_evidence(
     static_evidence: list[StaticEvidence],
-    key_by_old_id: dict[str, tuple[str, str, int]],
-    key_by_old_uid: dict[str, tuple[str, str, int]],
-    remap: dict[tuple[str, str, int], tuple[str, str]],
+    key_by_old_id: dict[str, tuple[str, str, int, str, str]],
+    key_by_old_uid: dict[str, tuple[str, str, int, str, str]],
+    remap: dict[tuple[str, str, int, str, str], tuple[str, str]],
 ) -> list[StaticEvidence]:
     new_static: list[StaticEvidence] = []
     seen_hashes: set[tuple[str, str]] = set()
@@ -163,7 +209,16 @@ def _remap_static_evidence(
                 candidate_uid=candidate_uid,
             )
         )
-    return new_static
+    return sorted(
+        new_static,
+        key=lambda item: (
+            str(item.candidate_uid or ""),
+            str(item.file_path),
+            int(item.line),
+            str(item.query_id),
+            str(item.hash),
+        ),
+    )
 
 
 def _build_evidence_graph(

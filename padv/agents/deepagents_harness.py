@@ -11,7 +11,6 @@ import sqlite3
 import subprocess
 import threading
 import traceback
-import urllib.parse
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -23,11 +22,17 @@ from padv.agents.checkpoints import FileBackedMemorySaver
 from padv.analytics.failure_patterns import failure_penalty
 from padv.config.schema import PadvConfig
 from padv.models import (
+    CanaryMatchRule,
     Candidate,
     ExperimentAttempt,
     FailureAnalysis,
     Hypothesis,
+    HttpExpectations,
+    HttpStep,
+    NegativeControl,
     ObjectiveScore,
+    OracleSpec,
+    PlanBudget,
     Refutation,
     ResearchFinding,
     ResearchTask,
@@ -35,6 +40,7 @@ from padv.models import (
     WitnessBundle,
 )
 from padv.validation.contracts import apply_validation_profile, profile_for_vuln_class
+from padv.validation.preconditions import ensure_no_legacy_preconditions, merge_gate_preconditions
 
 try:
     from langchain.agents.middleware.types import AgentMiddleware  # type: ignore[import-not-found]
@@ -52,6 +58,7 @@ _TRIAGE_FIELDS = (
     "impact_gap",
     "missing_witness",
 )
+_PLAN_CANARY_PLACEHOLDER = "__PADV_CANARY__"
 
 
 class AgentExecutionError(RuntimeError):
@@ -84,7 +91,9 @@ class AgentSoftYield(RuntimeError):
 _INFLIGHT_HANDOFFS: dict[str, dict[str, Any]] = {}
 _INFLIGHT_HANDOFFS_LOCK = threading.Lock()
 _HANDOFF_CACHE_TTL_SECONDS = 3600
-_HANDOFF_CACHE_PROMPT_VERSION = "2026-04-05"
+_HANDOFF_CACHE_PROMPT_VERSION = "2026-04-06"
+_HANDOFF_CODE_SIGNATURE_CACHE: tuple[tuple[tuple[str, int, int], ...], str] | None = None
+_HANDOFF_CODE_SIGNATURE_LOCK = threading.Lock()
 _RUN_SCOPED_HANDOFF_CATEGORIES = frozenset(
     {
         "orient",
@@ -733,8 +742,8 @@ def _handoff_cache_key(
         "delegated_role": delegated_role or "",
         "response_contract": response_contract,
         "config_signature": _handoff_config_signature(config),
-        "code_version": PADV_VERSION,
-        "prompt_version": _HANDOFF_CACHE_PROMPT_VERSION,
+        "code_signature": _handoff_code_signature(),
+        "prompt_version": _handoff_prompt_version(),
         "run_scope": _handoff_cache_run_scope(session, category),
         "envelope": _normalize_cache_value(envelope),
     }
@@ -746,6 +755,43 @@ def _handoff_config_signature(config: PadvConfig) -> str:
     payload = asdict(config)
     serialized = json.dumps(payload, sort_keys=True, ensure_ascii=True, separators=(",", ":"))
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:16]
+
+
+def _handoff_code_signature_root() -> Path:
+    return Path(__file__).resolve().parents[2]
+
+
+def _handoff_code_signature() -> str:
+    global _HANDOFF_CODE_SIGNATURE_CACHE
+    root = _handoff_code_signature_root()
+    paths = [root / "padv.toml", *sorted((root / "padv").rglob("*.py"))]
+    snapshot: list[tuple[str, int, int]] = []
+    for path in paths:
+        if not path.exists():
+            continue
+        stat = path.stat()
+        snapshot.append((str(path.relative_to(root)), int(stat.st_mtime_ns), int(stat.st_size)))
+    snapshot_key = tuple(snapshot)
+    with _HANDOFF_CODE_SIGNATURE_LOCK:
+        cached = _HANDOFF_CODE_SIGNATURE_CACHE
+        if cached is not None and cached[0] == snapshot_key:
+            return cached[1]
+    hasher = hashlib.sha256()
+    hasher.update(PADV_VERSION.encode("utf-8"))
+    hasher.update(b"\0")
+    for relative_path, _mtime_ns, _size in snapshot_key:
+        hasher.update(relative_path.encode("utf-8"))
+        hasher.update(b"\0")
+        hasher.update((root / relative_path).read_bytes())
+        hasher.update(b"\0")
+    signature = hasher.hexdigest()[:16]
+    with _HANDOFF_CODE_SIGNATURE_LOCK:
+        _HANDOFF_CODE_SIGNATURE_CACHE = (snapshot_key, signature)
+    return signature
+
+
+def _handoff_prompt_version() -> str:
+    return str(_HANDOFF_CACHE_PROMPT_VERSION)
 
 
 def _handoff_cache_run_scope(session: AgentSession, category: str) -> str:
@@ -796,6 +842,10 @@ def _parse_cache_created_at(raw: Any) -> datetime | None:
 def _cache_entry_expired(created_at: datetime) -> bool:
     age = (datetime.now(tz=timezone.utc) - created_at).total_seconds()
     return age > float(_HANDOFF_CACHE_TTL_SECONDS)
+
+
+def _handoff_cache_enabled(config: PadvConfig) -> bool:
+    return not bool(getattr(config.agent, "deterministic_mode", False))
 
 
 def _store_handoff_cache(checkpoint_dir: str | None, cache_key: str, payload: dict[str, Any]) -> None:
@@ -1172,6 +1222,7 @@ def _compact_hypotheses(hypotheses: list[Hypothesis], *, limit: int = 6) -> list
                 "evidence_refs": list(item.evidence_refs)[:4],
                 "confidence": item.confidence,
                 "status": item.status,
+                "gate_preconditions": item.gate_preconditions.to_dict(),
                 "auth_requirements": list(item.auth_requirements)[:3],
                 "web_path_hints": list(item.web_path_hints)[:3],
                 "preconditions": list(item.preconditions)[:3],
@@ -2269,6 +2320,7 @@ def _invoke_agent_handoff(
     delegated_role: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     artifact_role = workspace_role or session.role
+    cache_enabled = _handoff_cache_enabled(config)
     cache_key = _handoff_cache_key(
         session,
         config=config,
@@ -2325,31 +2377,33 @@ def _invoke_agent_handoff(
             "cache_key": cache_key,
         }
 
-    cached = _load_handoff_cache(runtime.checkpoint_dir, cache_key)
-    if cached is not None:
-        _emit_shared_progress(
-            runtime.shared_context,
-            role=artifact_role,
-            status="cache_hit",
-            detail=f"{category} sqlite-exact",
-            step=category,
-            handoff_ref=handoff_ref,
-            cache_source="sqlite-exact",
-        )
-        return _cached_return(cached, cache_source="sqlite-exact")
+    inflight_entry: dict[str, Any] | None = None
+    if cache_enabled:
+        cached = _load_handoff_cache(runtime.checkpoint_dir, cache_key)
+        if cached is not None:
+            _emit_shared_progress(
+                runtime.shared_context,
+                role=artifact_role,
+                status="cache_hit",
+                detail=f"{category} sqlite-exact",
+                step=category,
+                handoff_ref=handoff_ref,
+                cache_source="sqlite-exact",
+            )
+            return _cached_return(cached, cache_source="sqlite-exact")
 
-    inflight_entry, is_leader = _acquire_inflight_handoff(cache_key)
-    if not is_leader:
-        inflight_entry["event"].wait()
-        if inflight_entry.get("error") is not None:
-            error = inflight_entry["error"]
-            if isinstance(error, Exception):
-                raise error
-            raise AgentExecutionError(str(error))
-        result = inflight_entry.get("result")
-        if isinstance(result, dict):
-            return _cached_return(result, cache_source="inflight-dedup")
-        raise AgentExecutionError(f"{session.role} identical handoff dedup wait ended without result")
+        inflight_entry, is_leader = _acquire_inflight_handoff(cache_key)
+        if not is_leader:
+            inflight_entry["event"].wait()
+            if inflight_entry.get("error") is not None:
+                error = inflight_entry["error"]
+                if isinstance(error, Exception):
+                    raise error
+                raise AgentExecutionError(str(error))
+            result = inflight_entry.get("result")
+            if isinstance(result, dict):
+                return _cached_return(result, cache_source="inflight-dedup")
+            raise AgentExecutionError(f"{session.role} identical handoff dedup wait ended without result")
 
     previous_active_category = _set_active_progress_category(runtime.shared_context, role=artifact_role, category=category)
     try:
@@ -2408,9 +2462,11 @@ def _invoke_agent_handoff(
             invocation_role=session.role,
             delegated_role=delegated_role,
         )
-        _store_handoff_cache(runtime.checkpoint_dir, cache_key, parsed)
+        if cache_enabled:
+            _store_handoff_cache(runtime.checkpoint_dir, cache_key, parsed)
         meta = _build_handoff_success_meta(handoff_ref, response_ref, session, artifact_role, delegated_role, cache_key, runtime)
-        _resolve_inflight_handoff(cache_key, result=parsed)
+        if cache_enabled:
+            _resolve_inflight_handoff(cache_key, result=parsed)
         return parsed, meta
     except Exception as exc:
         _emit_shared_progress(
@@ -2423,7 +2479,8 @@ def _invoke_agent_handoff(
             invocation_role=session.role,
             delegated_role=delegated_role,
         )
-        _resolve_inflight_handoff(cache_key, error=exc if isinstance(exc, Exception) else AgentExecutionError(str(exc)))
+        if cache_enabled:
+            _resolve_inflight_handoff(cache_key, error=exc if isinstance(exc, Exception) else AgentExecutionError(str(exc)))
         raise
     finally:
         _set_active_progress_category(runtime.shared_context, role=artifact_role, category=previous_active_category)
@@ -2829,6 +2886,10 @@ def _normalize_hypotheses(raw: Any) -> list[Hypothesis]:
                 confidence=float(item.get("confidence", candidate.confidence or 0.0)),
                 auth_requirements=list(candidate.auth_requirements),
                 preconditions=list(candidate.preconditions),
+                gate_preconditions=merge_gate_preconditions(
+                    candidate.gate_preconditions,
+                    item.get("gate_preconditions"),
+                ),
                 web_path_hints=list(candidate.web_path_hints),
                 metadata=_hypothesis_metadata(item),
             )
@@ -3342,395 +3403,6 @@ def schedule_actions_with_deepagents(
     return selected, selected_objective_scores, trace
 
 
-def _normalize_plan_string_list(value: Any) -> list[str]:
-    if not isinstance(value, list):
-        return []
-    return [str(x).strip() for x in value if str(x).strip()]
-
-
-def _normalize_oracle_function(value: str) -> str:
-    token = str(value).strip().replace("->", "::")
-    if not token:
-        return ""
-    match = re.match(r"^([A-Za-z_][A-Za-z0-9_:]*)\s*(?:\(\s*\))?$", token)
-    if match:
-        return match.group(1)
-    match = re.match(r"^([A-Za-z_][A-Za-z0-9_:]*)\s*\(", token)
-    if match:
-        return match.group(1)
-    return ""
-
-
-def _extract_path_hint(value: str, method: str | None = None) -> str:
-    text = str(value).strip()
-    if not text:
-        return ""
-    lowered = text.casefold()
-    if method:
-        method_lower = method.casefold()
-        match = re.search(rf"\b{re.escape(method_lower)}\b(?:\s+request\b.*?\bto\b|\s+)(/[A-Za-z0-9_./?&=%:-]+)", lowered)
-        if match:
-            return match.group(1)
-    match = re.search(r"\b(?:get|post|put|patch|delete|head|options)\b(?:\s+request\b.*?\bto\b|\s+)(/[A-Za-z0-9_./?&=%:-]+)", lowered)
-    if match:
-        return match.group(1)
-    if text.startswith("/"):
-        return text
-    return ""
-
-
-def _preferred_request_path_from_candidate(candidate: Candidate, request_expectations: list[str], method: str) -> str:
-    candidates: list[str] = []
-    if candidate.entrypoint_hint:
-        candidates.append(str(candidate.entrypoint_hint))
-    candidates.extend(str(x) for x in candidate.web_path_hints if str(x).strip())
-    candidates.extend(request_expectations)
-    for raw in candidates:
-        hint = _extract_path_hint(raw, method)
-        if hint and hint != "/":
-            return hint
-    return "/"
-
-
-def _classify_intercept_item(item: str, lowered: str) -> str:
-    """Return 'oracle', 'request', 'response', or 'skip' for a single intercept."""
-    if not item:
-        return "skip"
-    if re.match(r"^(get|post|put|patch|delete|head|options)\s+/", lowered):
-        return "request"
-    if lowered.startswith("content-type:") or lowered.startswith("soapaction:") or lowered.startswith("cookie:"):
-        return "request"
-    if lowered.startswith("http "):
-        return "response"
-    if "<" in item and ">" in item:
-        if any(marker in lowered for marker in ("<output", "<pre", "<script", "<html", "<body")):
-            return "response"
-        return "request"
-    if "/" in item and " " not in item and item.startswith("/"):
-        return "request"
-    if "=" in item and " " not in item and not item.startswith("uid=") and not item.startswith("www-data"):
-        return "request"
-    if any(marker in lowered for marker in ("uid=", "www-data", "root:x", "phpinfo", "fatal error", "warning:", "notice:")):
-        return "response"
-    return "oracle"
-
-
-def _split_intercepts(values: list[str]) -> tuple[list[str], list[str], list[str]]:
-    oracle_functions: list[str] = []
-    request_expectations: list[str] = []
-    response_witnesses: list[str] = []
-    for raw in values:
-        item = str(raw).strip()
-        lowered = item.casefold()
-        classification = _classify_intercept_item(item, lowered)
-        if classification == "request":
-            request_expectations.append(item)
-        elif classification == "response":
-            response_witnesses.append(item)
-        elif classification == "oracle":
-            oracle_functions.append(_normalize_oracle_function(item))
-    return (
-        sorted(dict.fromkeys(x for x in oracle_functions if x)),
-        sorted(dict.fromkeys(x for x in request_expectations if x)),
-        sorted(dict.fromkeys(x for x in response_witnesses if x)),
-    )
-
-
-def _inject_canary_value(value: str, canary_value: str) -> str:
-    stripped = str(value)
-    if canary_value in stripped:
-        return stripped
-    return f"{stripped} {canary_value}".strip()
-
-
-def _inject_canary_into_mapping(mapping: dict[str, str], canary_value: str, reserved_query_keys: set[str], fallback_key: str) -> dict[str, str]:
-    mutated = {str(k): str(v) for k, v in mapping.items()}
-    injected = False
-    for key in list(mutated.keys()):
-        if key.casefold() in reserved_query_keys:
-            continue
-        mutated[key] = _inject_canary_value(mutated[key], canary_value)
-        injected = True
-    if not injected:
-        mutated[fallback_key] = canary_value
-    return mutated
-
-
-def _inject_canary_into_xml(body_text: str, canary_value: str) -> str:
-    def _replace(match: re.Match[str]) -> str:
-        opening, content, closing = match.group(1), match.group(3), match.group(4)
-        content = content.strip()
-        if not content or canary_value in content:
-            return match.group(0)
-        return f"{opening}{_inject_canary_value(content, canary_value)}{closing}"
-
-    return re.sub(r"(<([A-Za-z0-9:_-]+)[^>]*>)([^<]+)(</\2>)", _replace, body_text)
-
-
-_ALLOWED_HTTP_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}
-
-
-def _normalize_request_body_string(
-    body_str: str,
-    canary_value: str,
-    reserved_query_keys: set[str],
-    fallback_key: str,
-    normalized: dict[str, Any],
-) -> None:
-    parsed: object | None = None
-    try:
-        parsed = json.loads(body_str)
-    except json.JSONDecodeError:
-        parsed = None
-    if isinstance(parsed, dict):
-        normalized["body"] = _inject_canary_into_mapping(
-            {str(k): str(v) for k, v in parsed.items()},
-            canary_value,
-            reserved_query_keys,
-            fallback_key,
-        )
-        normalized.setdefault("headers", {})
-        normalized["headers"].setdefault("Content-Type", "application/json")
-        return
-    if "=" in body_str and not body_str.startswith("<"):
-        form_pairs = urllib.parse.parse_qsl(body_str, keep_blank_values=True)
-        if form_pairs:
-            normalized["body"] = _inject_canary_into_mapping(dict(form_pairs), canary_value, reserved_query_keys, fallback_key)
-            normalized.setdefault("headers", {})
-            normalized["headers"].setdefault("Content-Type", "application/x-www-form-urlencoded")
-            return
-        normalized["body_text"] = _inject_canary_value(body_str, canary_value)
-        return
-    normalized["body_text"] = (
-        _inject_canary_into_xml(body_str, canary_value)
-        if body_str.startswith("<")
-        else _inject_canary_value(body_str, canary_value)
-    )
-    normalized.setdefault("headers", {})
-    if body_str.startswith("<"):
-        normalized["headers"].setdefault("Content-Type", "text/xml")
-
-
-def _normalize_plan_request(
-    req: dict[str, Any],
-    canary_value: str,
-    candidate: Candidate,
-    request_expectations: list[str],
-    reserved_query_keys: set[str],
-    fallback_key: str,
-) -> dict[str, Any]:
-    method_raw = req.get("method")
-    method = str(method_raw).strip().upper() if method_raw is not None else "GET"
-    if method not in _ALLOWED_HTTP_METHODS:
-        method = "GET"
-
-    path_raw = req.get("path")
-    path = str(path_raw).strip() if path_raw is not None else ""
-    if not path:
-        path = _preferred_request_path_from_candidate(candidate, request_expectations, method)
-    if not path.startswith("/"):
-        path = "/" + path
-
-    query = req.get("query")
-    if not isinstance(query, dict):
-        query = req.get("params")
-    if isinstance(query, dict):
-        q = _inject_canary_into_mapping({str(k): str(v) for k, v in query.items()}, canary_value, reserved_query_keys, fallback_key)
-    else:
-        q = {fallback_key: canary_value}
-
-    body = req.get("body")
-    headers = req.get("headers")
-    normalized: dict[str, Any] = {"method": method, "path": path, "query": q}
-    if isinstance(headers, dict):
-        normalized["headers"] = {str(k): str(v) for k, v in headers.items() if str(k).strip()}
-    if body is None:
-        return normalized
-    if isinstance(body, dict):
-        normalized["body"] = _inject_canary_into_mapping({str(k): str(v) for k, v in body.items()}, canary_value, reserved_query_keys, fallback_key)
-    elif isinstance(body, str):
-        _normalize_request_body_string(body.strip(), canary_value, reserved_query_keys, fallback_key, normalized)
-    else:
-        normalized["body_text"] = _inject_canary_value(str(body), canary_value)
-    return normalized
-
-
-def _request_transport(req: dict[str, Any]) -> str:
-    headers = req.get("headers")
-    content_type = ""
-    if isinstance(headers, dict):
-        content_type = str(
-            headers.get("Content-Type")
-            or headers.get("content-type")
-            or ""
-        ).casefold()
-    if "multipart/form-data" in content_type:
-        return "multipart"
-    if "application/json" in content_type:
-        return "json"
-    if "xml" in content_type or isinstance(req.get("body_text"), str) and str(req.get("body_text", "")).lstrip().startswith("<"):
-        return "xml"
-    if isinstance(req.get("body"), dict):
-        return "form"
-    return "query"
-
-
-def _neutralize_control_mapping(mapping: dict[str, Any], marker: str, canonical_class: str) -> dict[str, Any]:
-    result = {
-        str(k): ("1" if str(v).strip() else marker)
-        for k, v in mapping.items()
-    }
-    if result:
-        first = next(iter(result))
-        result[first] = marker if canonical_class == "xss_output_boundary" else "1"
-    return result
-
-
-def _neutralize_body_text(raw: str, canonical_class: str, marker: str) -> str:
-    if canonical_class == "xxe_influence":
-        cleaned = re.sub(r"<!DOCTYPE[^>]*>", "", raw, flags=re.IGNORECASE | re.DOTALL)
-        return re.sub(r"<!ENTITY[^>]*>", "", cleaned, flags=re.IGNORECASE | re.DOTALL)
-    if canonical_class == "command_injection_boundary":
-        return re.sub(r"[;&|`$><]", "", raw)
-    if canonical_class == "sql_injection_boundary":
-        return re.sub(r"(?i)(union|select|sleep|and|or|--|#|')", "", raw)
-    return marker
-
-
-def _neutralize_control_request(req: dict[str, Any], label: str, canonical_class: str) -> dict[str, Any]:
-    clone = copy.deepcopy(req)
-    marker = f"padv-negative-{label}"
-    if isinstance(clone.get("query"), dict):
-        clone["query"] = _neutralize_control_mapping(clone["query"], marker, canonical_class)
-    if isinstance(clone.get("body"), dict):
-        clone["body"] = _neutralize_control_mapping(clone["body"], marker, canonical_class)
-    if isinstance(clone.get("body_text"), str):
-        clone["body_text"] = _neutralize_body_text(str(clone["body_text"]), canonical_class, marker)
-    return clone
-
-
-
-def _resolve_plan_fields(
-    response: dict[str, Any],
-    candidate: Candidate,
-) -> tuple[list[str], list[str], list[str], list[str]]:
-    """Resolve oracle_functions, request_expectations, response_witnesses from response and candidate."""
-    original_intercepts = _normalize_plan_string_list(response.get("intercepts"))
-    oracle_functions_raw = response.get("oracle_functions")
-    request_expectations_raw = response.get("request_expectations")
-    response_witnesses_raw = response.get("response_witnesses")
-
-    allowed_oracle_functions = sorted(
-        {
-            normalized
-            for raw in [*(candidate.expected_intercepts or []), candidate.sink]
-            if raw is not None
-            if (normalized := _normalize_oracle_function(str(raw).strip()))
-        }
-    )
-    oracle_functions = sorted(
-        dict.fromkeys(
-            normalized
-            for normalized in (_normalize_oracle_function(x) for x in _normalize_plan_string_list(oracle_functions_raw))
-            if normalized
-        )
-    )
-    request_expectations = sorted(dict.fromkeys(_normalize_plan_string_list(request_expectations_raw)))
-    response_witnesses = sorted(dict.fromkeys(_normalize_plan_string_list(response_witnesses_raw)))
-
-    if original_intercepts and (not oracle_functions or not request_expectations or not response_witnesses):
-        split_oracle, split_request, split_response = _split_intercepts(original_intercepts)
-        if not oracle_functions:
-            oracle_functions = split_oracle
-        if not request_expectations:
-            request_expectations = split_request
-        if not response_witnesses:
-            response_witnesses = split_response
-
-    if allowed_oracle_functions:
-        oracle_functions = [item for item in oracle_functions if item in allowed_oracle_functions]
-    if not oracle_functions:
-        oracle_functions = list(allowed_oracle_functions)
-    if not oracle_functions:
-        oracle_functions = ["unknown"]
-
-    normalized_intercepts = sorted(
-        dict.fromkeys(
-            [*original_intercepts, *oracle_functions, *request_expectations, *response_witnesses]
-        )
-    )
-    return oracle_functions, request_expectations, response_witnesses, normalized_intercepts
-
-
-def _build_reserved_query_keys(config: PadvConfig) -> set[str]:
-    return {
-        config.canary.parameter_name.casefold(),
-        "page",
-        "popupnotificationcode",
-        "security_level",
-        "security-level",
-        "phpsessid",
-        "wsdl",
-    }
-
-
-def _filter_plan_requests(
-    items: list[dict[str, Any]],
-    *,
-    control: bool,
-    canary: str,
-    candidate: Candidate,
-    request_expectations: list[str],
-    reserved_query_keys: set[str],
-    fallback_key: str,
-    profile: Any,
-) -> list[dict[str, Any]]:
-    out: list[dict[str, Any]] = []
-    for idx, item in enumerate(items):
-        canary_value = "padv-negative-control" if control else canary
-        normalized = _normalize_plan_request(item, canary_value, candidate, request_expectations, reserved_query_keys, fallback_key)
-        if profile.allowed_transports:
-            transport = _request_transport(normalized)
-            if transport not in profile.allowed_transports:
-                continue
-        out.append(normalized)
-    return out
-
-
-def _ensure_positive_request_count(
-    positive_requests: list[dict[str, Any]],
-    min_count: int,
-    canary_param: str,
-) -> list[dict[str, Any]]:
-    if not positive_requests:
-        return positive_requests
-    while len(positive_requests) < min_count:
-        clone = dict(positive_requests[-1])
-        clone_query = dict(clone.get("query", {}))
-        clone_query[f"{canary_param}_step"] = str(len(positive_requests) + 1)
-        clone["query"] = clone_query
-        positive_requests.append(clone)
-    return positive_requests[:3]
-
-
-def _ensure_negative_request_count(
-    negative_requests: list[dict[str, Any]],
-    positive_requests: list[dict[str, Any]],
-    min_count: int,
-    canonical_class: str,
-) -> list[dict[str, Any]]:
-    if not negative_requests:
-        if not positive_requests:
-            return negative_requests
-        negative_requests = [_neutralize_control_request(positive_requests[0], "control-0", canonical_class)]
-    while len(negative_requests) < min_count and positive_requests:
-        source_idx = min(len(negative_requests), len(positive_requests) - 1)
-        negative_requests.append(
-            _neutralize_control_request(positive_requests[source_idx], f"control-{len(negative_requests)}", canonical_class)
-        )
-    return negative_requests
-
-
 def _normalize_validation_plan_response(
     candidate: Candidate,
     response: dict[str, Any],
@@ -3738,63 +3410,146 @@ def _normalize_validation_plan_response(
 ) -> ValidationPlan:
     candidate = apply_validation_profile(candidate)
     profile = profile_for_vuln_class(candidate.canonical_class or candidate.vuln_class)
-    pos = response.get("positive_requests")
-    neg = response.get("negative_requests")
-    if not isinstance(pos, list) or not isinstance(neg, list):
-        raise AgentExecutionError("deepagents plan response missing required list fields")
-
-    oracle_functions, request_expectations, response_witnesses, normalized_intercepts = _resolve_plan_fields(response, candidate)
     canary = f"padv-{candidate.candidate_id}-{uuid.uuid4().hex[:10]}"
-    reserved_query_keys = _build_reserved_query_keys(config)
-    fallback_key = config.canary.parameter_name
+    steps_raw = response.get("steps")
+    oracle_spec_raw = response.get("oracle_spec")
+    negative_controls_raw = response.get("negative_controls")
+    budgets_raw = response.get("budgets")
+    if not isinstance(steps_raw, list) or not isinstance(oracle_spec_raw, dict) or not isinstance(negative_controls_raw, list) or not isinstance(budgets_raw, dict):
+        raise AgentExecutionError("deepagents plan response must include steps, oracle_spec, negative_controls, and budgets")
 
-    filter_kwargs: dict[str, Any] = {
-        "canary": canary,
-        "candidate": candidate,
-        "request_expectations": request_expectations,
-        "reserved_query_keys": reserved_query_keys,
-        "fallback_key": fallback_key,
-        "profile": profile,
-    }
+    def _replace_placeholder(value: Any, replacement: str) -> Any:
+        if isinstance(value, str):
+            return value.replace(_PLAN_CANARY_PLACEHOLDER, replacement)
+        if isinstance(value, list):
+            return [_replace_placeholder(item, replacement) for item in value]
+        if isinstance(value, dict):
+            return {key: _replace_placeholder(item, replacement) for key, item in value.items()}
+        return value
 
-    positive_requests = _filter_plan_requests(
-        [req for req in pos if isinstance(req, dict)], control=False, **filter_kwargs,
-    )
-    if not positive_requests:
-        positive_requests = [{"method": "GET", "path": _preferred_request_path_from_candidate(candidate, request_expectations, "GET"), "query": {fallback_key: canary}}]
-    positive_requests = _ensure_positive_request_count(positive_requests, max(3, profile.min_positive_requests), fallback_key)
-
-    negative_requests = _filter_plan_requests(
-        [req for req in neg if isinstance(req, dict)], control=True, **filter_kwargs,
-    )
-    negative_requests = _ensure_negative_request_count(
-        negative_requests, positive_requests, max(1, profile.min_negative_controls), profile.canonical_class,
-    )
-
-    environment_requirements = sorted(
-        dict.fromkeys(
-            [str(x).strip() for x in [*candidate.preconditions, *candidate.auth_requirements] if str(x).strip()]
+    def _build_step(item: Any, *, field_name: str, idx: int) -> HttpStep:
+        if not isinstance(item, dict):
+            raise AgentExecutionError(f"deepagents plan {field_name}[{idx}] must be an object")
+        method = str(item.get("method", "")).strip().upper()
+        path = str(item.get("path", "")).strip()
+        url = str(item.get("url", "")).strip()
+        if not method or (not path and not url):
+            raise AgentExecutionError(f"deepagents plan {field_name}[{idx}] must define method and path/url")
+        expectations_raw = item.get("expectations", {})
+        if expectations_raw is None:
+            expectations_raw = {}
+        if not isinstance(expectations_raw, dict):
+            raise AgentExecutionError(f"deepagents plan {field_name}[{idx}].expectations must be an object")
+        body_type = str(item.get("body_type", "")).strip().casefold() or "none"
+        body = item.get("body")
+        if body_type in {"text", "xml"} and body is not None and not isinstance(body, str):
+            raise AgentExecutionError(f"deepagents plan {field_name}[{idx}].body must be a string for {body_type}")
+        return HttpStep(
+            method=method,
+            path=path,
+            url=url,
+            headers=item.get("headers", {}),
+            query=item.get("query", {}),
+            body_type=body_type,
+            body=body,
+            body_ref=item.get("body_ref", ""),
+            cookies=item.get("cookies", {}),
+            expectations=HttpExpectations(**expectations_raw),
         )
+
+    steps = [
+        _build_step(_replace_placeholder(item, canary), field_name="steps", idx=idx)
+        for idx, item in enumerate(steps_raw)
+    ]
+    if not steps:
+        raise AgentExecutionError("deepagents plan response must include at least one validation step")
+
+    oracle_functions = [
+        str(item).strip()
+        for item in oracle_spec_raw.get("oracle_functions", [])
+        if isinstance(item, (str, int, float)) and str(item).strip()
+    ]
+    if not oracle_functions:
+        raise AgentExecutionError("deepagents plan oracle_spec.oracle_functions must be a non-empty list")
+    canary_rules_raw = oracle_spec_raw.get("canary_rules", [])
+    if not isinstance(canary_rules_raw, list):
+        raise AgentExecutionError("deepagents plan oracle_spec.canary_rules must be a list")
+    oracle_spec = OracleSpec(
+        intercept_profile=str(oracle_spec_raw.get("intercept_profile", "default")).strip() or "default",
+        oracle_functions=oracle_functions,
+        canary_rules=[
+            CanaryMatchRule(**item)
+            for item in _replace_placeholder(canary_rules_raw, canary)
+            if isinstance(item, dict)
+        ],
     )
+
+    negative_controls: list[NegativeControl] = []
+    for idx, item in enumerate(negative_controls_raw):
+        if not isinstance(item, dict):
+            raise AgentExecutionError(f"deepagents plan negative_controls[{idx}] must be an object")
+        raw_step = item.get("step") if isinstance(item.get("step"), dict) else item
+        negative_controls.append(
+            NegativeControl(
+                label=str(item.get("label", "")).strip() or f"control-{idx}",
+                step=_build_step(
+                    _replace_placeholder(raw_step, f"{canary}-control-{idx}"),
+                    field_name="negative_controls",
+                    idx=idx,
+                ),
+                expect_clean=bool(item.get("expect_clean", True)),
+            )
+        )
+
+    max_requests = budgets_raw.get("max_requests")
+    max_time_s = budgets_raw.get("max_time_s")
+    if not isinstance(max_requests, int) or max_requests <= 0 or not isinstance(max_time_s, int) or max_time_s <= 0:
+        raise AgentExecutionError("deepagents plan budgets must include positive integer max_requests and max_time_s")
+    budgets = PlanBudget(max_requests=max_requests, max_time_s=max_time_s)
+
+    gate_preconditions = merge_gate_preconditions(
+        candidate.gate_preconditions,
+        response.get("gate_preconditions"),
+    )
+    if gate_preconditions.is_empty():
+        ensure_no_legacy_preconditions(
+            preconditions=candidate.preconditions,
+            auth_requirements=candidate.auth_requirements,
+        )
+    environment_requirements = []
+    if gate_preconditions.requires_auth:
+        environment_requirements.append("requires_auth")
+    if gate_preconditions.requires_session:
+        environment_requirements.append("requires_session")
+    if gate_preconditions.requires_csrf_token:
+        environment_requirements.append("requires_csrf_token")
+    if gate_preconditions.requires_upload:
+        environment_requirements.append("requires_upload")
+    if gate_preconditions.requires_seed:
+        environment_requirements.append("requires_seed")
+    environment_requirements.extend(f"requires_header:{item}" for item in gate_preconditions.requires_specific_header)
+    environment_requirements.extend(f"unknown_blocker:{item}" for item in gate_preconditions.unknown_blockers)
 
     return ValidationPlan(
         candidate_id=candidate.candidate_id,
-        oracle_functions=oracle_functions,
-        request_expectations=request_expectations,
-        response_witnesses=response_witnesses,
-        intercepts=normalized_intercepts,
-        positive_requests=positive_requests,
-        negative_requests=negative_requests,
+        intercepts=list(oracle_spec.oracle_functions),
+        positive_requests=[step.to_request_spec() for step in steps],
+        negative_requests=[control.step.to_request_spec() for control in negative_controls],
         validation_mode=profile.validation_mode,
         canonical_class=profile.canonical_class,
         class_contract_id=profile.class_contract_id,
+        gate_preconditions=gate_preconditions,
         environment_requirements=environment_requirements,
-        requests=list(positive_requests),
-        negative_controls=list(negative_requests),
+        requests=[step.to_request_spec() for step in steps],
+        negative_controls=negative_controls,
         canary=canary,
+        oracle_functions=list(oracle_spec.oracle_functions),
         strategy=str(response.get("strategy", "deepagents-plan")),
         negative_control_strategy=str(response.get("negative_control_strategy", "canary-mismatch")),
         plan_notes=[str(x) for x in response.get("plan_notes", []) if str(x).strip()],
+        steps=steps,
+        oracle_spec=oracle_spec,
+        budgets=budgets,
     )
 
 
@@ -3815,10 +3570,10 @@ def make_validation_plan_with_deepagents(
     )
     prompt = (
         "Create a strict HTTP validation plan for this PHP candidate. "
-        "Need exactly 3 positive and at least 1 negative request, deterministic canary injection, and a clean separation between oracle functions, request expectations, and response witnesses. "
+        "Return only structured JSON with no prose-derived request fields. "
+        "Use the literal placeholder __PADV_CANARY__ inside positive steps and oracle canary rules when a dynamic canary is needed. "
         "Prioritize reachable paths from web_path_hints and exploit-relevant parameters. "
-        'Return JSON: {"oracle_functions":[...], "request_expectations":[...], "response_witnesses":[...], "intercepts":[...], "positive_requests":[...], "negative_requests":[...], '
-        '"strategy":"...", "negative_control_strategy":"...", "plan_notes":[...]} '
+        'Return JSON: {"candidate_id":"...","steps":[{"method":"GET","path":"/...","headers":{},"query":{},"body_type":"none","body":null,"expectations":{"status_codes":[200],"body_must_contain":[],"body_must_not_contain":[],"header_must_include":{}}}],"oracle_spec":{"intercept_profile":"default","oracle_functions":["..."],"canary_rules":[{"location":"response_body","match_type":"contains","value":"__PADV_CANARY__"}]},"negative_controls":[{"label":"control-0","step":{"method":"GET","path":"/...","headers":{},"query":{},"body_type":"none","body":null,"expectations":{"status_codes":[200],"body_must_contain":[],"body_must_not_contain":[],"header_must_include":{}}},"expect_clean":true}],"budgets":{"max_requests":4,"max_time_s":15},"strategy":"...","negative_control_strategy":"...","plan_notes":[...]} '
         f"{class_hint} "
         f"Candidate: {json.dumps(candidate.to_dict(), ensure_ascii=True)} "
         f"Canary parameter: {config.canary.parameter_name}"
@@ -3850,11 +3605,10 @@ def _process_validation_plan_batch(
     payload = [cand.to_dict() for cand in batch]
     prompt = (
         "Create strict HTTP validation plans for each listed PHP web-security candidate. "
-        "Each plan needs exactly 3 positive and at least 1 negative request, deterministic canary injection, "
-        "and a clean separation between oracle functions, request expectations, and response witnesses. "
+        "Return only structured JSON with no prose-derived request fields. "
+        "Use the literal placeholder __PADV_CANARY__ inside positive steps and oracle canary rules when a dynamic canary is needed. "
         "Prioritize reachable paths from web_path_hints and exploit-relevant parameters. "
-        'Return JSON: {"plans":[{"candidate_id":"...","oracle_functions":[...],"request_expectations":[...],"response_witnesses":[...],"intercepts":[...],"positive_requests":[...],"'
-        '"negative_requests":[...],"strategy":"...","negative_control_strategy":"...","plan_notes":[...]}],'
+        'Return JSON: {"plans":[{"candidate_id":"...","steps":[{"method":"GET","path":"/...","headers":{},"query":{},"body_type":"none","body":null,"expectations":{"status_codes":[200],"body_must_contain":[],"body_must_not_contain":[],"header_must_include":{}}}],"oracle_spec":{"intercept_profile":"default","oracle_functions":["..."],"canary_rules":[{"location":"response_body","match_type":"contains","value":"__PADV_CANARY__"}]},"negative_controls":[{"label":"control-0","step":{"method":"GET","path":"/...","headers":{},"query":{},"body_type":"none","body":null,"expectations":{"status_codes":[200],"body_must_contain":[],"body_must_not_contain":[],"header_must_include":{}}},"expect_clean":true}],"budgets":{"max_requests":4,"max_time_s":15},"strategy":"...","negative_control_strategy":"...","plan_notes":[...]}],'
         '"notes":[...]}. '
         f"{class_hint} "
         f"Canary parameter: {config.canary.parameter_name}. "
@@ -4176,7 +3930,7 @@ def _plan_experiments_primary(
                 "defer_environmental_constraints": True,
             },
         },
-        response_contract='{"plans":[{"hypothesis_id":"...","candidate":{"candidate_id":"...","vuln_class":"...","title":"...","file_path":"...","line":1,"sink":"...","expected_intercepts":[...],"notes":"...","provenance":[...],"evidence_refs":[...],"confidence":0.0},"oracle_functions":[...],"request_expectations":[...],"response_witnesses":[...],"intercepts":[...],"positive_requests":[...],"negative_requests":[...],"strategy":"...","negative_control_strategy":"...","plan_notes":[...],"attempt_id":"...","plan_id":"...","request_refs":[...],"witness_goal":"...","status":"planned","analysis_flags":[...]}],"notes":[...]}',
+        response_contract='{"plans":[{"hypothesis_id":"...","candidate":{"candidate_id":"...","vuln_class":"...","title":"...","file_path":"...","line":1,"sink":"...","expected_intercepts":[...],"notes":"...","provenance":[...],"evidence_refs":[...],"confidence":0.0},"steps":[{"method":"GET","path":"/...","headers":{},"query":{},"body_type":"none","body":null,"expectations":{"status_codes":[200],"body_must_contain":[],"body_must_not_contain":[],"header_must_include":{}}}],"oracle_spec":{"intercept_profile":"default","oracle_functions":["..."],"canary_rules":[{"location":"response_body","match_type":"contains","value":"__PADV_CANARY__"}]},"negative_controls":[{"label":"control-0","step":{"method":"GET","path":"/...","headers":{},"query":{},"body_type":"none","body":null,"expectations":{"status_codes":[200],"body_must_contain":[],"body_must_not_contain":[],"header_must_include":{}}},"expect_clean":true}],"budgets":{"max_requests":4,"max_time_s":15},"strategy":"...","negative_control_strategy":"...","plan_notes":[...],"attempt_id":"...","plan_id":"...","request_refs":[...],"witness_goal":"...","status":"planned","analysis_flags":[...]}],"notes":[...]}',
         workspace_role="experiment",
     )
     plans, attempts = _normalize_experiment_attempts(parsed.get("plans", parsed), config)

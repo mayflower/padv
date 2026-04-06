@@ -125,6 +125,74 @@ def test_select_linked_evidence_preserves_static_attachments_after_fusion_via_ca
     assert {item.candidate_uid for item in selection.static_evidence} == {fused_candidates[0].candidate_uid}
 
 
+def test_select_linked_evidence_keeps_distinct_same_sink_slices_after_fusion() -> None:
+    config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
+    candidates = [
+        Candidate(
+            candidate_id="cand-slice-a",
+            vuln_class="sql_injection_boundary",
+            title="SQL boundary A",
+            file_path="src/a.php",
+            line=12,
+            sink="mysqli_query",
+            expected_intercepts=["mysqli_query"],
+            entrypoint_hint="GET /reports",
+            provenance=["joern"],
+            evidence_refs=["joern::sql::slice-a"],
+            confidence=0.7,
+        ),
+        Candidate(
+            candidate_id="cand-slice-b",
+            vuln_class="sql_injection_boundary",
+            title="SQL boundary B",
+            file_path="src/a.php",
+            line=12,
+            sink="mysqli_query",
+            expected_intercepts=["mysqli_query"],
+            entrypoint_hint="POST /admin/search",
+            provenance=["joern"],
+            evidence_refs=["joern::sql::slice-b"],
+            confidence=0.7,
+        ),
+    ]
+    static = [
+        StaticEvidence(
+            candidate_id="cand-slice-a",
+            candidate_uid=candidates[0].candidate_uid,
+            query_profile="default",
+            query_id="joern::sql::slice-a",
+            file_path="src/a.php",
+            line=12,
+            snippet="mysqli_query($db, $q_a)",
+            hash="hash-slice-a",
+        ),
+        StaticEvidence(
+            candidate_id="cand-slice-b",
+            candidate_uid=candidates[1].candidate_uid,
+            query_profile="default",
+            query_id="joern::sql::slice-b",
+            file_path="src/a.php",
+            line=12,
+            snippet="mysqli_query($db, $q_b)",
+            hash="hash-slice-b",
+        ),
+    ]
+
+    fused_candidates, fused_static = fuse_candidates(candidates, static, config)
+    selection = select_linked_evidence(fused_candidates, fused_static)
+
+    assert sorted(candidate.candidate_id for candidate in selection.candidates) == ["cand-slice-a", "cand-slice-b"]
+    assert sorted(item.query_id for item in selection.static_evidence) == ["joern::sql::slice-a", "joern::sql::slice-b"]
+    assert {
+        candidate_id: [item.query_id for item in items]
+        for candidate_id, items in selection.static_by_candidate.items()
+    } == {
+        "cand-slice-a": ["joern::sql::slice-a"],
+        "cand-slice-b": ["joern::sql::slice-b"],
+    }
+    assert len({candidate.candidate_uid for candidate in selection.candidates}) == 2
+
+
 def test_select_linked_evidence_avoids_quadratic_candidate_scans_for_exact_uid_matches(
     monkeypatch,
 ) -> None:

@@ -1,125 +1,26 @@
 from __future__ import annotations
 
-import re
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from typing import Any
 
 
-def _unique_append(items: list[str], value: str) -> None:
-    if value not in items:
-        items.append(value)
+class InvalidGatePreconditionsError(TypeError):
+    """Raised when decision-plane code receives legacy or malformed preconditions."""
 
 
-def _normalize_text(value: str) -> str:
-    return " ".join(str(value).strip().split())
-
-
-_AUTH_REQUIRED_PATTERNS = (
-    re.compile(r"\blogin required\b"),
-    re.compile(r"\bauthenticated user\b"),
-    re.compile(r"\bauthenticated session\b"),
-    re.compile(r"\bauthenticated\b"),
-    re.compile(r"\badmin session\b"),
-    re.compile(r"\badmin role\b"),
-    re.compile(r"\bprivileged\b"),
-    re.compile(r"\bauthori[sz]ed\b"),
-)
-
-_SESSION_REQUIRED_PATTERNS = (
-    re.compile(r"\bsession required\b"),
-    re.compile(r"\bauthenticated session\b"),
-    re.compile(r"\badmin session\b"),
-    re.compile(r"\bvalid session\b"),
-    re.compile(r"\bcookie\b"),
-    re.compile(r"\bphpsessid\b"),
-)
-
-_AUTH_NEGATION_PATTERNS = (
-    re.compile(r"\bunauthenticated access allowed\b"),
-    re.compile(r"\baccessible without authentication\b"),
-    re.compile(r"\bno authentication check\b"),
-    re.compile(r"\bno username/password required\b"),
-    re.compile(r"\bno jwt token required\b"),
-    re.compile(r"\banonymous access\b"),
-    re.compile(r"\bno special permissions\b"),
-    re.compile(r"\bno credentials required\b"),
-)
-
-_REQUEST_SHAPE_MARKERS = (
-    "for level",
-    "content-type:",
-    "http post request",
-    "http get request",
-    "post request",
-    "get request",
-    "post or get",
-    "soap request",
-    "soap envelope",
-    "soap 1.1",
-    "soapaction",
-    "json body",
-    "valid json",
-    "xml",
-    "multipart/form-data",
-    "parameter",
-    "query string",
-    "query must return",
-    "response",
-    "base query returns",
-    "matching 5 columns",
-    "match 5-column structure",
-    "union-based",
-    "boolean-blind",
-    "error-based",
-    "time-based",
-    "special uuid",
-)
-
-_ENVIRONMENT_MARKERS = (
-    "security level",
-    "security-level",
-    "security_level",
-    "satisfying precondition",
-    "$lprotectagainst",
-    "shell_exec()",
-    "shell_exec",
-    "mysql",
-    "public endpoint",
-    "database must be accessible",
-    "database accessible",
-    "error reporting",
-    "unix/linux system",
-    "web server",
-    "allowoverride",
-    "mod_mime",
-    "webroot path",
-    "write permissions",
-    "writable by",
-    "file_exists()",
-    "require_once()",
-    "session_start()",
-    "session must be initiated",
-    "automatically created",
-    "automatically happens on first request",
-    "standard php behavior",
-    "standard linux permission",
-    "populated with",
-)
-
-_UPLOAD_MARKERS = (
-    "file upload",
-    "upload webshell",
-    "upload_directory",
-    "multipart/form-data",
-    "uploaded_file_path",
-    "uploaded file",
-)
-
-_HEADER_REQUIREMENT_PATTERNS = (
-    (re.compile(r"\bx-csrf-token\b"), "x-csrf-token"),
-    (re.compile(r"\bcsrf-token\b"), "csrf-token"),
-    (re.compile(r"\bauthorization header\b"), "authorization"),
-    (re.compile(r"\bx-api-key\b"), "x-api-key"),
-)
+def _normalized_strings(values: Sequence[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if not isinstance(value, str):
+            raise InvalidGatePreconditionsError("gate precondition string fields must contain strings")
+        text = value.strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+    return out
 
 
 @dataclass(slots=True)
@@ -128,20 +29,29 @@ class GatePreconditions:
     requires_session: bool = False
     requires_csrf_token: bool = False
     requires_upload: bool = False
+    requires_seed: bool = False
     requires_specific_header: list[str] = field(default_factory=list)
     unknown_blockers: list[str] = field(default_factory=list)
 
-    def has_unresolved(self) -> bool:
-        return any(
+    def __post_init__(self) -> None:
+        self.requires_specific_header = _normalized_strings(self.requires_specific_header)
+        self.unknown_blockers = _normalized_strings(self.unknown_blockers)
+
+    def is_empty(self) -> bool:
+        return not any(
             [
                 self.requires_auth,
                 self.requires_session,
                 self.requires_csrf_token,
                 self.requires_upload,
+                self.requires_seed,
                 bool(self.requires_specific_header),
                 bool(self.unknown_blockers),
             ]
         )
+
+    def has_unresolved(self) -> bool:
+        return not self.is_empty()
 
     def reason(self) -> str:
         parts: list[str] = []
@@ -153,6 +63,8 @@ class GatePreconditions:
             parts.append("requires_csrf_token")
         if self.requires_upload:
             parts.append("requires_upload")
+        if self.requires_seed:
+            parts.append("requires_seed")
         if self.requires_specific_header:
             parts.append(f"requires_specific_header={','.join(self.requires_specific_header)}")
         if self.unknown_blockers:
@@ -161,80 +73,126 @@ class GatePreconditions:
             return "typed_preconditions_unresolved: none"
         return f"typed_preconditions_unresolved: {', '.join(parts)}"
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "requires_auth": self.requires_auth,
+            "requires_session": self.requires_session,
+            "requires_csrf_token": self.requires_csrf_token,
+            "requires_upload": self.requires_upload,
+            "requires_seed": self.requires_seed,
+            "requires_specific_header": list(self.requires_specific_header),
+            "unknown_blockers": list(self.unknown_blockers),
+        }
 
-def parse_gate_preconditions(raw_values: list[str]) -> GatePreconditions:
-    parsed = GatePreconditions()
-    for raw in raw_values:
-        text = _normalize_text(raw)
-        if not text:
+
+def _mapping_bool(
+    value: Mapping[str, object],
+    *,
+    key: str,
+    aliases: Sequence[str] = (),
+) -> bool:
+    for candidate in (key, *aliases):
+        if candidate not in value:
             continue
-        lowered = text.casefold()
+        raw = value[candidate]
+        if not isinstance(raw, bool):
+            raise InvalidGatePreconditionsError(f"gate preconditions field {key!r} must be a boolean")
+        return raw
+    return False
 
-        if lowered == "runtime-oracle-not-applicable":
+
+def _mapping_string_list(
+    value: Mapping[str, object],
+    *,
+    key: str,
+    aliases: Sequence[str] = (),
+) -> list[str]:
+    for candidate in (key, *aliases):
+        if candidate not in value:
             continue
-        if lowered == "auth-state-known":
-            parsed.requires_auth = True
-            continue
+        raw = value[candidate]
+        if raw is None:
+            return []
+        if not isinstance(raw, list):
+            raise InvalidGatePreconditionsError(f"gate preconditions field {key!r} must be a list of strings")
+        return _normalized_strings(raw)
+    return []
 
-        if any(pattern.search(lowered) for pattern in _AUTH_NEGATION_PATTERNS):
-            continue
 
-        matched = False
-        for pattern, header_name in _HEADER_REQUIREMENT_PATTERNS:
-            if pattern.search(lowered):
-                _unique_append(parsed.requires_specific_header, header_name)
-                matched = True
+def coerce_gate_preconditions(
+    value: GatePreconditions | Mapping[str, object] | None,
+) -> GatePreconditions:
+    if isinstance(value, GatePreconditions):
+        return GatePreconditions(
+            requires_auth=bool(value.requires_auth),
+            requires_session=bool(value.requires_session),
+            requires_csrf_token=bool(value.requires_csrf_token),
+            requires_upload=bool(value.requires_upload),
+            requires_seed=bool(value.requires_seed),
+            requires_specific_header=list(value.requires_specific_header),
+            unknown_blockers=list(value.unknown_blockers),
+        )
+    if value is None:
+        return GatePreconditions()
+    if isinstance(value, Mapping):
+        return GatePreconditions(
+            requires_auth=_mapping_bool(value, key="requires_auth"),
+            requires_session=_mapping_bool(value, key="requires_session"),
+            requires_csrf_token=_mapping_bool(value, key="requires_csrf_token", aliases=("requires_csrf",)),
+            requires_upload=_mapping_bool(value, key="requires_upload"),
+            requires_seed=_mapping_bool(value, key="requires_seed"),
+            requires_specific_header=_mapping_string_list(
+                value,
+                key="requires_specific_header",
+                aliases=("required_headers",),
+            ),
+            unknown_blockers=_mapping_string_list(value, key="unknown_blockers"),
+        )
+    raise InvalidGatePreconditionsError(
+        "gate preconditions must be a GatePreconditions object or structured mapping"
+    )
 
-        if "csrf" in lowered and "token" in lowered:
-            parsed.requires_csrf_token = True
-            matched = True
 
-        if any(marker in lowered for marker in _UPLOAD_MARKERS):
-            parsed.requires_upload = True
-            matched = True
+def merge_gate_preconditions(
+    *values: GatePreconditions | Mapping[str, object] | None,
+) -> GatePreconditions:
+    merged = GatePreconditions()
+    for value in values:
+        item = coerce_gate_preconditions(value)
+        merged.requires_auth = merged.requires_auth or item.requires_auth
+        merged.requires_session = merged.requires_session or item.requires_session
+        merged.requires_csrf_token = merged.requires_csrf_token or item.requires_csrf_token
+        merged.requires_upload = merged.requires_upload or item.requires_upload
+        merged.requires_seed = merged.requires_seed or item.requires_seed
+        merged.requires_specific_header = _normalized_strings(
+            [*merged.requires_specific_header, *item.requires_specific_header]
+        )
+        merged.unknown_blockers = _normalized_strings([*merged.unknown_blockers, *item.unknown_blockers])
+    return merged
 
-        if any(pattern.search(lowered) for pattern in _AUTH_REQUIRED_PATTERNS):
-            parsed.requires_auth = True
-            matched = True
 
-        if any(pattern.search(lowered) for pattern in _SESSION_REQUIRED_PATTERNS):
-            parsed.requires_session = True
-            matched = True
-
-        if matched:
-            continue
-
-        if any(marker in lowered for marker in _REQUEST_SHAPE_MARKERS):
-            continue
-        if any(marker in lowered for marker in _ENVIRONMENT_MARKERS):
-            continue
-
-        _unique_append(parsed.unknown_blockers, text)
-    return parsed
+def ensure_no_legacy_preconditions(
+    *,
+    preconditions: Sequence[str] | None = None,
+    auth_requirements: Sequence[str] | None = None,
+) -> None:
+    has_preconditions = bool(_normalized_strings(preconditions or []))
+    has_auth_requirements = bool(_normalized_strings(auth_requirements or []))
+    if not has_preconditions and not has_auth_requirements:
+        return
+    raise InvalidGatePreconditionsError(
+        "legacy candidate.preconditions/auth_requirements are not allowed in decision-plane APIs; "
+        "use gate_preconditions"
+    )
 
 
 def resolve_gate_preconditions(
-    parsed: GatePreconditions,
+    parsed: GatePreconditions | Mapping[str, object] | None,
     *,
     cookie_jar: dict[str, str] | None = None,
 ) -> GatePreconditions:
-    resolved = GatePreconditions(
-        requires_auth=parsed.requires_auth,
-        requires_session=parsed.requires_session,
-        requires_csrf_token=parsed.requires_csrf_token,
-        requires_upload=parsed.requires_upload,
-        requires_specific_header=list(parsed.requires_specific_header),
-        unknown_blockers=list(parsed.unknown_blockers),
-    )
+    resolved = coerce_gate_preconditions(parsed)
     if cookie_jar:
         resolved.requires_auth = False
         resolved.requires_session = False
     return resolved
-
-
-def coerce_gate_preconditions(value: GatePreconditions | list[str] | None) -> GatePreconditions:
-    if isinstance(value, GatePreconditions):
-        return value
-    if not value:
-        return GatePreconditions()
-    return parse_gate_preconditions([str(item) for item in value])

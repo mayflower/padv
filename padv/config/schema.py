@@ -101,6 +101,7 @@ class AgentConfig:
     use_deepagents: bool
     hard_fail: bool
     require_langgraph: bool
+    deterministic_mode: bool
     max_iterations: int
     max_agent_turns: int
     improvement_patience: int
@@ -340,6 +341,7 @@ def load_config(path: str | Path) -> PadvConfig:
             "use_deepagents",
             "hard_fail",
             "require_langgraph",
+            "deterministic_mode",
             "max_iterations",
             "max_agent_turns",
             "improvement_patience",
@@ -476,6 +478,7 @@ def load_config(path: str | Path) -> PadvConfig:
             use_deepagents=agent_use_deepagents,
             hard_fail=agent_hard_fail,
             require_langgraph=agent_require_langgraph,
+            deterministic_mode=_get_optional_bool(agent, "deterministic_mode", False),
             max_iterations=_get_int(agent, "max_iterations", min_value=1),
             max_agent_turns=_get_optional_int(agent, "max_agent_turns", 3, min_value=1),
             improvement_patience=_get_int(agent, "improvement_patience", min_value=0),

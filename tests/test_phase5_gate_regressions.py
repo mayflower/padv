@@ -8,6 +8,7 @@ from padv.config.schema import load_config
 from padv.gates.engine import evaluate_candidate
 from padv.models import RuntimeEvidence, StaticEvidence
 from padv.static.joern.query_sets import VULN_CLASS_SPECS
+from padv.validation.preconditions import GatePreconditions
 
 
 def _runtime(request_id: str) -> RuntimeEvidence:
@@ -53,7 +54,7 @@ def test_runtime_validatable_class_without_witness_never_validates(
         negative_runs=[_runtime("n1")],
         intercepts=intercepts,
         canary="padv-canary",
-        preconditions=[],
+        preconditions=GatePreconditions(),
         evidence_signals=["joern", "scip"],
         vuln_class=vuln_class,
     )

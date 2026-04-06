@@ -50,7 +50,12 @@ from padv.validation.contracts import (
     profile_for_vuln_class,
     witness_contract_for_vuln_class,
 )
-from padv.validation.preconditions import GatePreconditions, parse_gate_preconditions, resolve_gate_preconditions
+from padv.validation.preconditions import (
+    GatePreconditions,
+    ensure_no_legacy_preconditions,
+    merge_gate_preconditions,
+    resolve_gate_preconditions,
+)
 
 
 _HTTP_SIGNAL_CLASSES = {
@@ -95,8 +100,20 @@ def _validation_headers(config: PadvConfig, oracle_functions: list[str], correla
 
 
 def _oracle_functions(plan: ValidationPlan) -> list[str]:
-    values = plan.oracle_functions or plan.intercepts
+    values = plan.oracle_spec.oracle_functions or plan.oracle_functions or plan.intercepts
     return [str(x).strip() for x in values if str(x).strip()]
+
+
+def _plan_steps(plan: ValidationPlan) -> list[dict[str, Any]]:
+    if plan.steps:
+        return [step.to_request_spec() for step in plan.steps]
+    return list(plan.positive_requests)
+
+
+def _plan_negative_control_steps(plan: ValidationPlan) -> list[dict[str, Any]]:
+    if plan.negative_controls:
+        return [control.step.to_request_spec() for control in plan.negative_controls]
+    return list(plan.negative_requests)
 
 
 def _request_transport(request_spec: dict[str, Any]) -> str:
@@ -150,6 +167,44 @@ def _display_arg(arg: str) -> str:
     return arg[:24] + "..." + arg[-12:]
 
 
+def _call_arg_rules(plan: ValidationPlan) -> list[Any]:
+    return [
+        rule
+        for rule in getattr(plan.oracle_spec, "canary_rules", [])
+        if str(getattr(rule, "location", "")).strip().casefold() == "call_arg"
+    ]
+
+
+def _match_call_arg_rule(arg: str, expected: str, match_type: str) -> bool:
+    if match_type == "exact":
+        return arg == expected
+    if match_type == "contains":
+        return expected in arg
+    return False
+
+
+def _call_matches_canary_rules(call: RuntimeCall, plan: ValidationPlan, config: PadvConfig) -> bool:
+    rules = _call_arg_rules(plan)
+    if not rules:
+        return any(_contains_canary(arg, plan.canary, config) for arg in call.args)
+    for rule in rules:
+        expected = str(getattr(rule, "value", "") or plan.canary)
+        if not expected:
+            continue
+        match_type = str(getattr(rule, "match_type", "contains")).strip().casefold() or "contains"
+        arg_index = getattr(rule, "arg_index", None)
+        if arg_index is not None:
+            if arg_index < 0 or arg_index >= len(call.args):
+                continue
+            if _match_call_arg_rule(str(call.args[arg_index]), expected, match_type):
+                return True
+            continue
+        for arg in call.args:
+            if _match_call_arg_rule(str(arg), expected, match_type):
+                return True
+    return False
+
+
 def _oracle_evidence(runtime: RuntimeEvidence, plan: ValidationPlan, config: PadvConfig) -> list[OracleEvidence]:
     intercepts = {x.strip().casefold() for x in _oracle_functions(plan)}
     out: list[OracleEvidence] = []
@@ -166,7 +221,7 @@ def _oracle_evidence(runtime: RuntimeEvidence, plan: ValidationPlan, config: Pad
                 line=int(call.line or 0),
                 full_args=full_args,
                 display_args=[_display_arg(arg) for arg in full_args],
-                matched_canary=any(_contains_canary(arg, plan.canary, config) for arg in full_args),
+                matched_canary=_call_matches_canary_rules(call, plan, config),
             )
         )
     return out
@@ -418,12 +473,20 @@ def _looks_like_login(response: Any) -> bool:
 
 def _normalize_gate_preconditions(
     candidate: Candidate,
+    plan: ValidationPlan | None,
     cookie_jar: dict[str, str],
     config: PadvConfig,
 ) -> GatePreconditions:
     del config
-    raw_values = [str(item) for item in [*candidate.preconditions, *candidate.auth_requirements] if str(item).strip()]
-    parsed = parse_gate_preconditions(raw_values)
+    parsed = merge_gate_preconditions(
+        candidate.gate_preconditions,
+        getattr(plan, "gate_preconditions", None),
+    )
+    if parsed.is_empty():
+        ensure_no_legacy_preconditions(
+            preconditions=candidate.preconditions,
+            auth_requirements=candidate.auth_requirements,
+        )
     return resolve_gate_preconditions(parsed, cookie_jar=cookie_jar)
 
 
@@ -450,9 +513,8 @@ def _has_class_oracle_witness(
         function = str(call.function or "").strip().casefold()
         if intercepts and function not in intercepts:
             continue
-        for arg in call.args:
-            if _contains_canary(str(arg), plan.canary, config):
-                return True
+        if _call_matches_canary_rules(call, plan, config):
+            return True
     return False
 
 
@@ -748,7 +810,7 @@ def _run_positive_phase(
     positive_runs: list[RuntimeEvidence] = []
     repro_ids: list[str] = []
     budget = request_budget_remaining
-    for idx, request_spec in enumerate(plan.positive_requests[:3]):
+    for idx, request_spec in enumerate(_plan_steps(plan)):
         if budget <= 0 or monotonic() >= candidate_deadline:
             break
         req_id = new_request_id(candidate.candidate_id, "pos", idx)
@@ -796,7 +858,7 @@ def _run_negative_phase(
     cookie_jar = ctx.cookie_jar
     negative_runs: list[RuntimeEvidence] = []
     budget = request_budget_remaining
-    for idx, request_spec in enumerate(plan.negative_requests):
+    for idx, request_spec in enumerate(_plan_negative_control_steps(plan)):
         if budget <= 0 or monotonic() >= candidate_deadline:
             break
         req_id = new_request_id(candidate.candidate_id, "neg", idx)
@@ -898,9 +960,10 @@ def _run_differential_phase(
     budget = request_budget_remaining
     if not config.differential.enabled or not needs_differential(candidate.vuln_class):
         return pairs, 0
-    if not positive_runs or not plan.positive_requests:
+    plan_steps = _plan_steps(plan)
+    if not positive_runs or not plan_steps:
         return pairs, 0
-    base_request = plan.positive_requests[0]
+    base_request = plan_steps[0]
     levels = _resolve_differential_levels(config)
     for diff_idx, level in enumerate(levels):
         if budget <= 0 or monotonic() >= candidate_deadline:
@@ -1001,8 +1064,8 @@ def _build_skipped_bundle(
                 "validation_mode": plan.validation_mode,
                 "canonical_class": plan.canonical_class,
                 "class_contract_id": plan.class_contract_id,
-                "positive_request_count": len(plan.positive_requests),
-                "negative_request_count": len(plan.negative_requests),
+                "positive_request_count": len(_plan_steps(plan)),
+                "negative_request_count": len(_plan_negative_control_steps(plan)),
             },
         },
         bundle_type=_bundle_type_for_decision(decision),
@@ -1063,20 +1126,23 @@ def _sanitize_exports(
 def _build_planner_trace(
     candidate_hypotheses: list[dict[str, Any]], plan: ValidationPlan, attempts: list[dict[str, Any]],
 ) -> dict[str, Any]:
+    plan_steps = _plan_steps(plan)
+    typed_negative_controls = plan.negative_controls or []
+    negative_control_steps = _plan_negative_control_steps(plan)
     return {
         "hypotheses": candidate_hypotheses,
         "validation_plan": {
             "candidate_id": plan.candidate_id, "validation_mode": plan.validation_mode,
             "canonical_class": plan.canonical_class, "class_contract_id": plan.class_contract_id,
-            "oracle_functions": list(_oracle_functions(plan)),
-            "request_expectations": list(plan.request_expectations),
-            "response_witnesses": list(plan.response_witnesses), "intercepts": list(plan.intercepts),
+            "oracle_spec": plan.oracle_spec.to_dict(),
             "environment_requirements": list(plan.environment_requirements),
-            "requests": list(plan.requests or plan.positive_requests),
-            "negative_controls": list(plan.negative_controls or plan.negative_requests),
+            "steps": [step.to_dict() for step in plan.steps],
+            "requests": list(plan_steps),
+            "negative_controls": [control.to_dict() for control in typed_negative_controls] or negative_control_steps,
+            "budgets": plan.budgets.to_dict(),
             "strategy": plan.strategy, "negative_control_strategy": plan.negative_control_strategy,
-            "positive_request_count": len(plan.positive_requests),
-            "negative_request_count": len(plan.negative_requests), "plan_notes": list(plan.plan_notes),
+            "positive_request_count": len(plan_steps),
+            "negative_request_count": len(negative_control_steps), "plan_notes": list(plan.plan_notes),
         },
         "attempts": attempts,
     }
@@ -1121,21 +1187,26 @@ def _validate_single_candidate_runtime(
     if plan is None:
         raise RuntimeError(f"missing agent-generated validation plan for candidate: {candidate.candidate_id}")
     candidate_deadline = min(run_deadline, monotonic() + float(config.budgets.max_seconds_per_candidate))
+    if plan.budgets.max_time_s > 0:
+        candidate_deadline = min(candidate_deadline, monotonic() + float(plan.budgets.max_time_s))
+    effective_request_budget = request_budget_remaining
+    if plan.budgets.max_requests > 0:
+        effective_request_budget = min(effective_request_budget, plan.budgets.max_requests)
     total_cost = 0
     session = HttpSession.from_cookie_jar(ctx.cookie_jar)
 
     positive_runs, repro_ids, pos_cost = _run_positive_phase(
-        ctx, candidate, plan, request_budget_remaining, candidate_deadline, attempts, seen_flags, session,
+        ctx, candidate, plan, effective_request_budget, candidate_deadline, attempts, seen_flags, session,
     )
     total_cost += pos_cost
 
     negative_runs, neg_cost = _run_negative_phase(
-        ctx, candidate, plan, request_budget_remaining - total_cost, candidate_deadline, attempts, seen_flags, session,
+        ctx, candidate, plan, effective_request_budget - total_cost, candidate_deadline, attempts, seen_flags, session,
     )
     total_cost += neg_cost
 
     differential_pairs, diff_cost = _run_differential_phase(
-        ctx, candidate, plan, positive_runs, request_budget_remaining - total_cost, candidate_deadline, attempts, seen_flags,
+        ctx, candidate, plan, positive_runs, effective_request_budget - total_cost, candidate_deadline, attempts, seen_flags,
     )
     total_cost += diff_cost
     witness_contract = witness_contract_for_vuln_class(candidate.canonical_class or candidate.vuln_class)
@@ -1205,7 +1276,9 @@ def _prepare_validation_target(
         plan=plans_by_candidate.get(prepared.candidate_id),
         static_evidence=candidate_static,
         evidence_signals=_collect_evidence_signals(candidate_static, prepared),
-        preconditions=_normalize_gate_preconditions(prepared, ctx.cookie_jar, ctx.config),
+        preconditions=_normalize_gate_preconditions(
+            prepared, plans_by_candidate.get(prepared.candidate_id), ctx.cookie_jar, ctx.config
+        ),
     )
 
 

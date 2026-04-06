@@ -133,7 +133,7 @@ def _evaluate_v5(
 ) -> GateResult | None:
     if len(in_scope_positive_runs) < 2 or len(in_scope_negative_runs) < 1:
         return GateResult("DROPPED", passed, "V5", "insufficient repro runs")
-    if any(run.overflow or run.result_truncated for run in in_scope_positive_runs + in_scope_negative_runs):
+    if any(run.overflow or run.arg_truncated or run.result_truncated for run in in_scope_positive_runs + in_scope_negative_runs):
         return GateResult("DROPPED", passed, "V5", "runtime evidence truncated")
     return None
 
@@ -145,7 +145,7 @@ def evaluate_candidate(
     negative_runs: list[RuntimeEvidence],
     intercepts: list[str],
     canary: str,
-    preconditions: GatePreconditions | list[str],
+    preconditions: GatePreconditions | None,
     evidence_signals: list[str] | None = None,
     vuln_class: str | None = None,
     differential_pairs: list[DifferentialPair] | None = None,

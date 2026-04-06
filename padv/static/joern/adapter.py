@@ -20,6 +20,7 @@ from padv.models import Candidate, StaticEvidence
 from padv.path_scope import is_app_candidate_path, normalize_repo_path
 from padv.static.joern.query_sets import VULN_CLASS_SPECS, VulnClassSpec, intercepts_for_class
 from padv.taxonomy import canonicalize_vuln_class
+from padv.validation.preconditions import GatePreconditions
 
 
 class JoernExecutionError(RuntimeError):
@@ -57,11 +58,9 @@ def _hash_for(file_path: str, line: int, text: str) -> str:
     return hashlib.sha256(payload).hexdigest()[:16]
 
 
-def _preconditions_for_spec(spec: VulnClassSpec, config: PadvConfig) -> list[str]:
-    return (
-        (["auth-state-known"] if config.auth.enabled else [])
-        + ([] if spec.runtime_validatable else ["runtime-oracle-not-applicable"])
-    )
+def _preconditions_for_spec(spec: VulnClassSpec, config: PadvConfig) -> GatePreconditions:
+    del spec
+    return GatePreconditions(requires_auth=bool(config.auth.enabled))
 
 
 def _make_candidate_and_evidence(
@@ -86,12 +85,13 @@ def _make_candidate_and_evidence(
         sink=sink,
         expected_intercepts=intercepts_for_class(spec.vuln_class),
         entrypoint_hint=None,
-        preconditions=_preconditions_for_spec(spec, config),
+        preconditions=[],
         notes=notes,
         provenance=(["manifest"] if query_id.startswith("manifest::") else ["joern"]),
         evidence_refs=[evidence_ref],
         confidence=(0.55 if query_id.startswith("manifest::") else 0.6),
-        auth_requirements=(["login"] if config.auth.enabled else []),
+        auth_requirements=[],
+        gate_preconditions=_preconditions_for_spec(spec, config),
         web_path_hints=[],
     )
     candidate.canonical_class = canonicalize_vuln_class(spec.vuln_class)

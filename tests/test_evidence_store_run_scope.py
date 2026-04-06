@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from padv.models import Candidate, EvidenceBundle, GateResult, RunSummary, StaticEvidence
-from padv.store.evidence_store import CorruptStoreArtifactError, EvidenceStore
+from padv.store.evidence_store import CorruptStoreArtifactError, EvidenceStore, RunIdRequiredError
 
 
 def _candidate(candidate_id: str, title: str) -> Candidate:
@@ -126,3 +126,28 @@ def test_corrupt_run_scoped_candidates_raise_typed_error(tmp_path: Path) -> None
     except CorruptStoreArtifactError as exc:
         assert exc.path == path
         assert exc.artifact_kind == "candidates"
+
+
+def test_unscoped_bundle_load_requires_run_id(tmp_path: Path) -> None:
+    store = EvidenceStore(tmp_path)
+    run_a = store.for_run("run-a")
+    run_b = store.for_run("run-b")
+
+    shared_id = "bundle-shared-candidate"
+    cand_a = _candidate("cand-a", "SQL injection A")
+    cand_b = _candidate("cand-b", "SQL injection B")
+
+    bundle_a = _bundle("run-a", cand_a)
+    bundle_b = _bundle("run-b", cand_b)
+    bundle_a.bundle_id = shared_id
+    bundle_b.bundle_id = shared_id
+
+    run_a.save_bundle(bundle_a)
+    run_b.save_bundle(bundle_b)
+
+    try:
+        store.load_bundle(shared_id)
+        raise AssertionError("expected unscoped bundle load to require run_id")
+    except RunIdRequiredError as exc:
+        assert exc.method == "load_bundle"
+        assert exc.artifact_kind == "bundle"

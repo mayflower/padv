@@ -266,7 +266,10 @@ def _cmd_list(args: argparse.Namespace) -> int:
     if args.kind == "candidates":
         _print_json([c.to_dict() for c in scoped_store.load_candidates()])
     elif args.kind == "bundles":
-        _print_json(scoped_store.list_bundle_ids())
+        if args.run_id:
+            _print_json(scoped_store.list_bundle_ids())
+        else:
+            _print_json(store.list_bundle_ids_legacy_lookup())
     elif args.kind == "resumes":
         _print_json(store.list_resume_metadata())
     else:
@@ -284,7 +287,11 @@ def _cmd_show(args: argparse.Namespace) -> int:
         return 2
 
     if args.bundle_id:
-        bundle = store.for_run(args.scope_run_id).load_bundle(args.bundle_id) if args.scope_run_id else store.load_bundle(args.bundle_id)
+        bundle = (
+            store.for_run(args.scope_run_id).load_bundle(args.bundle_id)
+            if args.scope_run_id
+            else store.load_bundle_legacy_lookup(args.bundle_id)
+        )
         if bundle is None:
             _print_json({"error": f"bundle not found: {args.bundle_id}"})
             return 1

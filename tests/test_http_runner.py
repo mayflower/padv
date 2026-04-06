@@ -4,6 +4,7 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from threading import Thread
+from urllib.parse import parse_qs
 from urllib.error import HTTPError
 
 import pytest
@@ -172,3 +173,92 @@ def test_http_session_isolated_between_candidates() -> None:
     assert candidate_one.cookies == {"sessionid": "abc123"}
     assert candidate_two.cookies == {}
     assert seen_cookie_headers == ["", "sessionid=abc123", ""]
+
+
+def test_http_session_reuses_cookie_and_cached_token_for_csrf_flow() -> None:
+    seen_requests: list[tuple[str, str, str]] = []
+
+    class _CsrfHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            seen_requests.append((self.command, self.path, self.headers.get("Cookie", "")))
+            if self.path == "/login":
+                self.send_response(200)
+                self.send_header("Set-Cookie", "sessionid=abc123; Path=/; HttpOnly")
+                self.end_headers()
+                self.wfile.write(b"logged-in")
+                return
+            if self.path == "/token":
+                if "sessionid=abc123" not in self.headers.get("Cookie", ""):
+                    self.send_response(401)
+                    self.end_headers()
+                    self.wfile.write(b"missing-cookie")
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"csrf_token":"token-123"}')
+                return
+            self.send_response(404)
+            self.end_headers()
+
+        def do_POST(self) -> None:  # noqa: N802
+            content_length = int(self.headers.get("Content-Length", "0") or "0")
+            body = self.rfile.read(content_length).decode("utf-8", errors="replace")
+            seen_requests.append((self.command, f"{self.path}?{body}", self.headers.get("Cookie", "")))
+            if self.path != "/action":
+                self.send_response(404)
+                self.end_headers()
+                return
+            form = parse_qs(body, keep_blank_values=True)
+            if "sessionid=abc123" not in self.headers.get("Cookie", ""):
+                self.send_response(401)
+                self.end_headers()
+                self.wfile.write(b"missing-cookie")
+                return
+            if form.get("csrf_token") != ["token-123"]:
+                self.send_response(403)
+                self.end_headers()
+                self.wfile.write(b"missing-token")
+                return
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"action-ok")
+
+        def log_message(self, format: str, *args) -> None:  # pragma: no cover
+            return
+
+    session = HttpSession()
+    with _serve(_CsrfHandler) as base_url:
+        login = send_request(
+            url=f"{base_url}/login",
+            method="GET",
+            headers={},
+            timeout_seconds=5,
+            session=session,
+        )
+        token = send_request(
+            url=f"{base_url}/token",
+            method="GET",
+            headers={},
+            timeout_seconds=5,
+            session=session,
+        )
+        action = send_request(
+            url=f"{base_url}/action",
+            method="POST",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            timeout_seconds=5,
+            body={"csrf_token": "{{token:csrf_token}}", "action": "apply"},
+            session=session,
+        )
+
+    assert login.status_code == 200
+    assert token.status_code == 200
+    assert action.status_code == 200
+    assert session.cookies == {"sessionid": "abc123"}
+    assert session.tokens == {"csrf_token": "token-123"}
+    assert seen_requests == [
+        ("GET", "/login", ""),
+        ("GET", "/token", "sessionid=abc123"),
+        ("POST", "/action?csrf_token=token-123&action=apply", "sessionid=abc123"),
+    ]

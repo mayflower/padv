@@ -30,10 +30,8 @@ from padv.agents.deepagents_harness import (
     _store_handoff_cache,
     _handoff_turn_checklist,
     _handoff_work_guidance,
-    _inject_canary_into_xml,
     _invoke_agent_session_with_timeout,
     _limit_primary_objectives,
-    _normalize_plan_request,
     clone_runtime_for_parallel_role,
     _extract_json,
     _normalize_experiment_attempts,
@@ -56,6 +54,7 @@ from padv.agents.deepagents_harness import (
 )
 from padv.config.schema import load_config
 from padv.models import Candidate, Hypothesis, ObjectiveScore, ResearchFinding, ValidationPlan
+from padv.validation.preconditions import GatePreconditions, InvalidGatePreconditionsError
 
 
 def _candidate() -> Candidate:
@@ -86,6 +85,52 @@ def _candidate2() -> Candidate:
         provenance=["source", "web"],
         confidence=0.6,
     )
+
+
+def _structured_plan_payload(
+    candidate_id: str,
+    *,
+    path: str = "/",
+    method: str = "GET",
+    query: dict[str, object] | None = None,
+    body_type: str = "none",
+    body: object = None,
+    headers: dict[str, str] | None = None,
+    oracle_functions: list[str] | None = None,
+    negative_query: dict[str, object] | None = None,
+    negative_body: object = None,
+    max_requests: int = 4,
+    max_time_s: int = 15,
+) -> dict[str, object]:
+    step = {
+        "method": method,
+        "path": path,
+        "headers": headers or {},
+        "query": query or {},
+        "body_type": body_type,
+        "body": body,
+        "expectations": {"status_codes": [200], "body_must_contain": [], "body_must_not_contain": [], "header_must_include": {}},
+    }
+    negative_step = {
+        "method": method,
+        "path": path,
+        "headers": headers or {},
+        "query": negative_query or {},
+        "body_type": body_type,
+        "body": negative_body,
+        "expectations": {"status_codes": [200], "body_must_contain": [], "body_must_not_contain": [], "header_must_include": {}},
+    }
+    return {
+        "candidate_id": candidate_id,
+        "steps": [step],
+        "oracle_spec": {
+            "intercept_profile": "default",
+            "oracle_functions": oracle_functions or ["mysqli_query"],
+            "canary_rules": [{"location": "response_body", "match_type": "contains", "value": "__PADV_CANARY__"}],
+        },
+        "negative_controls": [{"label": "control-0", "step": negative_step, "expect_clean": True}],
+        "budgets": {"max_requests": max_requests, "max_time_s": max_time_s},
+    }
 
 
 def _scip_candidate() -> Candidate:
@@ -433,18 +478,8 @@ def test_make_validation_plans_batch_returns_multiple_plans(monkeypatch: pytest.
         "padv.agents.deepagents_harness._invoke_deepagent_json",
         lambda *args, **kwargs: {
             "plans": [
-                {
-                    "candidate_id": "cand-1",
-                    "intercepts": ["mysqli_query"],
-                    "positive_requests": [{"method": "GET", "path": "/", "query": {"x": "1"}}] * 3,
-                    "negative_requests": [{"method": "GET", "path": "/", "query": {"x": "0"}}],
-                },
-                {
-                    "candidate_id": "cand-2",
-                    "intercepts": ["curl_exec"],
-                    "positive_requests": [{"method": "GET", "path": "/", "query": {"y": "1"}}] * 3,
-                    "negative_requests": [{"method": "GET", "path": "/", "query": {"y": "0"}}],
-                },
+                _structured_plan_payload("cand-1", query={"x": "__PADV_CANARY__"}),
+                _structured_plan_payload("cand-2", query={"y": "__PADV_CANARY__"}, oracle_functions=["curl_exec"]),
             ]
         },
     )
@@ -453,6 +488,8 @@ def test_make_validation_plans_batch_returns_multiple_plans(monkeypatch: pytest.
     assert sorted(plans.keys()) == ["cand-1", "cand-2"]
     assert plans["cand-1"].candidate_id == "cand-1"
     assert plans["cand-2"].candidate_id == "cand-2"
+    assert plans["cand-1"].steps[0].query["x"].startswith("padv-cand-1-")
+    assert plans["cand-2"].oracle_spec.oracle_functions == ["curl_exec"]
     assert trace["engine"] == "deepagents"
     assert trace["planned"] == 2
 
@@ -463,12 +500,7 @@ def test_make_validation_plans_batch_raises_for_missing_candidates(monkeypatch: 
         "padv.agents.deepagents_harness._invoke_deepagent_json",
         lambda *args, **kwargs: {
             "plans": [
-                {
-                    "candidate_id": "cand-1",
-                    "intercepts": ["mysqli_query"],
-                    "positive_requests": [{"method": "GET", "path": "/", "query": {"x": "1"}}] * 3,
-                    "negative_requests": [{"method": "GET", "path": "/", "query": {"x": "0"}}],
-                }
+                _structured_plan_payload("cand-1", query={"x": "__PADV_CANARY__"})
             ]
         },
     )
@@ -477,7 +509,7 @@ def test_make_validation_plans_batch_raises_for_missing_candidates(monkeypatch: 
         make_validation_plans_with_deepagents([_candidate(), _candidate2()], config, batch_size=2)
 
 
-def test_make_validation_plans_batch_normalizes_short_positive_count(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_make_validation_plans_batch_rejects_legacy_request_schema(monkeypatch: pytest.MonkeyPatch) -> None:
     config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
     monkeypatch.setattr(
         "padv.agents.deepagents_harness._invoke_deepagent_json",
@@ -493,93 +525,42 @@ def test_make_validation_plans_batch_normalizes_short_positive_count(monkeypatch
         },
     )
 
-    plans, trace = make_validation_plans_with_deepagents([_candidate()], config, batch_size=1)
-    assert "cand-1" in plans
-    assert len(plans["cand-1"].positive_requests) == 3
-    assert len(plans["cand-1"].negative_requests) >= 1
-    assert trace["planned"] == 1
+    with pytest.raises(AgentExecutionError, match="steps, oracle_spec, negative_controls, and budgets"):
+        make_validation_plans_with_deepagents([_candidate()], config, batch_size=1)
 
 
-def test_make_validation_plans_batch_normalizes_string_body(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_make_validation_plans_batch_preserves_structured_step_body(monkeypatch: pytest.MonkeyPatch) -> None:
     config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
     monkeypatch.setattr(
         "padv.agents.deepagents_harness._invoke_deepagent_json",
         lambda *args, **kwargs: {
             "plans": [
-                {
-                    "candidate_id": "cand-1",
-                    "oracle_functions": ["mysqli_query"],
-                    "request_expectations": ["POST /submit", "raw=payload"],
-                    "response_witnesses": ["HTTP 200"],
-                    "intercepts": ["mysqli_query", "POST /submit", "HTTP 200"],
-                    "positive_requests": [
-                        {"method": "POST", "path": "submit", "query": {"x": "1"}, "body": "raw=payload"}
-                    ],
-                    "negative_requests": [{"method": "POST", "path": "submit", "body": "neg"}],
-                }
+                _structured_plan_payload(
+                    "cand-1",
+                    method="POST",
+                    path="/submit",
+                    query={"x": "1"},
+                    body_type="text",
+                    body="raw=payload",
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    negative_body="neg",
+                )
             ]
         },
     )
 
     plans, _trace = make_validation_plans_with_deepagents([_candidate()], config, batch_size=1)
+    step = plans["cand-1"].steps[0]
     req = plans["cand-1"].positive_requests[0]
-    assert req["path"] == "/submit"
-    assert isinstance(req["body"], dict)
-    assert "raw" in req["body"]
+    assert step.path == "/submit"
+    assert step.body_type == "text"
+    assert step.body == "raw=payload"
+    assert req["body_text"] == "raw=payload"
     assert req["headers"]["Content-Type"] == "application/x-www-form-urlencoded"
     assert plans["cand-1"].oracle_functions == ["mysqli_query"]
-    assert plans["cand-1"].request_expectations == ["POST /submit", "raw=payload"]
-    assert plans["cand-1"].response_witnesses == ["HTTP 200"]
 
 
-def test_make_validation_plans_splits_mixed_intercepts_into_clean_channels(monkeypatch: pytest.MonkeyPatch) -> None:
-    config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
-    candidate = Candidate(
-        candidate_id="cand-1",
-        vuln_class="command_injection",
-        title="Command injection candidate",
-        file_path="src/cmd.php",
-        line=21,
-        sink="shell_exec",
-        expected_intercepts=["shell_exec"],
-        notes="test",
-        provenance=["source"],
-        confidence=0.8,
-    )
-    monkeypatch.setattr(
-        "padv.agents.deepagents_harness._invoke_deepagent_json",
-        lambda *args, **kwargs: {
-            "plans": [
-                {
-                    "candidate_id": "cand-1",
-                    "intercepts": [
-                        "shell_exec(\"echo test\")",
-                        "POST /webservices/soap/ws-echo.php",
-                        "SOAPAction: urn:echowsdl#echoMessage",
-                        "<message>test</message>",
-                        "<output>uid=",
-                        "HTTP 200",
-                    ],
-                    "positive_requests": [{"method": "POST", "path": "webservices/soap/ws-echo.php", "body": "<message>test</message>"}],
-                    "negative_requests": [{"method": "POST", "path": "webservices/soap/ws-echo.php", "body": "<message>neg</message>"}],
-                }
-            ]
-        },
-    )
-
-    plans, _trace = make_validation_plans_with_deepagents([candidate], config, batch_size=1)
-    plan = plans["cand-1"]
-    assert plan.oracle_functions == ["shell_exec"]
-    assert "POST /webservices/soap/ws-echo.php" in plan.request_expectations
-    assert "SOAPAction: urn:echowsdl#echoMessage" in plan.request_expectations
-    assert "<message>test</message>" in plan.request_expectations
-    assert "<output>uid=" in plan.response_witnesses
-    assert "HTTP 200" in plan.response_witnesses
-    assert plan.positive_requests[0]["headers"]["Content-Type"] == "text/xml"
-    assert "body_text" in plan.positive_requests[0]
-
-
-def test_make_validation_plans_discards_non_function_oracle_expressions(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_make_validation_plans_batch_rejects_step_without_path_or_url(monkeypatch: pytest.MonkeyPatch) -> None:
     config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
     monkeypatch.setattr(
         "padv.agents.deepagents_harness._invoke_deepagent_json",
@@ -587,47 +568,35 @@ def test_make_validation_plans_discards_non_function_oracle_expressions(monkeypa
             "plans": [
                 {
                     "candidate_id": "cand-1",
-                    "oracle_functions": [
-                        "response.status_code == 200",
-                        "any(tool.get('tool_name') for tool in rows)",
-                        "'application/json' in response.headers.get('Content-Type', '')",
-                    ],
-                    "request_expectations": ["POST /submit"],
-                    "response_witnesses": ["HTTP 200"],
-                    "positive_requests": [{"method": "POST", "path": "/submit", "query": {"x": "1"}}] * 3,
-                    "negative_requests": [{"method": "POST", "path": "/submit", "query": {"x": "0"}}],
+                    "steps": [{"method": "POST", "headers": {"Content-Type": "text/xml"}, "body_type": "xml", "body": "<message>test</message>", "expectations": {}}],
+                    "oracle_spec": {"intercept_profile": "default", "oracle_functions": ["shell_exec"], "canary_rules": []},
+                    "negative_controls": [],
+                    "budgets": {"max_requests": 1, "max_time_s": 10},
                 }
             ]
         },
     )
 
-    plans, _trace = make_validation_plans_with_deepagents([_candidate()], config, batch_size=1)
-    assert plans["cand-1"].oracle_functions == ["mysqli_query"]
+    with pytest.raises(AgentExecutionError, match="must define method and path/url"):
+        make_validation_plans_with_deepagents([_candidate()], config, batch_size=1)
 
 
-def test_make_validation_plans_infers_request_path_from_candidate_hints_when_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_make_validation_plans_discards_invalid_budget_values(monkeypatch: pytest.MonkeyPatch) -> None:
     config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
-    candidate = _candidate()
-    candidate.web_path_hints = ["/ajax/lookup-pen-test-tool.php", "/index.php?page=pen-test-tool-lookup-ajax.php"]
     monkeypatch.setattr(
         "padv.agents.deepagents_harness._invoke_deepagent_json",
         lambda *args, **kwargs: {
             "plans": [
                 {
-                    "candidate_id": "cand-1",
-                    "oracle_functions": ["mysqli_query"],
-                    "request_expectations": ["GET request to /ajax/lookup-pen-test-tool.php"],
-                    "response_witnesses": ["HTTP 200"],
-                    "positive_requests": [{"method": "GET", "query": {"ToolID": "1"}}] * 3,
-                    "negative_requests": [{"method": "GET", "query": {"ToolID": "0"}}],
+                    **_structured_plan_payload("cand-1"),
+                    "budgets": {"max_requests": 0, "max_time_s": 0},
                 }
             ]
         },
     )
 
-    plans, _trace = make_validation_plans_with_deepagents([candidate], config, batch_size=1)
-    assert plans["cand-1"].positive_requests[0]["path"] == "/ajax/lookup-pen-test-tool.php"
-    assert plans["cand-1"].negative_requests[0]["path"] == "/ajax/lookup-pen-test-tool.php"
+    with pytest.raises(AgentExecutionError, match="budgets must include positive integer"):
+        make_validation_plans_with_deepagents([_candidate()], config, batch_size=1)
 
 
 def test_make_validation_plans_applies_runtime_contract_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -639,14 +608,15 @@ def test_make_validation_plans_applies_runtime_contract_metadata(monkeypatch: py
         "padv.agents.deepagents_harness._invoke_deepagent_json",
         lambda *args, **kwargs: {
             "plans": [
-                {
-                    "candidate_id": "cand-1",
-                    "oracle_functions": ["mysqli_query"],
-                    "request_expectations": ["POST /ajax/lookup-pen-test-tool.php"],
-                    "response_witnesses": ["HTTP 200"],
-                    "positive_requests": [{"method": "POST", "path": "/ajax/lookup-pen-test-tool.php", "body": "ToolID=1' UNION SELECT"}],
-                    "negative_requests": [{"method": "POST", "path": "/ajax/lookup-pen-test-tool.php", "body": "ToolID=1"}],
-                }
+                _structured_plan_payload(
+                    "cand-1",
+                    method="POST",
+                    path="/ajax/lookup-pen-test-tool.php",
+                    body_type="text",
+                    body="ToolID=__PADV_CANARY__",
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    negative_body="ToolID=1",
+                )
             ]
         },
     )
@@ -655,8 +625,9 @@ def test_make_validation_plans_applies_runtime_contract_metadata(monkeypatch: py
     assert plan.validation_mode == "runtime"
     assert plan.canonical_class == "sql_injection_boundary"
     assert plan.class_contract_id == "runtime:sql_injection_boundary"
-    assert len(plan.negative_controls) >= 2
+    assert len(plan.negative_controls) == 1
     assert plan.requests == plan.positive_requests
+    assert plan.budgets.max_requests == 4
 
 
 def test_normalize_experiment_attempts_canonicalizes_variant_candidate_ids() -> None:
@@ -675,11 +646,15 @@ def test_normalize_experiment_attempts_canonicalizes_variant_candidate_ids() -> 
                     "expected_intercepts": ["mysqli::query"],
                     "evidence_refs": ["cand-00010", "joern::sql_boundary:src/ajax/lookup-pen-test-tool.php:113"],
                 },
-                "oracle_functions": ["mysqli::query"],
-                "request_expectations": ["POST /ajax/lookup-pen-test-tool.php"],
-                "response_witnesses": ["HTTP 200"],
-                "positive_requests": [{"method": "POST", "path": "/ajax/lookup-pen-test-tool.php", "body": "ToolID=1"}] * 3,
-                "negative_requests": [{"method": "POST", "path": "/ajax/lookup-pen-test-tool.php", "body": "ToolID=0"}],
+                **_structured_plan_payload(
+                    "cand-00010-union",
+                    method="POST",
+                    path="/ajax/lookup-pen-test-tool.php",
+                    body_type="text",
+                    body="ToolID=__PADV_CANARY__",
+                    negative_body="ToolID=0",
+                    oracle_functions=["mysqli::query"],
+                ),
             }
         ],
         config,
@@ -1064,6 +1039,7 @@ def test_normalize_hypotheses_coerces_structured_auth_and_preconditions() -> Non
     candidate = hypotheses[0].candidate
     assert candidate.auth_requirements == ['{"description": "default insecure", "type": "none"}']
     assert candidate.preconditions == ['{"condition": "security_level=0", "status": "default"}']
+    assert candidate.gate_preconditions == GatePreconditions()
 
 
 def test_normalize_hypotheses_accepts_single_hypothesis_object() -> None:
@@ -1582,47 +1558,39 @@ def test_compact_hypotheses_truncates_and_limits_payload() -> None:
     assert len(compact[0]["candidate"]["evidence_refs"]) == 4
 
 
-def test_inject_canary_into_xml_updates_element_text() -> None:
-    body = (
-        "<?xml version='1.0'?>"
-        "<SOAP-ENV:Envelope>"
-        "<SOAP-ENV:Body><ns1:lookupDNS><targetHost>127.0.0.1; id</targetHost>"
-        "</ns1:lookupDNS></SOAP-ENV:Body></SOAP-ENV:Envelope>"
-    )
-
-    mutated = _inject_canary_into_xml(body, "padv-canary-123")
-
-    assert "127.0.0.1; id padv-canary-123" in mutated
-
-
-def test_normalize_plan_request_injects_canary_into_xml_body_text() -> None:
+def test_make_validation_plans_batch_rejects_legacy_candidate_preconditions(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
     candidate = _candidate()
-    candidate.vuln_class = "command_injection"
-    candidate.web_path_hints = ["/webservices/soap/ws-dns-lookup.php"]
-    req = {
-        "method": "POST",
-        "path": "/webservices/soap/ws-dns-lookup.php",
-        "headers": {"Content-Type": "text/xml; charset=utf-8"},
-        "body": (
-            "<?xml version='1.0'?>"
-            "<SOAP-ENV:Envelope><SOAP-ENV:Body><ns1:lookupDNS>"
-            "<targetHost>127.0.0.1; id</targetHost>"
-            "</ns1:lookupDNS></SOAP-ENV:Body></SOAP-ENV:Envelope>"
-        ),
-    }
-
-    normalized = _normalize_plan_request(
-        req,
-        "padv-canary-xml",
-        candidate,
-        ["POST to /webservices/soap/ws-dns-lookup.php", "SOAP envelope with lookupDNS method"],
-        {"padv_canary"},
-        "padv_canary",
+    candidate.preconditions = ["POST to /webservices/soap/ws-dns-lookup.php"]
+    monkeypatch.setattr(
+        "padv.agents.deepagents_harness._invoke_deepagent_json",
+        lambda *args, **kwargs: {
+            "plans": [
+                _structured_plan_payload(
+                    candidate.candidate_id,
+                    method="POST",
+                    path="/webservices/soap/ws-dns-lookup.php",
+                    body_type="xml",
+                    body=(
+                        "<?xml version='1.0'?>"
+                        "<SOAP-ENV:Envelope><SOAP-ENV:Body><ns1:lookupDNS>"
+                        "<targetHost>127.0.0.1; id</targetHost>"
+                        "</ns1:lookupDNS></SOAP-ENV:Body></SOAP-ENV:Envelope>"
+                    ),
+                    headers={"Content-Type": "text/xml; charset=utf-8"},
+                    negative_body=(
+                        "<?xml version='1.0'?>"
+                        "<SOAP-ENV:Envelope><SOAP-ENV:Body><ns1:lookupDNS>"
+                        "<targetHost>127.0.0.1</targetHost>"
+                        "</ns1:lookupDNS></SOAP-ENV:Body></SOAP-ENV:Envelope>"
+                    ),
+                )
+            ]
+        },
     )
 
-    assert normalized["query"]["padv_canary"] == "padv-canary-xml"
-    assert "padv-canary-xml" in normalized["body_text"]
-    assert "127.0.0.1; id padv-canary-xml" in normalized["body_text"]
+    with pytest.raises(InvalidGatePreconditionsError, match="legacy candidate.preconditions/auth_requirements"):
+        make_validation_plans_with_deepagents([candidate], config, batch_size=1)
 
 
 def test_orient_root_agent_rejects_non_final_continue_response(
@@ -2466,11 +2434,11 @@ def test_experiment_subagent_accepts_single_turn_when_requirements_are_met(
                 {
                     "hypothesis_id": "hyp-001",
                     "candidate": candidate,
-                    "intercepts": ["mysqli_query"],
-                    "positive_requests": [
-                        {"method": "GET", "path": "/admin.php", "params": {"id": "1' OR '1'='1"}}
-                    ],
-                    "negative_requests": [{"method": "GET", "path": "/admin.php", "params": {"id": "1"}}],
+                    **_structured_plan_payload(
+                        candidate["candidate_id"],
+                        path="/admin.php",
+                        query={"id": "__PADV_CANARY__"},
+                    ),
                     "strategy": "sql boolean",
                     "negative_control_strategy": "benign id",
                     "plan_notes": ["test"],
@@ -2577,11 +2545,12 @@ def test_experiment_subagent_accepts_single_plan_object(
                 "line": hypothesis.candidate.line,
                 "sink": hypothesis.candidate.sink,
                 "expected_intercepts": hypothesis.candidate.expected_intercepts,
-                "oracle_functions": ["mysqli_query"],
-                "request_expectations": ["GET request to /ajax/lookup-pen-test-tool.php"],
-                "response_witnesses": ["error output contains canary"],
-                "positive_requests": [{"method": "GET", "path": "/ajax/lookup-pen-test-tool.php", "query": {"ToolID": "1"}}] * 3,
-                "negative_requests": [{"method": "GET", "path": "/ajax/lookup-pen-test-tool.php", "query": {"ToolID": "0"}}],
+                **_structured_plan_payload(
+                    hypothesis.candidate.candidate_id,
+                    path="/ajax/lookup-pen-test-tool.php",
+                    query={"ToolID": "__PADV_CANARY__"},
+                    negative_query={"ToolID": "0"},
+                ),
                 "strategy": "direct single-plan response",
                 "plan_notes": ["single object"],
             },
@@ -3038,6 +3007,39 @@ def test_handoff_cache_key_changes_when_config_signature_changes(
     assert key_a != key_b
 
 
+def test_handoff_cache_key_changes_when_prompt_version_changes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config, runtime = _runtime_config(tmp_path, monkeypatch)
+    session = runtime.root
+    envelope = {
+        "frontier_state": {"iteration": 1, "coverage": {"files": ["src/a.php"]}},
+        "discovery_trace": {"semantic_count": 1},
+    }
+
+    key_a = _handoff_cache_key(
+        session,
+        config=config,
+        category="source_research",
+        envelope=envelope,
+        response_contract='{"tasks":[],"findings":[],"notes":[]}',
+        workspace_role="source",
+        delegated_role=None,
+    )
+    monkeypatch.setattr("padv.agents.deepagents_harness._HANDOFF_CACHE_PROMPT_VERSION", "2026-04-07")
+    key_b = _handoff_cache_key(
+        session,
+        config=config,
+        category="source_research",
+        envelope=envelope,
+        response_contract='{"tasks":[],"findings":[],"notes":[]}',
+        workspace_role="source",
+        delegated_role=None,
+    )
+
+    assert key_a != key_b
+
+
 def test_handoff_cache_ignores_stale_sqlite_entry(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -3064,6 +3066,67 @@ def test_handoff_cache_ignores_stale_sqlite_entry(
     monkeypatch.setattr("padv.agents.deepagents_harness._HANDOFF_CACHE_TTL_SECONDS", 1)
 
     assert _load_handoff_cache(runtime.checkpoint_dir, key) is None
+
+
+def test_research_handoff_deterministic_mode_always_misses_cache(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config, runtime = _runtime_config(tmp_path, monkeypatch)
+    config.agent.deterministic_mode = True
+    objective = _objective()
+    calls = {"count": 0}
+
+    def _fake_invoke(session, prompt, _config):
+        calls["count"] += 1
+        _append_tool_call(runtime, "source", f"source/tool_calls/no-cache-{calls['count']}.json", "search_repo_text")
+        _append_worklog(runtime, "source", f"source/worklog/no-cache-{calls['count']}.json")
+        return {
+            "tasks": [
+                {
+                    "task_id": f"source-task-{calls['count']}",
+                    "target_ref": "cand-1",
+                    "prompt": "inspect source",
+                    "status": "done",
+                }
+            ],
+            "findings": [
+                {
+                    "finding_id": f"source-finding-{calls['count']}",
+                    "title": "source finding",
+                    "summary": "summary",
+                    "evidence_refs": ["ev-1"],
+                    "file_refs": ["src/a.php"],
+                    "web_paths": ["/"],
+                    "params": ["id"],
+                    "sink_refs": ["mysqli_query"],
+                }
+            ],
+            "notes": [f"final-{calls['count']}"],
+        }
+
+    monkeypatch.setattr("padv.agents.deepagents_harness.invoke_agent_session_json", _fake_invoke)
+
+    _tasks1, _findings1, trace1 = run_research_subagent(
+        runtime,
+        "source",
+        config,
+        objective=objective,
+        frontier_state={},
+    )
+    _tasks2, _findings2, trace2 = run_research_subagent(
+        runtime,
+        "source",
+        config,
+        objective=objective,
+        frontier_state={},
+    )
+
+    assert calls["count"] == 2
+    assert trace1["cache_hit"] is False
+    assert trace2["cache_hit"] is False
+    assert trace1["cache_source"] == ""
+    assert trace2["cache_source"] == ""
+    assert not Path(runtime.checkpoint_dir, "handoff_cache.sqlite").exists()
 
 
 def test_parallel_role_runtime_uses_isolated_shared_context_and_merge() -> None:

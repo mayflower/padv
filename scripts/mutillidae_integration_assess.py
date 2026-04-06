@@ -17,7 +17,9 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from padv.eval.integration_assessment import RequirementResult, classify_failure, matrix_to_gap_list
+from padv.models import default_candidate_outcomes, explicit_candidate_outcome_for_decision
 from padv.store.evidence_store import EvidenceStore
+from padv.taxonomy import canonicalize_vuln_class
 
 PADV_STORE = ROOT_DIR / ".padv"
 APP_COMPOSE_FILE = ROOT_DIR / "docker-compose.mutillidae.yml"
@@ -127,6 +129,31 @@ def _safe_json_parse(text: str) -> dict[str, Any] | None:
 
 
 _GRAPH_STAGE_RE = re.compile(r"^(?P<index>\d+)-(?P<stage>[^.]+)\.json$")
+_REASON_TOKEN_RE = re.compile(r"[^a-z0-9]+")
+
+_ASSESSMENT_CATEGORY_BY_CANONICAL_CLASS: dict[str, str] = {
+    "sql_injection_boundary": "sql_injection",
+    "xss_output_boundary": "cross_site_scripting",
+    "command_injection_boundary": "command_injection",
+    "broken_access_control": "authn_authz_failures",
+    "idor_invariant_missing": "authn_authz_failures",
+    "auth_and_session_failures": "authn_authz_failures",
+    "session_misuse": "session_misuse",
+    "session_fixation_invariant": "session_misuse",
+    "csrf": "csrf",
+    "csrf_invariant": "csrf",
+    "csrf_invariant_missing": "csrf",
+    "file_boundary_influence": "file_inclusion_path_traversal",
+    "ldap_injection_boundary": "ldap_injection",
+    "xxe_influence": "xxe_xml_injection",
+    "xml_dos_boundary": "xxe_xml_injection",
+    "file_upload_influence": "unrestricted_file_upload",
+    "header_injection_boundary": "open_redirect_header_cookie_manipulation",
+    "header_cookie_manipulation": "open_redirect_header_cookie_manipulation",
+    "information_disclosure": "information_disclosure_misconfiguration",
+    "security_misconfiguration": "information_disclosure_misconfiguration",
+    "debug_output_leak": "information_disclosure_misconfiguration",
+}
 
 
 def _latest_graph_progress(prefix: str) -> dict[str, Any] | None:
@@ -375,7 +402,7 @@ def run_analyze_stabilization(output_dir: Path, max_attempts: int, analyze_timeo
             timeout_seconds=analyze_timeout,
         )
         parsed = _safe_json_parse(res.stdout)
-        recovered = _graph_progress_for_run(requested_run_id) or _latest_graph_progress("analyze")
+        recovered = _graph_progress_for_run(requested_run_id)
         observed = parsed if isinstance(parsed, dict) else recovered
         has_counts = isinstance(observed, dict) and int(observed.get("candidates", 0)) > 0 and int(observed.get("static_evidence", 0)) > 0
         completed = isinstance(recovered, dict) and bool(recovered.get("completed"))
@@ -421,7 +448,7 @@ def run_strict_run_stabilization(output_dir: Path, max_attempts: int, run_timeou
             timeout_seconds=run_timeout,
         )
         parsed = _safe_json_parse(res.stdout)
-        recovered = _graph_progress_for_run(requested_run_id) or _latest_graph_progress("run")
+        recovered = _graph_progress_for_run(requested_run_id)
         observed = parsed if isinstance(parsed, dict) else recovered
         has_run = isinstance(observed, dict) and str(observed.get("run_id", "")).strip() != ""
         completed = isinstance(recovered, dict) and bool(recovered.get("completed"))
@@ -464,23 +491,13 @@ def _load_json(path: Path, default: Any) -> Any:
         return default
 
 
-def _category_match(category: str, vuln_class: str, title: str, file_path: str, sink: str) -> bool:
-    haystack = " ".join([category, vuln_class, title, file_path, sink]).casefold()
-    needles = {
-        "sql_injection": ["sql"],
-        "cross_site_scripting": ["xss", "cross-site scripting", "cross site scripting"],
-        "command_injection": ["command", "cmdi", "shell_exec", "system", "passthru", "exec"],
-        "authn_authz_failures": ["auth", "authorization", "authentication", "idor", "privilege", "session"],
-        "session_misuse": ["session", "cookie", "fixation"],
-        "csrf": ["csrf", "cross-site request forgery"],
-        "file_inclusion_path_traversal": ["file", "include", "traversal", "lfi", "rfi", "path"],
-        "ldap_injection": ["ldap"],
-        "xxe_xml_injection": ["xxe", "xml", "entity"],
-        "unrestricted_file_upload": ["upload"],
-        "open_redirect_header_cookie_manipulation": ["redirect", "header", "cookie"],
-        "information_disclosure_misconfiguration": ["phpinfo", "info", "disclosure", "error", "misconfig", "leak"],
-    }[category]
-    return any(needle in haystack for needle in needles)
+def _assessment_category(vuln_class: str) -> str:
+    canonical = canonicalize_vuln_class(vuln_class)
+    return _ASSESSMENT_CATEGORY_BY_CANONICAL_CLASS.get(canonical, "")
+
+
+def _category_match(category: str, vuln_class: str) -> bool:
+    return str(category).strip() == _assessment_category(vuln_class)
 
 
 def _load_gap_rows() -> list[dict[str, Any]]:
@@ -491,35 +508,134 @@ def _store() -> EvidenceStore:
     return EvidenceStore(PADV_STORE)
 
 
+def _require_run_id(run_id: str) -> str:
+    normalized = str(run_id).strip()
+    if not normalized:
+        raise ValueError("run_id is required")
+    return normalized
+
+
 def _load_candidates(run_id: str) -> list[dict[str, Any]]:
-    store = _store().for_run(run_id)
-    return _load_json(store.root / "candidates.json", [])
+    run_store = _store().for_run(_require_run_id(run_id))
+    payload = run_store.load_json_artifact("candidates.json")
+    if not isinstance(payload, list):
+        return []
+    return [item for item in payload if isinstance(item, dict)]
 
 
 def _load_bundles(run_id: str) -> list[dict[str, Any]]:
-    store = _store().for_run(run_id)
-    bundles_dir = store.root / "bundles"
-    if not bundles_dir.exists():
-        return []
-    return [_load_json(path, {}) for path in sorted(bundles_dir.glob("*.json"))]
+    run_store = _store().for_run(_require_run_id(run_id))
+    bundles: list[dict[str, Any]] = []
+    for bundle_id in run_store.list_bundle_ids():
+        payload = run_store.load_bundle(bundle_id)
+        if isinstance(payload, dict):
+            bundles.append(payload)
+    return bundles
+
+
+def _bundle_candidate_outcome(bundle: dict[str, Any]) -> str:
+    explicit = str(bundle.get("candidate_outcome", "")).strip().upper()
+    if explicit:
+        return explicit
+    decision = str((bundle.get("gate_result") or {}).get("decision", "")).strip().upper()
+    return explicit_candidate_outcome_for_decision(decision)
+
+
+def _bundle_refutation_has_strong_witness(bundle: dict[str, Any]) -> bool:
+    contract = (bundle.get("validation_contract") or {}).get("witness_contract", {})
+    witness = (bundle.get("validation_contract") or {}).get("witness", {})
+    if not isinstance(contract, dict) or not isinstance(witness, dict):
+        return False
+    positive_flags = {
+        str(item).strip().casefold()
+        for item in witness.get("positive_flags", [])
+        if str(item).strip()
+    }
+    negative_flags = {
+        str(item).strip().casefold()
+        for item in witness.get("negative_flags", [])
+        if str(item).strip()
+    }
+    required_all = {
+        str(item).strip().casefold()
+        for item in contract.get("required_all", [])
+        if str(item).strip()
+    }
+    required_any = {
+        str(item).strip().casefold()
+        for item in contract.get("required_any", [])
+        if str(item).strip()
+    }
+    forbidden_negative = {
+        str(item).strip().casefold()
+        for item in contract.get("negative_must_not_include", [])
+        if str(item).strip()
+    }
+    enforce_negative_clean = bool(contract.get("enforce_negative_clean", True))
+    if required_all and not required_all.issubset(positive_flags):
+        return False
+    if required_any and not (positive_flags & required_any):
+        return False
+    if enforce_negative_clean and forbidden_negative and (negative_flags & forbidden_negative):
+        return False
+    return bool(required_all or required_any)
 
 
 def _bundle_coverage_outcome(bundle: dict[str, Any]) -> str:
-    decision = str((bundle.get("gate_result") or {}).get("decision", "")).strip().upper()
-    bundle_type = str(bundle.get("bundle_type", "")).strip().lower()
-
-    if decision == "VALIDATED" or bundle_type == "validated_exploit":
+    outcome = _bundle_candidate_outcome(bundle)
+    if outcome == "VALIDATED":
         return "VALIDATED"
-    if decision == "REFUTED" or bundle_type == "refuted":
+    if outcome == "REFUTED":
         return "REFUTED"
-    if decision in {"SKIPPED_BUDGET", "NEEDS_HUMAN_SETUP"} or bundle_type in {"skipped_budget", "skipped"}:
+    if outcome in {"SKIPPED_BUDGET", "SKIPPED_PRECONDITION"}:
         return "SKIPPED"
-    if decision == "ERROR" or bundle_type == "error":
+    if outcome == "ERROR":
         return "ERROR"
-    return "ATTEMPTED"
+    return "ERROR"
+
+
+def _normalize_reason_token(value: str, default: str) -> str:
+    normalized = _REASON_TOKEN_RE.sub("_", str(value).strip().casefold()).strip("_")
+    return normalized or default
+
+
+def _bundle_outcome_reason(bundle: dict[str, Any]) -> str:
+    outcome = _bundle_candidate_outcome(bundle)
+    default_reason = {
+        "VALIDATED": "validated",
+        "REFUTED": "refuted",
+        "SKIPPED_BUDGET": "skipped_budget",
+        "SKIPPED_PRECONDITION": "skipped_precondition",
+        "ERROR": "error",
+    }.get(outcome, "error")
+    gate_result = bundle.get("gate_result")
+    if isinstance(gate_result, dict):
+        reason = str(gate_result.get("reason", "")).strip()
+        if reason:
+            return _normalize_reason_token(reason, default_reason)
+    return default_reason
+
+
+def _count_bundle_outcomes(bundles: list[dict[str, Any]]) -> dict[str, int]:
+    counts = default_candidate_outcomes()
+    for bundle in bundles:
+        outcome = _bundle_candidate_outcome(bundle)
+        counts[outcome] = counts.get(outcome, 0) + 1
+    return counts
+
+
+def _count_bundle_outcome_reasons(bundles: list[dict[str, Any]]) -> dict[str, dict[str, int]]:
+    reasons = {key: {} for key in default_candidate_outcomes()}
+    for bundle in bundles:
+        outcome = _bundle_candidate_outcome(bundle)
+        reason = _bundle_outcome_reason(bundle)
+        outcome_reasons = reasons.setdefault(outcome, {})
+        outcome_reasons[reason] = outcome_reasons.get(reason, 0) + 1
+    return reasons
 
 
 def run_phase_b(output_dir: Path, run_id: str, phase_a: dict[str, Any]) -> dict[str, Any]:
+    run_id = _require_run_id(run_id)
     matrix: list[dict[str, Any]] = []
     gaps = []
 
@@ -539,36 +655,42 @@ def run_phase_b(output_dir: Path, run_id: str, phase_a: dict[str, Any]) -> dict[
 
     candidates = _load_candidates(run_id)
     bundles = _load_bundles(run_id)
+    candidate_outcomes = _count_bundle_outcomes(bundles)
+    outcome_reasons = _count_bundle_outcome_reasons(bundles)
+    run_summary = _store().load_run_summary(run_id)
     for gap in _load_gap_rows():
         category = str(gap.get("category", ""))
         matched_candidates = [
             item
             for item in candidates
-            if _category_match(category, str(item.get("vuln_class", "")), str(item.get("title", "")), str(item.get("file_path", "")), str(item.get("sink", "")))
+            if _category_match(category, str(item.get("canonical_class", "") or item.get("vuln_class", "")))
         ]
         matched_bundles = [
             item
             for item in bundles
-            if _category_match(
-                category,
-                str(((item.get("candidate") or {}).get("vuln_class", ""))),
-                str(((item.get("candidate") or {}).get("title", ""))),
-                str(((item.get("candidate") or {}).get("file_path", ""))),
-                str(((item.get("candidate") or {}).get("sink", ""))),
-            )
+            if _category_match(category, str(((item.get("candidate") or {}).get("canonical_class", "") or (item.get("candidate") or {}).get("vuln_class", ""))))
         ]
         found_by_static = any(set(item.get("provenance", [])) & {"source", "joern", "scip"} for item in matched_candidates)
         found_by_web = any("web" in item.get("provenance", []) or item.get("web_path_hints") for item in matched_candidates)
         runtime_attempted = bool(matched_bundles)
         runtime_outcomes = [_bundle_coverage_outcome(item) for item in matched_bundles]
-        runtime_conclusive = any(outcome in {"VALIDATED", "REFUTED"} for outcome in runtime_outcomes)
+        matched_outcome_counts = _count_bundle_outcomes(matched_bundles)
+        matched_outcome_reasons = _count_bundle_outcome_reasons(matched_bundles)
+        strong_refutation_count = sum(
+            1
+            for item, outcome in zip(matched_bundles, runtime_outcomes, strict=False)
+            if outcome == "REFUTED" and _bundle_refutation_has_strong_witness(item)
+        )
+        runtime_full = any(outcome == "VALIDATED" for outcome in runtime_outcomes) or strong_refutation_count > 0
 
-        if matched_candidates and (not gap.get("runtime_validatable") or runtime_conclusive):
+        if not gap.get("runtime_validatable"):
+            status = "FULL" if matched_candidates else "NONE"
+        elif runtime_full:
             status = "FULL"
-        elif matched_candidates:
+        elif runtime_attempted:
             status = "PARTIAL"
         else:
-            status = "FAIL"
+            status = "NONE"
 
         evidence_path = str(_store().for_run(run_id).root / "candidates.json") if matched_candidates else str(GAP_CATALOG_PATH)
         observed = json.dumps(
@@ -577,6 +699,9 @@ def run_phase_b(output_dir: Path, run_id: str, phase_a: dict[str, Any]) -> dict[
                 "found_by_web": found_by_web,
                 "runtime_attempted": runtime_attempted,
                 "runtime_outcomes": runtime_outcomes,
+                "outcome_counts": matched_outcome_counts,
+                "outcome_reasons": matched_outcome_reasons,
+                "strong_refutation_count": strong_refutation_count,
             },
             ensure_ascii=True,
         )
@@ -587,7 +712,17 @@ def run_phase_b(output_dir: Path, run_id: str, phase_a: dict[str, Any]) -> dict[
         )
 
     gaps = matrix_to_gap_list(matrix)
-    output = {"phase": "B", "generated_at": _now_iso(), "run_id": run_id, "matrix": matrix, "gaps": gaps}
+    output = {
+        "phase": "B",
+        "generated_at": _now_iso(),
+        "run_id": run_id,
+        "matrix": matrix,
+        "gaps": gaps,
+        "candidate_outcomes": candidate_outcomes,
+        "outcome_reasons": outcome_reasons,
+        "stop_rule": str((run_summary or {}).get("stop_rule", "")),
+        "stop_reason": str((run_summary or {}).get("stop_reason", "")),
+    }
     _write_json(output_dir / "phase-b-matrix.json", output)
     return output
 
@@ -610,10 +745,13 @@ def _write_report_markdown(output_dir: Path, phase_a: dict[str, Any], phase_b: d
 def main() -> int:
     parser = argparse.ArgumentParser(description="Stabilize strict Mutillidae integration run and produce requirement assessment.")
     parser.add_argument("--phase", choices=["a", "b", "full"], default="full")
+    parser.add_argument("--run-id", default="")
     parser.add_argument("--max-attempts", type=int, default=2)
     parser.add_argument("--analyze-timeout", type=int, default=3600)
     parser.add_argument("--run-timeout", type=int, default=3600)
     args = parser.parse_args()
+    if args.phase == "b" and not str(args.run_id).strip():
+        parser.error("--run-id is required when --phase b")
 
     timestamp = datetime.now(tz=timezone.utc).strftime("%Y%m%d-%H%M%S")
     output_dir = PADV_STORE / "assessments" / f"mutillidae-{timestamp}"
@@ -630,7 +768,7 @@ def main() -> int:
         phase_a = {"a1": {"summary": {"all_passed": True}}, "a2": {"success": True}, "a3": {"success": True, "final_output": {}}}
 
     phase_a_success = bool(phase_a.get("a1", {}).get("summary", {}).get("all_passed")) and bool(phase_a.get("a2", {}).get("success")) and bool(phase_a.get("a3", {}).get("success"))
-    run_id = str((phase_a.get("a3", {}).get("final_output", {}) or {}).get("run_id", "")).strip() or "unknown"
+    run_id = _require_run_id(args.run_id) if args.phase == "b" else str((phase_a.get("a3", {}).get("final_output", {}) or {}).get("run_id", "")).strip()
 
     if args.phase in {"b", "full"}:
         phase_b = run_phase_b(output_dir, run_id=run_id, phase_a=phase_a)

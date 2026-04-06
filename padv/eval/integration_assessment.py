@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 
-VALID_STATUSES = {"FULL", "PARTIAL", "FAIL"}
+VALID_STATUSES = {"FULL", "PARTIAL", "NONE", "FAIL"}
 
 
 @dataclass(slots=True)

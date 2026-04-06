@@ -429,6 +429,8 @@ def test_run_with_graph_uses_agentic_validation_nodes(monkeypatch: pytest.Monkey
     summary = run_with_graph(config, str(tmp_path), store, "variant")
     assert isinstance(summary, RunSummary)
     assert summary.decisions["DROPPED"] == 1
+    assert summary.candidate_outcomes["REFUTED"] == 1
+    assert summary.candidate_outcomes["SKIPPED_BUDGET"] == 0
     assert summary.bundle_ids == ["bundle-1"]
     assert "experiment" in summary.planner_trace
     assert "root_orient" in summary.planner_trace
@@ -765,13 +767,80 @@ def test_run_with_graph_stops_on_stagnation_without_root_continue(
 
     monkeypatch.setattr("padv.orchestrator.graphs.validate_candidates_runtime", _fake_validate)
 
-    run_with_graph(config, str(tmp_path), store, "variant")
+    summary = run_with_graph(config, str(tmp_path), store, "variant")
 
     assert call_counter["n"] == 2
+    assert summary.stop_rule == "stagnation"
+    assert "stagnation detected" in summary.stop_reason
     frontier = store.load_frontier_state()
     assert frontier is not None
     assert frontier["iteration"] == 2
     assert frontier["stagnation_rounds"] == 2
+
+
+def test_validate_with_graph_persists_budget_stop_reason_and_candidate_outcomes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
+    store = EvidenceStore(tmp_path / ".padv")
+    candidate = _mk_candidate("cand-budget", ["joern"])
+    static = _mk_evidence("cand-budget", "joern::sql")
+
+    monkeypatch.setattr(
+        graph_mod,
+        "make_validation_plans_with_deepagents",
+        lambda candidates, _config, repo_root=None, session=None: (
+            {
+                item.candidate_id: ValidationPlan(
+                    candidate_id=item.candidate_id,
+                    intercepts=[],
+                    positive_requests=[],
+                    negative_requests=[],
+                    canary="",
+                )
+                for item in candidates
+            },
+            {"engine": "stub"},
+        ),
+    )
+
+    def _fake_validate_candidates_runtime(**kwargs):
+        del kwargs
+        decisions = graph_mod._default_decisions()
+        decisions["SKIPPED_BUDGET"] = 1
+        bundle = EvidenceBundle(
+            bundle_id="bundle-run-validate-budget-cand-budget",
+            created_at="2026-04-06T00:00:00+00:00",
+            candidate=candidate,
+            static_evidence=[static],
+            positive_runtime=[],
+            negative_runtime=[],
+            repro_run_ids=[],
+            gate_result=GateResult("SKIPPED_BUDGET", [], None, "request budget exhausted before candidate execution"),
+            limitations=["request budget exhausted before candidate execution"],
+            bundle_type="skipped_budget",
+        )
+        return [bundle], decisions
+
+    monkeypatch.setattr(graph_mod, "validate_candidates_runtime", _fake_validate_candidates_runtime)
+
+    bundles, decisions = graph_mod.validate_with_graph(
+        config=config,
+        store=store,
+        static_evidence=[static],
+        candidates=[candidate],
+        run_id="run-validate-budget",
+        repo_root=str(tmp_path),
+    )
+
+    assert decisions["SKIPPED_BUDGET"] == 1
+    assert bundles[0].candidate_outcome == "SKIPPED_BUDGET"
+    summary = store.load_run_summary("run-validate-budget")
+    assert summary is not None
+    assert summary["candidate_outcomes"]["SKIPPED_BUDGET"] == 1
+    assert summary["candidate_outcomes"]["REFUTED"] == 0
+    assert summary["stop_rule"] == "budget_exhausted"
+    assert summary["stop_reason"] == "budget exhausted"
 
 
 

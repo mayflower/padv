@@ -6,6 +6,7 @@ from padv.config.schema import load_config
 from padv.gates.engine import _RUNTIME_VALIDATABLE_CLASSES, evaluate_candidate
 from padv.models import RuntimeCall, RuntimeEvidence, StaticEvidence, WitnessContract
 from padv.validation.contracts import runtime_witness_contracts
+from padv.validation.preconditions import GatePreconditions
 
 
 def _static() -> list[StaticEvidence]:
@@ -61,7 +62,7 @@ def test_gate_sql_requires_sink_and_differential_witness() -> None:
         ],
         intercepts=["mysqli_query"],
         canary=canary,
-        preconditions=[],
+        preconditions=GatePreconditions(),
         evidence_signals=["joern", "scip"],
         vuln_class="sql_injection_boundary",
     )
@@ -84,7 +85,7 @@ def test_gate_sql_drops_without_differential_witness() -> None:
         ],
         intercepts=["mysqli_query"],
         canary=canary,
-        preconditions=[],
+        preconditions=GatePreconditions(),
         evidence_signals=["joern", "scip"],
         vuln_class="sql_injection_boundary",
     )
@@ -108,7 +109,7 @@ def test_gate_sql_negative_control_rejects_oracle_hit() -> None:
         ],
         intercepts=["mysqli_query"],
         canary=canary,
-        preconditions=[],
+        preconditions=GatePreconditions(),
         evidence_signals=["joern", "scip"],
         vuln_class="sql_injection_boundary",
     )
@@ -146,7 +147,7 @@ def test_gate_uses_shared_witness_contract_provider(monkeypatch) -> None:
         negative_runs=[_runtime_call("n1", function="curl_exec", arg="https://example.org/safe")],
         intercepts=["curl_exec"],
         canary="padv-canary",
-        preconditions=[],
+        preconditions=GatePreconditions(),
         evidence_signals=["joern", "scip"],
         vuln_class="ssrf",
     )
@@ -190,7 +191,7 @@ def test_gate_ssrf_requires_url_arg_witness() -> None:
         negative_runs=[_runtime_call("n1", function="curl_exec", arg="https://example.org/safe")],
         intercepts=["curl_exec"],
         canary=canary,
-        preconditions=[],
+        preconditions=GatePreconditions(),
         evidence_signals=["joern", "scip"],
         vuln_class="ssrf",
     )
@@ -215,7 +216,7 @@ def test_gate_xxe_requires_entity_witness() -> None:
         negative_runs=[_runtime_call("n1", function="DOMDocument::loadXML", arg="<root>safe</root>")],
         intercepts=["DOMDocument::loadXML"],
         canary=canary,
-        preconditions=[],
+        preconditions=GatePreconditions(),
         evidence_signals=["joern", "scip"],
         vuln_class="xxe_influence",
     )
@@ -281,7 +282,7 @@ def test_gate_xss_raw_canary_without_dom_witness_is_rejected() -> None:
         ],
         intercepts=[],
         canary="padv-canary",
-        preconditions=[],
+        preconditions=GatePreconditions(),
         evidence_signals=["joern", "scip"],
         vuln_class="xss_output_boundary",
     )

@@ -50,6 +50,7 @@ from padv.models import (
     RunSummary,
     StaticEvidence,
     WitnessBundle,
+    count_candidate_outcomes,
     utc_now_iso as _now_iso,
 )
 from padv.orchestrator.evidence_linking import select_linked_evidence
@@ -58,6 +59,7 @@ from padv.static.joern.adapter import discover_candidates_with_meta
 from padv.static.joern.query_sets import VULN_CLASS_SPECS
 from padv.store.evidence_store import EvidenceStore
 from padv.taxonomy import runtime_validatable_classes
+from padv.validation.preconditions import merge_gate_preconditions
 
 _DECISION_KEYS = (
     "VALIDATED",
@@ -71,6 +73,27 @@ _DECISION_KEYS = (
 
 def _default_decisions() -> dict[str, int]:
     return dict.fromkeys(_DECISION_KEYS, 0)
+
+
+def _summary_stop_metadata(
+    *,
+    planner_trace: dict[str, Any] | None,
+    decisions: dict[str, int] | None,
+) -> tuple[str, str]:
+    continue_trace = {}
+    if isinstance(planner_trace, dict):
+        maybe_continue = planner_trace.get("continue", {})
+        if isinstance(maybe_continue, dict):
+            continue_trace = maybe_continue
+    stop_rule = str(continue_trace.get("stop_rule", "")).strip()
+    stop_reason = str(continue_trace.get("reason", "")).strip()
+    if stop_rule:
+        return stop_rule, stop_reason
+
+    decision_map = decisions if isinstance(decisions, dict) else {}
+    if int(decision_map.get("SKIPPED_BUDGET", 0) or 0) > 0:
+        return "budget_exhausted", "budget exhausted"
+    return "completed", "completed"
 
 
 class GraphState(TypedDict, total=False):
@@ -1292,9 +1315,11 @@ def _resolve_auth_preconditions(candidates: list[Candidate], auth_known: bool) -
     if not auth_known:
         return
     for candidate in candidates:
-        if not candidate.preconditions:
-            continue
-        candidate.preconditions = [p for p in candidate.preconditions if p != "auth-state-known"]
+        candidate.gate_preconditions = merge_gate_preconditions(candidate.gate_preconditions)
+        candidate.gate_preconditions.requires_auth = False
+        candidate.gate_preconditions.requires_session = False
+        if candidate.preconditions:
+            candidate.preconditions = [p for p in candidate.preconditions if p != "auth-state-known"]
 
 
 def _reset_iteration_state_for_new_objective(state: GraphState) -> None:
@@ -1858,6 +1883,7 @@ def _candidate_from_hypothesis(hypothesis: Hypothesis) -> Candidate:
     candidate = _safe_copy_candidate(hypothesis.candidate)
     candidate.confidence = max(candidate.confidence, hypothesis.confidence)
     candidate.evidence_refs = sorted(_stable_text_values(candidate.evidence_refs + list(hypothesis.evidence_refs)))
+    candidate.gate_preconditions = merge_gate_preconditions(candidate.gate_preconditions, hypothesis.gate_preconditions)
     candidate.preconditions = sorted(_stable_text_values(candidate.preconditions + list(hypothesis.preconditions)))
     candidate.auth_requirements = sorted(_stable_text_values(candidate.auth_requirements + list(hypothesis.auth_requirements)))
     candidate.web_path_hints = sorted(_stable_text_values(candidate.web_path_hints + list(hypothesis.web_path_hints)))
@@ -2254,10 +2280,10 @@ def _node_experiment_plan(state: GraphState) -> GraphState:
                 "validation_mode": value.validation_mode,
                 "canonical_class": value.canonical_class,
                 "class_contract_id": value.class_contract_id,
-                "oracle_functions": value.oracle_functions,
+                "oracle_spec": value.oracle_spec.to_dict(),
                 "requests": value.requests or value.positive_requests,
-                "negative_controls": value.negative_controls or value.negative_requests,
-                "response_witnesses": value.response_witnesses,
+                "negative_controls": [item.to_dict() for item in value.negative_controls] or value.negative_requests,
+                "steps": [item.to_dict() for item in value.steps],
                 "environment_requirements": value.environment_requirements,
             }
             for key, value in plans_by_candidate.items()
@@ -2290,18 +2316,17 @@ def _node_experiment_plan(state: GraphState) -> GraphState:
                 "plans": {
                     key: {
                         "candidate_id": value.candidate_id,
-                        "oracle_functions": value.oracle_functions,
-                        "request_expectations": value.request_expectations,
-                        "response_witnesses": value.response_witnesses,
-                        "intercepts": value.intercepts,
+                        "oracle_spec": value.oracle_spec.to_dict(),
                         "validation_mode": value.validation_mode,
                         "canonical_class": value.canonical_class,
                         "class_contract_id": value.class_contract_id,
                         "environment_requirements": value.environment_requirements,
+                        "steps": [item.to_dict() for item in value.steps],
                         "requests": value.requests,
-                        "negative_controls": value.negative_controls,
+                        "negative_controls": [item.to_dict() for item in value.negative_controls],
                         "positive_requests": value.positive_requests,
                         "negative_requests": value.negative_requests,
+                        "budgets": value.budgets.to_dict(),
                         "canary": value.canary,
                         "strategy": value.strategy,
                     "negative_control_strategy": value.negative_control_strategy,
@@ -3208,6 +3233,11 @@ def run_with_graph(
 
         bundles = result.get("bundles", [])
         decisions = result.get("decisions", _default_decisions())
+        planner_trace = result.get("planner_trace", {})
+        stop_rule, stop_reason = _summary_stop_metadata(
+            planner_trace=planner_trace,
+            decisions=decisions,
+        )
         summary = RunSummary(
             run_id=run_id,
             mode=mode,
@@ -3217,8 +3247,11 @@ def run_with_graph(
             decisions=decisions,
             bundle_ids=[b.bundle_id for b in bundles],
             discovery_trace=result.get("discovery_trace", {}),
-            planner_trace=result.get("planner_trace", {}),
+            planner_trace=planner_trace,
             frontier_state=result.get("frontier_state", {}),
+            candidate_outcomes=count_candidate_outcomes(bundles),
+            stop_rule=stop_rule,
+            stop_reason=stop_reason,
         )
         store.save_run_summary(summary)
         return summary
@@ -3321,6 +3354,10 @@ def validate_with_graph(
                 "discovery_trace": discovery_trace,
             },
         )
+        stop_rule, stop_reason = _summary_stop_metadata(
+            planner_trace=planner_trace,
+            decisions=decisions,
+        )
         summary = RunSummary(
             run_id=run_id,
             mode="variant",
@@ -3332,6 +3369,9 @@ def validate_with_graph(
             discovery_trace=discovery_trace,
             planner_trace=planner_trace,
             frontier_state={},
+            candidate_outcomes=count_candidate_outcomes(bundles),
+            stop_rule=stop_rule,
+            stop_reason=stop_reason,
         )
         store.save_run_summary(summary)
         _emit_progress(progress_state, "persist", "done", "evidence persisted")

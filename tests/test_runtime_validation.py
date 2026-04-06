@@ -1,14 +1,45 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from threading import Thread
+from urllib.parse import parse_qs
 
 import pytest
 
 from padv.config.schema import load_config
-from padv.models import Candidate, EvidenceBundle, GateResult, RuntimeEvidence, StaticEvidence, ValidationPlan
-from padv.orchestrator.runtime import _normalize_gate_preconditions, validate_candidates_runtime
+from padv.models import (
+    Candidate,
+    CanaryMatchRule,
+    EvidenceBundle,
+    GateResult,
+    HttpExpectations,
+    HttpStep,
+    NegativeControl,
+    OracleSpec,
+    PlanBudget,
+    RuntimeCall,
+    RuntimeEvidence,
+    StaticEvidence,
+    ValidationPlan,
+)
+from padv.orchestrator.runtime import _normalize_gate_preconditions, _oracle_evidence, validate_candidates_runtime
 from padv.store.evidence_store import EvidenceStore
-from padv.validation.preconditions import GatePreconditions
+from padv.validation.preconditions import GatePreconditions, InvalidGatePreconditionsError
+
+
+@contextmanager
+def _serve(handler: type[BaseHTTPRequestHandler]):
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+        server.server_close()
 
 
 def _candidate() -> Candidate:
@@ -35,6 +66,47 @@ def _evidence() -> StaticEvidence:
         line=10,
         snippet="mysqli_query($db,$q)",
         hash="h1",
+    )
+
+
+def _structured_plan(candidate_id: str, canary: str) -> ValidationPlan:
+    return ValidationPlan(
+        candidate_id=candidate_id,
+        intercepts=[],
+        positive_requests=[],
+        negative_requests=[],
+        canary=canary,
+        steps=[
+            HttpStep(
+                method="POST",
+                path="/typed-submit",
+                headers={"Content-Type": "application/json"},
+                query={"marker": canary},
+                body_type="json",
+                body={"marker": canary},
+                expectations=HttpExpectations(status_codes=[200]),
+            )
+        ],
+        negative_controls=[
+            NegativeControl(
+                label="control-0",
+                step=HttpStep(
+                    method="POST",
+                    path="/typed-control",
+                    headers={"Content-Type": "application/json"},
+                    query={"marker": "control"},
+                    body_type="json",
+                    body={"marker": "control"},
+                    expectations=HttpExpectations(status_codes=[200]),
+                ),
+            )
+        ],
+        oracle_spec=OracleSpec(
+            intercept_profile="default",
+            oracle_functions=["mysqli_query"],
+            canary_rules=[CanaryMatchRule(location="response_body", match_type="contains", value=canary)],
+        ),
+        budgets=PlanBudget(max_requests=2, max_time_s=15),
     )
 
 
@@ -97,6 +169,122 @@ def test_validate_runtime_confirms_analysis_only_candidate_without_agent_plan(tm
     assert decisions["CONFIRMED_ANALYSIS_FINDING"] == 1
     assert bundles[0].bundle_type == "confirmed_analysis_finding"
     assert bundles[0].validation_contract["validation_mode"] == "analysis_only"
+
+
+def test_validate_runtime_executes_structured_steps_not_legacy_request_arrays(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
+    store = EvidenceStore(tmp_path / ".padv")
+    candidate = _candidate()
+    plan = _structured_plan(candidate.candidate_id, "typed-canary")
+    plan.positive_requests = [{"method": "GET", "path": "/legacy-positive", "query": {"marker": "legacy"}}]
+    plan.negative_requests = [{"method": "GET", "path": "/legacy-negative", "query": {"marker": "legacy"}}]
+    seen_paths: list[str] = []
+
+    class _Resp:
+        headers: dict[str, str] = {}
+        status_code: int = 200
+        body: str = ""
+
+    def _fake_send_request(*args, **kwargs):
+        seen_paths.append(str(kwargs.get("url", "")))
+        return _Resp()
+
+    monkeypatch.setattr("padv.orchestrator.runtime.send_request", _fake_send_request)
+    monkeypatch.setattr(
+        "padv.orchestrator.runtime.parse_response_headers",
+        lambda request_id, headers, oracle: RuntimeEvidence(
+            request_id=request_id,
+            status="ok",
+            call_count=1,
+            overflow=False,
+            arg_truncated=False,
+            result_truncated=False,
+            correlation=request_id,
+            calls=[],
+            raw_headers={},
+        ),
+    )
+    monkeypatch.setattr(
+        "padv.orchestrator.runtime.evaluate_candidate",
+        lambda **kwargs: GateResult("DROPPED", ["V0"], "V3", "test"),
+    )
+
+    bundles, _decisions = validate_candidates_runtime(
+        config=config,
+        store=store,
+        static_evidence=[_evidence()],
+        candidates=[candidate],
+        run_id="run-structured-only",
+        plans_by_candidate={candidate.candidate_id: plan},
+        planner_trace={},
+        discovery_trace={},
+        artifact_refs=[],
+    )
+
+    assert bundles
+    assert any(path.endswith("/typed-submit") for path in seen_paths)
+    assert any(path.endswith("/typed-control") for path in seen_paths)
+    assert all("/legacy-" not in path for path in seen_paths)
+    assert bundles[0].planner_trace["validation_plan"]["positive_request_count"] == 1
+    assert bundles[0].planner_trace["validation_plan"]["negative_request_count"] == 1
+
+
+def test_oracle_evidence_uses_exact_call_arg_rules() -> None:
+    config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
+    canary = "padv-canary-exact"
+    plan = ValidationPlan(
+        candidate_id="cand-1",
+        intercepts=[],
+        positive_requests=[],
+        negative_requests=[],
+        canary=canary,
+        steps=[],
+        negative_controls=[],
+        oracle_spec=OracleSpec(
+            intercept_profile="default",
+            oracle_functions=["mysqli_query"],
+            canary_rules=[
+                CanaryMatchRule(location="call_arg", match_type="exact", value=canary, arg_index=1),
+            ],
+        ),
+        budgets=PlanBudget(max_requests=2, max_time_s=15),
+    )
+    positive = RuntimeEvidence(
+        request_id="p1",
+        status="active_hits",
+        call_count=1,
+        overflow=False,
+        arg_truncated=False,
+        result_truncated=False,
+        correlation="p1",
+        calls=[
+            RuntimeCall(function="mysqli_query", file="app.php", line=12, args=[f"prefix {canary}", canary])
+        ],
+        raw_headers={},
+    )
+    negative = RuntimeEvidence(
+        request_id="n1",
+        status="active_no_hits",
+        call_count=1,
+        overflow=False,
+        arg_truncated=False,
+        result_truncated=False,
+        correlation="n1",
+        calls=[
+            RuntimeCall(function="mysqli_query", file="app.php", line=12, args=[f"prefix {canary}", "safe"])
+        ],
+        raw_headers={},
+    )
+
+    positive_hits = _oracle_evidence(positive, plan, config)
+    negative_hits = _oracle_evidence(negative, plan, config)
+
+    assert len(positive_hits) == 1
+    assert positive_hits[0].matched_canary is True
+    assert len(negative_hits) == 1
+    assert negative_hits[0].matched_canary is False
 
 
 def test_validate_runtime_forwards_auth_cookies(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -266,6 +454,124 @@ def test_validate_runtime_uses_distinct_sessions_per_candidate(monkeypatch: pyte
     assert len(bundles) == 2
     assert set(sessions_by_candidate) == {"cand-1", "cand-2"}
     assert sessions_by_candidate["cand-1"] is not sessions_by_candidate["cand-2"]
+
+
+def test_validate_runtime_executes_structured_csrf_flow(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
+    store = EvidenceStore(tmp_path / ".padv")
+    candidate = _candidate()
+    candidate.preconditions = []
+    plan = ValidationPlan(
+        candidate_id=candidate.candidate_id,
+        intercepts=["mysqli_query"],
+        positive_requests=[],
+        negative_requests=[],
+        canary="csrf-token",
+        steps=[
+            HttpStep(method="GET", path="/login", expectations=HttpExpectations(status_codes=[200])),
+            HttpStep(method="GET", path="/token", expectations=HttpExpectations(status_codes=[200])),
+            HttpStep(
+                method="POST",
+                path="/action",
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                body_type="form",
+                body={"csrf_token": "{{token:csrf_token}}", "action": "apply"},
+                expectations=HttpExpectations(status_codes=[200]),
+            ),
+        ],
+        oracle_spec=OracleSpec(intercept_profile="default", oracle_functions=["mysqli_query"], canary_rules=[]),
+        budgets=PlanBudget(max_requests=3, max_time_s=15),
+    )
+    seen_requests: list[tuple[str, str, str]] = []
+
+    class _CsrfHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            seen_requests.append((self.command, self.path, self.headers.get("Cookie", "")))
+            if self.path == "/login":
+                self.send_response(200)
+                self.send_header("Set-Cookie", "sessionid=abc123; Path=/; HttpOnly")
+                self.end_headers()
+                self.wfile.write(b"logged-in")
+                return
+            if self.path == "/token":
+                if "sessionid=abc123" not in self.headers.get("Cookie", ""):
+                    self.send_response(401)
+                    self.end_headers()
+                    self.wfile.write(b"missing-cookie")
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"csrf_token":"token-123"}')
+                return
+            self.send_response(404)
+            self.end_headers()
+
+        def do_POST(self) -> None:  # noqa: N802
+            content_length = int(self.headers.get("Content-Length", "0") or "0")
+            body = self.rfile.read(content_length).decode("utf-8", errors="replace")
+            seen_requests.append((self.command, f"{self.path}?{body}", self.headers.get("Cookie", "")))
+            form = parse_qs(body, keep_blank_values=True)
+            if self.path != "/action":
+                self.send_response(404)
+                self.end_headers()
+                return
+            if "sessionid=abc123" not in self.headers.get("Cookie", ""):
+                self.send_response(401)
+                self.end_headers()
+                self.wfile.write(b"missing-cookie")
+                return
+            if form.get("csrf_token") != ["token-123"]:
+                self.send_response(403)
+                self.end_headers()
+                self.wfile.write(b"missing-token")
+                return
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, format: str, *args) -> None:  # pragma: no cover
+            return
+
+    monkeypatch.setattr(
+        "padv.orchestrator.runtime.parse_response_headers",
+        lambda request_id, headers, oracle: RuntimeEvidence(
+            request_id=request_id,
+            status="ok",
+            call_count=0,
+            overflow=False,
+            arg_truncated=False,
+            result_truncated=False,
+            correlation=request_id,
+            calls=[],
+            raw_headers={},
+        ),
+    )
+    monkeypatch.setattr(
+        "padv.orchestrator.runtime.evaluate_candidate",
+        lambda **kwargs: GateResult("DROPPED", ["V0"], "V3", "test"),
+    )
+
+    with _serve(_CsrfHandler) as base_url:
+        config.target.base_url = base_url
+        bundles, _decisions = validate_candidates_runtime(
+            config=config,
+            store=store,
+            static_evidence=[_evidence()],
+            candidates=[candidate],
+            run_id="run-csrf-flow",
+            plans_by_candidate={candidate.candidate_id: plan},
+            planner_trace={},
+            discovery_trace={},
+            artifact_refs=[],
+        )
+
+    assert bundles
+    assert seen_requests == [
+        ("GET", "/login", ""),
+        ("GET", "/token", "sessionid=abc123"),
+        ("POST", "/action?csrf_token=token-123&action=apply", "sessionid=abc123"),
+    ]
 
 
 def test_validate_runtime_passes_shared_witness_contract_and_witness(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -608,7 +914,7 @@ def test_validate_runtime_populates_typed_runtime_evidence(monkeypatch: pytest.M
     assert evidence.witness_evidence is not None
 
 
-def test_validate_runtime_filters_nonblocking_preconditions(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_validate_runtime_rejects_legacy_candidate_preconditions(tmp_path: Path) -> None:
     config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
     store = EvidenceStore(tmp_path / ".padv")
     candidate = _candidate()
@@ -616,343 +922,58 @@ def test_validate_runtime_filters_nonblocking_preconditions(monkeypatch: pytest.
         "runtime-oracle-not-applicable",
         "Content-Type: text/xml",
         "Valid SOAP 1.1 envelope structure with message parameter",
-        "Security level 0 (default)",
-        "$lProtectAgainstSQLInjection=false",
-        "Public endpoint accessibility",
     ]
     plan = ValidationPlan(
         candidate_id=candidate.candidate_id,
         intercepts=["mysqli_query"],
-        positive_requests=[
-            {"method": "GET", "path": "/", "query": {config.canary.parameter_name: "p1"}},
-            {"method": "GET", "path": "/", "query": {config.canary.parameter_name: "p2"}},
-            {"method": "GET", "path": "/", "query": {config.canary.parameter_name: "p3"}},
-        ],
+        positive_requests=[{"method": "GET", "path": "/", "query": {config.canary.parameter_name: "p1"}}],
         negative_requests=[{"method": "GET", "path": "/", "query": {config.canary.parameter_name: "neg"}}],
         canary="p1",
         oracle_functions=["mysqli_query"],
     )
-    seen_preconditions: list[GatePreconditions] = []
 
-    class _Resp:
-        headers: dict[str, str] = {}
-        status_code: int = 200
-        body: str = ""
-
-    monkeypatch.setattr("padv.orchestrator.runtime.send_request", lambda *args, **kwargs: _Resp())
-    monkeypatch.setattr(
-        "padv.orchestrator.runtime.parse_response_headers",
-        lambda request_id, headers, oracle: RuntimeEvidence(
-            request_id=request_id,
-            status="ok",
-            call_count=1,
-            overflow=False,
-            arg_truncated=False,
-            result_truncated=False,
-            correlation=request_id,
-            calls=[],
-            raw_headers={},
-        ),
-    )
-
-    def _fake_evaluate_candidate(**kwargs):
-        seen_preconditions.append(kwargs["preconditions"])
-        return GateResult("DROPPED", ["V0"], "V3", "test")
-
-    monkeypatch.setattr("padv.orchestrator.runtime.evaluate_candidate", _fake_evaluate_candidate)
-
-    validate_candidates_runtime(
-        config=config,
-        store=store,
-        static_evidence=[_evidence()],
-        candidates=[candidate],
-        run_id="run-filter-preconditions",
-        plans_by_candidate={candidate.candidate_id: plan},
-        planner_trace={},
-        discovery_trace={},
-        artifact_refs=[],
-        auth_state={},
-    )
-
-    assert seen_preconditions == [GatePreconditions()]
+    with pytest.raises(InvalidGatePreconditionsError, match="legacy candidate.preconditions/auth_requirements"):
+        validate_candidates_runtime(
+            config=config,
+            store=store,
+            static_evidence=[_evidence()],
+            candidates=[candidate],
+            run_id="run-filter-preconditions",
+            plans_by_candidate={candidate.candidate_id: plan},
+            planner_trace={},
+            discovery_trace={},
+            artifact_refs=[],
+            auth_state={},
+        )
 
 
-def test_validate_runtime_filters_trivial_candidate_preconditions(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_validate_runtime_rejects_legacy_auth_requirements_even_with_cookies(tmp_path: Path) -> None:
     config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
     store = EvidenceStore(tmp_path / ".padv")
     candidate = _candidate()
-    candidate.preconditions = [
-        "MySQL connection active",
-        "POST or GET request with ToolID parameter",
-        "Direct endpoint access via POST or GET",
-        "security_level IN [0, 1]",
-        "none - unauthenticated access allowed",
-    ]
-    candidate.auth_requirements = [
-        "none - endpoint accessible without authentication despite session_start()",
-    ]
-    plan = ValidationPlan(
-        candidate_id=candidate.candidate_id,
-        intercepts=["mysqli_query"],
-        positive_requests=[
-            {"method": "GET", "path": "/", "query": {config.canary.parameter_name: "p1"}},
-            {"method": "GET", "path": "/", "query": {config.canary.parameter_name: "p2"}},
-            {"method": "GET", "path": "/", "query": {config.canary.parameter_name: "p3"}},
-        ],
-        negative_requests=[{"method": "GET", "path": "/", "query": {config.canary.parameter_name: "neg"}}],
-        canary="p1",
-        oracle_functions=["mysqli_query"],
-    )
-    seen_preconditions: list[GatePreconditions] = []
-
-    class _Resp:
-        headers: dict[str, str] = {}
-        status_code: int = 200
-        body: str = ""
-
-    monkeypatch.setattr("padv.orchestrator.runtime.send_request", lambda *args, **kwargs: _Resp())
-    monkeypatch.setattr(
-        "padv.orchestrator.runtime.parse_response_headers",
-        lambda request_id, headers, oracle: RuntimeEvidence(
-            request_id=request_id,
-            status="ok",
-            call_count=1,
-            overflow=False,
-            arg_truncated=False,
-            result_truncated=False,
-            correlation=request_id,
-            calls=[],
-            raw_headers={},
-        ),
-    )
-
-    def _fake_evaluate_candidate(**kwargs):
-        seen_preconditions.append(kwargs["preconditions"])
-        return GateResult("DROPPED", ["V0"], "V3", "test")
-
-    monkeypatch.setattr("padv.orchestrator.runtime.evaluate_candidate", _fake_evaluate_candidate)
-
-    validate_candidates_runtime(
-        config=config,
-        store=store,
-        static_evidence=[_evidence()],
-        candidates=[candidate],
-        run_id="run-filter-trivial-preconditions",
-        plans_by_candidate={candidate.candidate_id: plan},
-        planner_trace={},
-        discovery_trace={},
-        artifact_refs=[],
-        auth_state={"cookies": {"PHPSESSID": "abc"}},
-    )
-
-    assert seen_preconditions == [GatePreconditions()]
-
-
-def test_validate_runtime_filters_satisfied_sql_shape_preconditions(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
-    store = EvidenceStore(tmp_path / ".padv")
-    candidate = _candidate()
-    candidate.preconditions = [
-        "Default security level is 0, satisfying precondition",
-        "Query must return 5 columns for successful UNION: SELECT tool_id, tool_name, phase_to_use, tool_type, comment",
-        "Security level must be 0 or 1 (SESSION[security-level] in {0,1})",
-    ]
-    plan = ValidationPlan(
-        candidate_id=candidate.candidate_id,
-        intercepts=["mysqli_query"],
-        positive_requests=[
-            {"method": "GET", "path": "/", "query": {config.canary.parameter_name: "p1"}},
-            {"method": "GET", "path": "/", "query": {config.canary.parameter_name: "p2"}},
-            {"method": "GET", "path": "/", "query": {config.canary.parameter_name: "p3"}},
-        ],
-        negative_requests=[{"method": "GET", "path": "/", "query": {config.canary.parameter_name: "neg"}}],
-        canary="p1",
-        oracle_functions=["mysqli_query"],
-    )
-    seen_preconditions: list[GatePreconditions] = []
-
-    class _Resp:
-        headers: dict[str, str] = {}
-        status_code: int = 200
-        body: str = ""
-
-    monkeypatch.setattr("padv.orchestrator.runtime.send_request", lambda *args, **kwargs: _Resp())
-    monkeypatch.setattr(
-        "padv.orchestrator.runtime.parse_response_headers",
-        lambda request_id, headers, oracle: RuntimeEvidence(
-            request_id=request_id,
-            status="ok",
-            call_count=1,
-            overflow=False,
-            arg_truncated=False,
-            result_truncated=False,
-            correlation=request_id,
-            calls=[],
-            raw_headers={},
-        ),
-    )
-
-    def _fake_evaluate_candidate(**kwargs):
-        seen_preconditions.append(kwargs["preconditions"])
-        return GateResult("DROPPED", ["V0"], "V3", "test")
-
-    monkeypatch.setattr("padv.orchestrator.runtime.evaluate_candidate", _fake_evaluate_candidate)
-
-    validate_candidates_runtime(
-        config=config,
-        store=store,
-        static_evidence=[_evidence()],
-        candidates=[candidate],
-        run_id="run-filter-sql-shape-preconditions",
-        plans_by_candidate={candidate.candidate_id: plan},
-        planner_trace={},
-        discovery_trace={},
-        artifact_refs=[],
-        auth_state={},
-    )
-
-    assert seen_preconditions == [GatePreconditions()]
-
-
-def test_validate_runtime_filters_nonhuman_sql_runtime_preconditions(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
-    store = EvidenceStore(tmp_path / ".padv")
-    candidate = _candidate()
-    candidate.preconditions = [
-        "Application must be at security level 0 or 1 (default is 0)",
-        "Database must be accessible and populated with pen_test_tools table",
-        "For UNION-based: Must match 5-column structure of base query",
-        "For boolean-blind: Differential response analysis based on WHERE clause evaluation",
-        "For error-based: Intentional syntax errors trigger CustomErrorHandler reflection",
-        "For special UUID: Must use exact UUID 'c84326e4-7487-41d3-91fd-88280828c756' which triggers $lWhereClause = ';'",
-        "For time-based: SLEEP() function must be available in MySQL",
-        "MySQL error reporting must be enabled (default at security levels 0-1)",
-        "PHP session must be initiated (automatically happens on first request)",
-    ]
-    candidate.auth_requirements = [
-        "Active PHP session (established via session_start() - no credentials required)",
-        "No JWT token required (AJAX endpoints do not implement JWT authentication)",
-        "No special permissions or roles required",
-        "No username/password required",
-    ]
-    plan = ValidationPlan(
-        candidate_id=candidate.candidate_id,
-        intercepts=["mysqli_query"],
-        positive_requests=[
-            {"method": "GET", "path": "/", "query": {config.canary.parameter_name: "p1"}},
-            {"method": "GET", "path": "/", "query": {config.canary.parameter_name: "p2"}},
-            {"method": "GET", "path": "/", "query": {config.canary.parameter_name: "p3"}},
-        ],
-        negative_requests=[{"method": "GET", "path": "/", "query": {config.canary.parameter_name: "neg"}}],
-        canary="p1",
-        oracle_functions=["mysqli_query"],
-    )
-    seen_preconditions: list[GatePreconditions] = []
-
-    class _Resp:
-        headers: dict[str, str] = {}
-        status_code: int = 200
-        body: str = ""
-
-    monkeypatch.setattr("padv.orchestrator.runtime.send_request", lambda *args, **kwargs: _Resp())
-    monkeypatch.setattr(
-        "padv.orchestrator.runtime.parse_response_headers",
-        lambda request_id, headers, oracle: RuntimeEvidence(
-            request_id=request_id,
-            status="ok",
-            call_count=1,
-            overflow=False,
-            arg_truncated=False,
-            result_truncated=False,
-            correlation=request_id,
-            calls=[],
-            raw_headers={},
-        ),
-    )
-
-    def _fake_evaluate_candidate(**kwargs):
-        seen_preconditions.append(kwargs["preconditions"])
-        return GateResult("DROPPED", ["V0"], "V3", "test")
-
-    monkeypatch.setattr("padv.orchestrator.runtime.evaluate_candidate", _fake_evaluate_candidate)
-
-    validate_candidates_runtime(
-        config=config,
-        store=store,
-        static_evidence=[_evidence()],
-        candidates=[candidate],
-        run_id="run-filter-nonhuman-sql-preconditions",
-        plans_by_candidate={candidate.candidate_id: plan},
-        planner_trace={},
-        discovery_trace={},
-        artifact_refs=[],
-        auth_state={},
-    )
-
-    assert seen_preconditions == [GatePreconditions()]
-
-
-def test_validate_runtime_resolves_auth_requirements_when_cookies_present(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
-    store = EvidenceStore(tmp_path / ".padv")
-    candidate = _candidate()
-    candidate.preconditions = []
     candidate.auth_requirements = ["Authenticated session required"]
     plan = ValidationPlan(
         candidate_id=candidate.candidate_id,
         intercepts=["mysqli_query"],
-        positive_requests=[
-            {"method": "GET", "path": "/", "query": {config.canary.parameter_name: "p1"}},
-            {"method": "GET", "path": "/", "query": {config.canary.parameter_name: "p2"}},
-            {"method": "GET", "path": "/", "query": {config.canary.parameter_name: "p3"}},
-        ],
+        positive_requests=[{"method": "GET", "path": "/", "query": {config.canary.parameter_name: "p1"}}],
         negative_requests=[{"method": "GET", "path": "/", "query": {config.canary.parameter_name: "neg"}}],
         canary="p1",
         oracle_functions=["mysqli_query"],
     )
-    seen_preconditions: list[GatePreconditions] = []
 
-    class _Resp:
-        headers: dict[str, str] = {}
-        status_code: int = 200
-        body: str = ""
-
-    monkeypatch.setattr("padv.orchestrator.runtime.send_request", lambda *args, **kwargs: _Resp())
-    monkeypatch.setattr(
-        "padv.orchestrator.runtime.parse_response_headers",
-        lambda request_id, headers, oracle: RuntimeEvidence(
-            request_id=request_id,
-            status="ok",
-            call_count=1,
-            overflow=False,
-            arg_truncated=False,
-            result_truncated=False,
-            correlation=request_id,
-            calls=[],
-            raw_headers={},
-        ),
-    )
-
-    def _fake_evaluate_candidate(**kwargs):
-        seen_preconditions.append(kwargs["preconditions"])
-        return GateResult("DROPPED", ["V0"], "V3", "test")
-
-    monkeypatch.setattr("padv.orchestrator.runtime.evaluate_candidate", _fake_evaluate_candidate)
-
-    validate_candidates_runtime(
-        config=config,
-        store=store,
-        static_evidence=[_evidence()],
-        candidates=[candidate],
-        run_id="run-auth-resolved",
-        plans_by_candidate={candidate.candidate_id: plan},
-        planner_trace={},
-        discovery_trace={},
-        artifact_refs=[],
-        auth_state={"cookies": {"PHPSESSID": "abc"}},
-    )
-
-    assert seen_preconditions == [GatePreconditions()]
+    with pytest.raises(InvalidGatePreconditionsError, match="legacy candidate.preconditions/auth_requirements"):
+        validate_candidates_runtime(
+            config=config,
+            store=store,
+            static_evidence=[_evidence()],
+            candidates=[candidate],
+            run_id="run-auth-resolved",
+            plans_by_candidate={candidate.candidate_id: plan},
+            planner_trace={},
+            discovery_trace={},
+            artifact_refs=[],
+            auth_state={"cookies": {"PHPSESSID": "abc"}},
+        )
 
 
 def test_validate_runtime_reuses_existing_bundle_without_replaying_requests(
@@ -996,12 +1017,16 @@ def test_validate_runtime_reuses_existing_bundle_without_replaying_requests(
         discovery_trace={},
         planner_trace={},
     )
-    store.save_bundle(bundle)
+    store.save_bundle(bundle, run_id="run-reuse")
 
     def _should_not_send(*_args, **_kwargs):
         raise AssertionError("send_request should not run when bundle already exists")
 
     monkeypatch.setattr("padv.orchestrator.runtime.send_request", _should_not_send)
+    monkeypatch.setattr(
+        "padv.store.evidence_store.EvidenceStore.load_bundle_legacy_lookup",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("legacy bundle lookup should not run")),
+    )
 
     bundles, decisions = validate_candidates_runtime(
         config=config,
@@ -1018,21 +1043,6 @@ def test_validate_runtime_reuses_existing_bundle_without_replaying_requests(
     assert len(bundles) == 1
     assert bundles[0].bundle_id == bundle.bundle_id
     assert decisions["DROPPED"] == 1
-
-
-def test_normalize_gate_preconditions_maps_auth_variants_to_same_typed_requirement() -> None:
-    config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
-    variants = [
-        ["Login required before reaching the endpoint"],
-        ["Authenticated user must access this page"],
-        ["Admin session required for exploitation"],
-    ]
-
-    normalized = [_normalize_gate_preconditions(_candidate_with_preconditions(items), {}, config) for items in variants]
-
-    assert normalized[0] == GatePreconditions(requires_auth=True)
-    assert normalized[1] == GatePreconditions(requires_auth=True)
-    assert normalized[2] == GatePreconditions(requires_auth=True, requires_session=True)
 
 
 def test_validate_runtime_marks_tail_candidates_skipped_when_budget_exhausts(
@@ -1101,163 +1111,55 @@ def test_validate_runtime_marks_tail_candidates_skipped_when_budget_exhausts(
 
     assert processed == ["cand-1"]
     assert [bundle.gate_result.decision for bundle in bundles] == ["DROPPED", "SKIPPED_BUDGET"]
+    assert [bundle.candidate_outcome for bundle in bundles] == ["REFUTED", "SKIPPED_BUDGET"]
     assert bundles[1].bundle_type == "skipped_budget"
     assert "budget exhausted" in bundles[1].gate_result.reason
     assert decisions["DROPPED"] == 1
     assert decisions["SKIPPED_BUDGET"] == 1
     persisted = store.load_bundle("bundle-run-budget-tail-cand-2", run_id="run-budget-tail")
     assert persisted is not None
+    assert persisted["candidate_outcome"] == "SKIPPED_BUDGET"
 
 
-def test_normalize_gate_preconditions_resolves_auth_and_session_with_cookies() -> None:
+def test_normalize_gate_preconditions_rejects_legacy_strings() -> None:
     config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
-    candidate = _candidate_with_preconditions(["Authenticated session required"])
+    candidate = _candidate_with_preconditions(["Login required before reaching the endpoint"])
 
-    unresolved = _normalize_gate_preconditions(candidate, {"PHPSESSID": "abc"}, config)
+    with pytest.raises(InvalidGatePreconditionsError, match="legacy candidate.preconditions/auth_requirements"):
+        _normalize_gate_preconditions(candidate, None, {}, config)
 
-    assert unresolved == GatePreconditions()
 
-
-def test_normalize_gate_preconditions_drops_request_shape_and_observed_env_notes() -> None:
+def test_normalize_gate_preconditions_ignores_legacy_prose_when_typed_requirements_exist() -> None:
     config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
-    candidate = _candidate_with_preconditions(
-        [
-            "For level 0: Can use GET or POST",
-            "PHP shell_exec() function must be enabled",
-            "Valid PHP session (automatically created)",
-            "SOAP request must be well-formed XML with targetHost parameter",
-            "Server must accept POST requests to SOAP endpoint",
-            "Unix/Linux system with /etc/passwd readable by web server",
-        ],
-        vuln_class="command_injection_boundary",
-        sink="shell_exec",
+    first = _candidate_with_preconditions(
+        ["planner explanation version one"],
+        auth_requirements=["separate human note"],
+        gate_preconditions=GatePreconditions(requires_auth=True, requires_session=True),
+    )
+    second = _candidate_with_preconditions(
+        ["planner explanation version two"],
+        auth_requirements=["same setup explained differently"],
+        gate_preconditions=GatePreconditions(requires_auth=True, requires_session=True),
+        candidate_id="cand-preconditions-2",
     )
 
-    unresolved = _normalize_gate_preconditions(candidate, {"PHPSESSID": "abc"}, config)
+    first_normalized = _normalize_gate_preconditions(first, None, {}, config)
+    second_normalized = _normalize_gate_preconditions(second, None, {}, config)
 
-    assert unresolved == GatePreconditions()
+    assert first_normalized == GatePreconditions(requires_auth=True, requires_session=True)
+    assert second_normalized == first_normalized
 
 
-def test_normalize_gate_preconditions_drops_live_mutillidae_request_shape_notes() -> None:
+def test_normalize_gate_preconditions_resolves_typed_auth_and_session_with_cookies() -> None:
     config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
     candidate = _candidate_with_preconditions(
-        [
-            "Content-Type: text/xml; charset=utf-8",
-            "POST request with valid SOAP 1.1 envelope structure",
-            "SOAPAction header may be required depending on SOAP client",
-            "security-level=0 (SECURITY_LEVEL_INSECURE disables authentication and input validation)",
-            "shell_exec() function enabled in PHP configuration (not disabled via disable_functions)",
-            "Valid JSON format (json_decode check at line 74)",
-        ],
-        candidate_id="cand-live-preconditions",
-        vuln_class="command_injection_boundary",
-        title="cmdi live",
-        file_path="src/ws.php",
-        sink="shell_exec",
+        ["legacy prose should not survive once typed preconditions resolve"],
+        gate_preconditions=GatePreconditions(requires_auth=True, requires_session=True),
     )
 
-    unresolved = _normalize_gate_preconditions(candidate, {}, config)
+    unresolved = _normalize_gate_preconditions(candidate, None, {"PHPSESSID": "abc"}, config)
 
     assert unresolved == GatePreconditions()
-
-
-def test_normalize_gate_preconditions_drops_live_runtime_body_parameter_notes() -> None:
-    config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
-    candidate = _candidate_with_preconditions(
-        [
-            "POST request with SOAP envelope",
-            "targetHost parameter in SOAP body",
-            "message parameter in SOAP body",
-            "JSON body with hostname parameter",
-            "parameter with payload",
-        ],
-        candidate_id="cand-live-body-params",
-        vuln_class="command_injection_boundary",
-        title="cmdi body params",
-        file_path="src/ws.php",
-        sink="shell_exec",
-    )
-
-    unresolved = _normalize_gate_preconditions(candidate, {}, config)
-
-    assert unresolved == GatePreconditions()
-
-
-def test_normalize_gate_preconditions_drops_live_mutillidae_env_assumptions() -> None:
-    config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
-    candidate = _candidate_with_preconditions(
-        [
-            "Apache web server with AllowOverride All or AllowOverride FileInfo",
-            "Webroot path known (/var/www/mutillidae)",
-            "mod_mime enabled in Apache (standard module)",
-            "www-data write permissions to webroot",
-            "/tmp directory writable by www-data (standard Linux permission)",
-            "file_exists() check at line 543 succeeds for /tmp paths",
-            "require_once() executes PHP code (standard PHP behavior)",
-        ],
-        candidate_id="cand-live-env",
-        vuln_class="file_upload_influence",
-        title="upload live",
-        file_path="src/upload.php",
-        sink="move_uploaded_file",
-        expected_intercepts=["move_uploaded_file"],
-    )
-
-    unresolved = _normalize_gate_preconditions(candidate, {}, config)
-
-    assert unresolved == GatePreconditions()
-
-
-def test_normalize_gate_preconditions_drops_live_rest_and_sqli_request_notes() -> None:
-    config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
-    candidate = _candidate_with_preconditions(
-        [
-            "HTTP POST request to /webservices/rest/ws-dns-lookup.php",
-            "JSON body with hostname key containing shell metacharacters",
-            "Security level must be 0 (SECURITY_LEVEL_INSECURE)",
-            "Base query returns 5 columns: tool_id, tool_name, phase_to_use, tool_type, comment",
-            "MySQL database backend - syntax varies for other databases",
-            "Response returned as JSON making data extraction straightforward",
-            "ToolID parameter must not equal special UUID '0923ac83-8b50-4eda-ad81-f1aac6168c5c' (triggers empty check)",
-            "Union-based SQLi requires matching 5 columns in UNION SELECT",
-        ],
-        candidate_id="cand-live-rest-sqli",
-        vuln_class="sql_injection",
-        title="rest and sqli",
-        file_path="src/api.php",
-        sink="mysqli_query",
-    )
-
-    unresolved = _normalize_gate_preconditions(candidate, {}, config)
-
-    assert unresolved == GatePreconditions()
-
-
-def test_normalize_gate_preconditions_drops_live_upload_chain_notes() -> None:
-    config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
-    candidate = _candidate_with_preconditions(
-        [
-            "Optional: Pass command parameters via query string (?cmd=whoami) if webshell supports it",
-            "Security level must be 0 or 1 for both upload and LFI vulnerabilities",
-            "Stage 1 - Extract permanent file path from server response (disclosed in HTML table)",
-            "Stage 1 - File Upload: Authenticated session or uid cookie bypass (Cookie: uid=1)",
-            "Stage 1 - Tamper UPLOAD_DIRECTORY hidden field to /tmp or /dev/shm (world-writable)",
-            "Stage 1 - Upload webshell: POST to /index.php?page=upload-file.php with multipart/form-data",
-            "Stage 2 - LFI Execution: GET/POST to /index.php?page={uploaded_file_path}",
-            "Stage 2 - require_once() executes PHP code regardless of file extension",
-        ],
-        candidate_id="cand-live-upload-chain",
-        vuln_class="unrestricted_file_upload",
-        title="upload chain",
-        file_path="src/upload.php",
-        sink="move_uploaded_file",
-        auth_requirements=["Authenticated session (bypassable via uid cookie)"],
-        expected_intercepts=["move_uploaded_file"],
-    )
-
-    unresolved = _normalize_gate_preconditions(candidate, {}, config)
-
-    assert unresolved == GatePreconditions(requires_auth=True, requires_session=True, requires_upload=True)
 
 
 def _candidate_with_preconditions(
@@ -1270,6 +1172,7 @@ def _candidate_with_preconditions(
     sink: str = "shell_exec",
     auth_requirements: list[str] | None = None,
     expected_intercepts: list[str] | None = None,
+    gate_preconditions: GatePreconditions | None = None,
 ) -> Candidate:
     return Candidate(
         candidate_id=candidate_id,
@@ -1281,4 +1184,5 @@ def _candidate_with_preconditions(
         expected_intercepts=expected_intercepts or [sink],
         preconditions=preconditions,
         auth_requirements=list(auth_requirements or []),
+        gate_preconditions=gate_preconditions or GatePreconditions(),
     )

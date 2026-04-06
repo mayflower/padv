@@ -7,7 +7,7 @@ from typing import Any, Callable
 from padv.config.schema import PadvConfig
 from padv.models import Candidate, RunSummary, StaticEvidence
 from padv.orchestrator.graphs import analyze_with_graph, run_with_graph, validate_with_graph
-from padv.store.evidence_store import EvidenceStore
+from padv.store.evidence_store import EvidenceStore, RunIdRequiredError
 
 
 def analyze(
@@ -75,7 +75,10 @@ def run_pipeline(
 
 
 def export_bundle(store: EvidenceStore, bundle_id: str, output_path: str) -> Path:
-    bundle = store.load_bundle(bundle_id)
+    try:
+        bundle = store.load_bundle(bundle_id)
+    except RunIdRequiredError:
+        bundle = store.load_bundle_legacy_lookup(bundle_id)
     if bundle is None:
         raise FileNotFoundError(f"bundle not found: {bundle_id}")
     out = Path(output_path)

@@ -68,6 +68,7 @@ timeout_seconds = 120
 use_deepagents = true
 hard_fail = true
 require_langgraph = true
+deterministic_mode = false
 max_iterations = 3
 improvement_patience = 1
 skeptic_rounds = 1

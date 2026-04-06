@@ -5,6 +5,7 @@ from pathlib import Path
 from padv.config.schema import load_config
 from padv.gates.engine import evaluate_candidate
 from padv.models import RuntimeEvidence, StaticEvidence
+from padv.validation.preconditions import GatePreconditions
 
 
 def _runtime_with_flags(request_id: str, *flags: str) -> RuntimeEvidence:
@@ -49,7 +50,7 @@ def test_gate_xss_runtime_signal_validates() -> None:
         negative_runs=[_runtime_with_flags("n1")],
         intercepts=[],
         canary="padv-canary",
-        preconditions=[],
+        preconditions=GatePreconditions(),
         evidence_signals=["source", "web"],
         vuln_class="xss_output_boundary",
     )
@@ -69,7 +70,7 @@ def test_gate_xss_negative_control_fails_when_signal_repeats() -> None:
         negative_runs=[_runtime_with_flags("n1", "xss_dom_witness")],
         intercepts=[],
         canary="padv-canary",
-        preconditions=[],
+        preconditions=GatePreconditions(),
         evidence_signals=["source", "web"],
         vuln_class="xss_output_boundary",
     )
@@ -90,7 +91,7 @@ def test_gate_access_control_requires_negative_control_cleanliness() -> None:
         negative_runs=[_runtime_with_flags("n1", "authz_bypass_status")],
         intercepts=[],
         canary="padv-canary",
-        preconditions=[],
+        preconditions=GatePreconditions(),
         evidence_signals=["source", "web"],
         vuln_class="broken_access_control",
     )
@@ -111,7 +112,7 @@ def test_gate_access_control_requires_pair_observation() -> None:
         negative_runs=[_runtime_with_flags("n1")],
         intercepts=[],
         canary="padv-canary",
-        preconditions=[],
+        preconditions=GatePreconditions(),
         evidence_signals=["source", "web"],
         vuln_class="broken_access_control",
     )

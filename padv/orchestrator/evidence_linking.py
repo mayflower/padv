@@ -91,13 +91,18 @@ def _candidate_index_matches(
 ) -> list[StaticEvidence]:
     matched: list[StaticEvidence] = []
 
+    direct_uid_key = _index_ref_key("candidate_uid", candidate.candidate_uid)
+    if direct_uid_key is not None:
+        direct_uid_matches = index.typed_refs.get(direct_uid_key, ())
+        if direct_uid_matches:
+            return _dedupe_static_evidence(direct_uid_matches, index)
+
     def _extend(ref_type: str, value: str) -> None:
         key = _index_ref_key(ref_type, value)
         if key is None:
             return
         matched.extend(index.typed_refs.get(key, ()))
 
-    _extend("candidate_uid", candidate.candidate_uid)
     _extend("candidate_id", candidate.candidate_id)
 
     refs = candidate_link_refs(candidate, extra_refs=extra_refs)
@@ -148,6 +153,10 @@ def static_evidence_matches_candidate(
 ) -> bool:
     if item.candidate_uid and item.candidate_uid == candidate.candidate_uid:
         return True
+
+    if item.candidate_uid and candidate.candidate_uid:
+        return False
+
     if item.candidate_id == candidate.candidate_id:
         return True
 

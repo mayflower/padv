@@ -114,7 +114,7 @@ def _build_pattern(vuln_class: str, failed_gate: str, entry: dict[str, Any]) -> 
 
 
 def analyze_failures(store: EvidenceStore, min_occurrences: int = 3) -> FailureAnalysis:
-    bundle_ids = store.list_bundle_ids()
+    bundles_payload = store.load_all_bundles_legacy_lookup()
     run_ids = store.list_run_ids()
 
     total_candidates = 0
@@ -131,10 +131,8 @@ def analyze_failures(store: EvidenceStore, min_occurrences: int = 3) -> FailureA
         }
     )
 
-    for bundle_id in bundle_ids:
-        bundle = store.load_bundle(bundle_id)
-        if not isinstance(bundle, dict):
-            continue
+    for bundle in bundles_payload:
+        bundle_id = _as_str(bundle.get("bundle_id"), "unknown")
         total_candidates += 1
         if _accumulate_bundle_failure(bundle, bundle_id, groups, gate_distribution):
             total_failures += 1

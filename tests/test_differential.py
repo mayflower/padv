@@ -10,6 +10,7 @@ from padv.models import Candidate, DifferentialPair, GateResult, RuntimeEvidence
 from padv.orchestrator.differential import build_unprivileged_request, compare_responses, needs_differential
 from padv.orchestrator.runtime import validate_candidates_runtime
 from padv.store.evidence_store import EvidenceStore
+from padv.validation.preconditions import GatePreconditions
 
 
 def _runtime(request_id: str, *, http_status: int = 200, call_count: int = 3, body: str = "ok") -> RuntimeEvidence:
@@ -161,7 +162,7 @@ def test_gate_engine_accepts_differential_pairs_for_authz_classes() -> None:
         negative_runs=negative_runs,
         intercepts=["header"],
         canary=canary,
-        preconditions=[],
+        preconditions=GatePreconditions(),
         evidence_signals=["source", "web"],
         vuln_class="broken_access_control",
         differential_pairs=differential,
@@ -192,7 +193,7 @@ def test_gate_engine_ignores_differential_pairs_for_non_authz() -> None:
         negative_runs=negative_runs,
         intercepts=["header"],
         canary=canary,
-        preconditions=[],
+        preconditions=GatePreconditions(),
         evidence_signals=["source", "web"],
         vuln_class="xss_output_boundary",
         differential_pairs=differential,

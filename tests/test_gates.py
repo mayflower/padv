@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 
+import padv.validation.preconditions as preconditions_module
+import pytest
 from padv.config.schema import load_config
 from padv.gates.engine import evaluate_candidate
 from padv.models import Candidate, OracleEvidence, RuntimeCall, RuntimeEvidence, StaticEvidence
-from padv.validation.preconditions import GatePreconditions
+from padv.validation.preconditions import GatePreconditions, InvalidGatePreconditionsError
 
 
 def _runtime(
@@ -66,7 +69,7 @@ def test_gate_validated() -> None:
         negative_runs=[_runtime("n1", canary, negative=True)],
         intercepts=["mysqli_query"],
         canary=canary,
-        preconditions=[],
+        preconditions=GatePreconditions(),
         evidence_signals=["joern", "web"],
     )
     assert result.decision == "VALIDATED"
@@ -87,6 +90,22 @@ def test_gate_needs_setup_when_preconditions() -> None:
     )
     assert result.decision == "NEEDS_HUMAN_SETUP"
     assert result.reason == "typed_preconditions_unresolved: unknown_blockers=custom proxy must be configured"
+
+
+def test_gate_rejects_legacy_precondition_strings() -> None:
+    config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
+    canary = "padv-canary-123"
+    with pytest.raises(InvalidGatePreconditionsError, match="GatePreconditions object or structured mapping"):
+        evaluate_candidate(
+            config=config,
+            static_evidence=[],
+            positive_runs=[_runtime("p1", canary), _runtime("p2", canary)],
+            negative_runs=[_runtime("n1", canary, negative=True)],
+            intercepts=["mysqli_query"],
+            canary=canary,
+            preconditions=["manual VPN setup required before execution"],  # type: ignore[arg-type]
+            evidence_signals=["source", "web"],
+        )
 
 
 def test_gate_needs_setup_for_typed_auth_and_csrf_requirements() -> None:
@@ -127,7 +146,7 @@ def test_gate_drops_without_multi_evidence_signals() -> None:
         negative_runs=[_runtime("n1", canary, negative=True)],
         intercepts=["mysqli_query"],
         canary=canary,
-        preconditions=[],
+        preconditions=GatePreconditions(),
         evidence_signals=["joern"],
     )
     assert result.decision == "DROPPED"
@@ -154,7 +173,7 @@ def test_gate_v0_tolerates_partial_positive_request_failures() -> None:
         negative_runs=[_runtime("n1", canary, negative=True)],
         intercepts=["mysqli_query"],
         canary=canary,
-        preconditions=[],
+        preconditions=GatePreconditions(),
         evidence_signals=["joern", "web"],
     )
     assert result.failed_gate != "V0"
@@ -180,7 +199,7 @@ def test_gate_v0_drops_when_all_positive_requests_fail() -> None:
         negative_runs=[_runtime("n1", canary, negative=True)],
         intercepts=["mysqli_query"],
         canary=canary,
-        preconditions=[],
+        preconditions=GatePreconditions(),
         evidence_signals=["joern", "web"],
     )
     assert result.decision == "DROPPED"
@@ -212,11 +231,18 @@ def test_gate_canonicalizes_family_level_sql_aliases() -> None:
         ],
         intercepts=["mysqli_query"],
         canary=canary,
-        preconditions=[],
+        preconditions=GatePreconditions(),
         evidence_signals=["joern", "web"],
-        vuln_class="sql_injection",
+        vuln_class="legacy_probe",
     )
     assert result.decision == "VALIDATED"
+
+
+def test_preconditions_policy_avoids_regex_parsing() -> None:
+    source = inspect.getsource(preconditions_module)
+
+    assert "import re" not in source
+    assert "re." not in source
 
 
 def test_gate_accepts_typed_oracle_evidence_without_analysis_flags() -> None:
@@ -276,21 +302,48 @@ def test_gate_accepts_typed_oracle_evidence_without_analysis_flags() -> None:
         negative_runs=[negative],
         intercepts=["mysqli_query"],
         canary=canary,
-        preconditions=[],
+        preconditions=GatePreconditions(),
         evidence_signals=["joern", "web"],
-        candidate=Candidate(
-            candidate_id="cand-1",
-            vuln_class="sql_injection",
-            title="SQLi",
-            file_path="app.php",
-            line=10,
-            sink="mysqli_query",
-            expected_intercepts=["mysqli_query"],
-            validation_mode="runtime",
-            canonical_class="sql_injection_boundary",
-        ),
+        vuln_class="legacy_probe",
     )
     assert result.decision == "VALIDATED"
+
+
+def test_gate_drops_truncated_runtime_evidence() -> None:
+    config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
+    canary = "padv-canary-truncated"
+    truncated_positive = _runtime("p1", canary)
+    truncated_positive.status = "insufficient_evidence"
+    truncated_positive.result_truncated = True
+    truncated_positive.aux["truncation_reason"] = "result_truncated"
+    clean_positive = _runtime("p2", canary)
+    negative = _runtime("n1", canary, negative=True)
+
+    result = evaluate_candidate(
+        config=config,
+        static_evidence=[
+            StaticEvidence(
+                candidate_id="cand-1",
+                query_profile="default",
+                query_id="joern::sql_boundary",
+                file_path="app.php",
+                line=10,
+                snippet="mysqli_query($db, $q);",
+                hash="abc",
+            )
+        ],
+        positive_runs=[truncated_positive, clean_positive],
+        negative_runs=[negative],
+        intercepts=["mysqli_query"],
+        canary=canary,
+        preconditions=GatePreconditions(),
+        evidence_signals=["joern", "web"],
+        vuln_class="legacy_probe",
+    )
+
+    assert result.decision == "DROPPED"
+    assert result.failed_gate == "V5"
+    assert result.reason == "runtime evidence truncated"
 
 
 def test_gate_returns_confirmed_analysis_for_analysis_only_candidate() -> None:
@@ -302,7 +355,7 @@ def test_gate_returns_confirmed_analysis_for_analysis_only_candidate() -> None:
         negative_runs=[],
         intercepts=[],
         canary="padv",
-        preconditions=[],
+        preconditions=GatePreconditions(),
         candidate=Candidate(
             candidate_id="cand-a",
             vuln_class="security_misconfiguration",

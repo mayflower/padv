@@ -19,6 +19,21 @@ class CorruptStoreArtifactError(RuntimeError):
         super().__init__(f"corrupt {self.artifact_kind} JSON at {self.path}")
 
 
+class RunIdRequiredError(RuntimeError):
+    def __init__(self, method: str, artifact_kind: str) -> None:
+        self.method = str(method)
+        self.artifact_kind = str(artifact_kind)
+        super().__init__(f"{self.method} requires explicit run_id for {self.artifact_kind}")
+
+
+class AmbiguousLegacyBundleLookupError(RuntimeError):
+    def __init__(self, bundle_id: str, paths: list[Path]) -> None:
+        self.bundle_id = str(bundle_id)
+        self.paths = list(paths)
+        joined = ", ".join(str(path) for path in self.paths)
+        super().__init__(f"legacy bundle lookup matched multiple artifacts for {self.bundle_id}: {joined}")
+
+
 @dataclass(slots=True)
 class RunScopedEvidenceStore:
     store: "EvidenceStore"
@@ -163,6 +178,31 @@ class EvidenceStore:
             return self.run_dir(run_id) / "bundles"
         return self.bundles_dir
 
+    def _bundle_paths_legacy_lookup(self, bundle_id: str | None = None) -> list[Path]:
+        paths: list[Path] = []
+        if bundle_id is None:
+            if self.bundles_dir.exists():
+                paths.extend(sorted(self.bundles_dir.glob(_JSON_GLOB)))
+            if self.runs_dir.exists():
+                for run_root in sorted(self.runs_dir.iterdir()):
+                    if not run_root.is_dir():
+                        continue
+                    paths.extend(sorted((run_root / "bundles").glob(_JSON_GLOB)))
+            return paths
+
+        if self.bundles_dir.exists():
+            root_path = self.bundles_dir / f"{bundle_id}.json"
+            if root_path.exists():
+                paths.append(root_path)
+        if self.runs_dir.exists():
+            for run_root in sorted(self.runs_dir.iterdir()):
+                if not run_root.is_dir():
+                    continue
+                scoped = run_root / "bundles" / f"{bundle_id}.json"
+                if scoped.exists():
+                    paths.append(scoped)
+        return paths
+
     def save_candidates(self, candidates: list[Candidate], *, run_id: str | None = None) -> None:
         if run_id:
             self.ensure_run(run_id)
@@ -213,23 +253,11 @@ class EvidenceStore:
         return path
 
     def load_bundle(self, bundle_id: str, *, run_id: str | None = None) -> dict[str, Any] | None:
+        if run_id is None:
+            raise RunIdRequiredError("load_bundle", "bundle")
         path = self._bundles_dir(run_id) / f"{bundle_id}.json"
         if not path.exists():
-            if run_id is not None:
-                legacy_path = self.bundles_dir / f"{bundle_id}.json"
-                if not legacy_path.exists():
-                    return None
-                path = legacy_path
-            else:
-                for candidate in self.runs_dir.iterdir() if self.runs_dir.exists() else []:
-                    if not candidate.is_dir():
-                        continue
-                    scoped = candidate / "bundles" / f"{bundle_id}.json"
-                    if scoped.exists():
-                        path = scoped
-                        break
-                else:
-                    return None
+            return None
         payload = self._load_json(path, artifact_kind="bundle", raise_on_corrupt=True)
         if isinstance(payload, dict):
             return payload
@@ -237,22 +265,35 @@ class EvidenceStore:
             return None
         return None
 
-    def list_bundle_ids(self, *, run_id: str | None = None) -> list[str]:
-        bundles_dir = self._bundles_dir(run_id)
-        if run_id is not None:
-            if not bundles_dir.exists():
-                return []
-            return sorted(p.stem for p in bundles_dir.glob(_JSON_GLOB))
+    def load_bundle_legacy_lookup(self, bundle_id: str) -> dict[str, Any] | None:
+        paths = self._bundle_paths_legacy_lookup(bundle_id)
+        if not paths:
+            return None
+        if len(paths) > 1:
+            raise AmbiguousLegacyBundleLookupError(bundle_id, paths)
+        payload = self._load_json(paths[0], artifact_kind="bundle", raise_on_corrupt=True)
+        if isinstance(payload, dict):
+            return payload
+        return None
 
-        ids: set[str] = set()
-        if self.bundles_dir.exists():
-            ids.update(p.stem for p in self.bundles_dir.glob(_JSON_GLOB))
-        if self.runs_dir.exists():
-            for run_root in self.runs_dir.iterdir():
-                if not run_root.is_dir():
-                    continue
-                ids.update(p.stem for p in (run_root / "bundles").glob(_JSON_GLOB))
-        return sorted(ids)
+    def list_bundle_ids(self, *, run_id: str | None = None) -> list[str]:
+        if run_id is None:
+            raise RunIdRequiredError("list_bundle_ids", "bundle")
+        bundles_dir = self._bundles_dir(run_id)
+        if not bundles_dir.exists():
+            return []
+        return sorted(p.stem for p in bundles_dir.glob(_JSON_GLOB))
+
+    def list_bundle_ids_legacy_lookup(self) -> list[str]:
+        return [path.stem for path in self._bundle_paths_legacy_lookup()]
+
+    def load_all_bundles_legacy_lookup(self) -> list[dict[str, Any]]:
+        bundles: list[dict[str, Any]] = []
+        for path in self._bundle_paths_legacy_lookup():
+            payload = self._load_json(path, artifact_kind="bundle", raise_on_corrupt=True)
+            if isinstance(payload, dict):
+                bundles.append(payload)
+        return bundles
 
     def save_run_summary(self, summary: RunSummary) -> Path:
         self.ensure()

@@ -18,6 +18,7 @@ from padv.models import Candidate, StaticEvidence
 from padv.path_scope import is_app_candidate_path, normalize_repo_path
 from padv.static.joern.query_sets import VULN_CLASS_SPECS, VulnClassSpec
 from padv.taxonomy import canonicalize_vuln_class
+from padv.validation.preconditions import GatePreconditions
 
 
 _RE_NON_ALNUM = r"[^a-z0-9_$]"
@@ -52,13 +53,9 @@ def _hash_for(file_path: str, line: int, text: str) -> str:
     return hashlib.sha256(payload).hexdigest()[:16]
 
 
-def _preconditions_for_spec(spec: VulnClassSpec, config: PadvConfig) -> list[str]:
-    preconditions: list[str] = []
-    if config.auth.enabled:
-        preconditions.append("auth-state-known")
-    if not spec.runtime_validatable:
-        preconditions.append("runtime-oracle-not-applicable")
-    return preconditions
+def _preconditions_for_spec(spec: VulnClassSpec, config: PadvConfig) -> GatePreconditions:
+    del spec
+    return GatePreconditions(requires_auth=bool(config.auth.enabled))
 
 
 def _collect_created_scip_files(base_dir: Path, started_at: float) -> list[Path]:
@@ -407,12 +404,13 @@ def discover_scip_candidates_with_meta(
                     sink=hit.symbol or "scip-symbol",
                     expected_intercepts=list(spec.intercepts),
                     entrypoint_hint=None,
-                    preconditions=_preconditions_for_spec(spec, config),
+                    preconditions=[],
                     notes="scip semantic detector",
                     provenance=["scip"],
                     evidence_refs=[evidence_id],
                     confidence=0.55,
-                    auth_requirements=(["login"] if config.auth.enabled else []),
+                    auth_requirements=[],
+                    gate_preconditions=_preconditions_for_spec(spec, config),
                     web_path_hints=[],
                 )
             cand.canonical_class = canonicalize_vuln_class(spec.vuln_class)
