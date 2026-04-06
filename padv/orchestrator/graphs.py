@@ -776,6 +776,7 @@ _VULN_CLASS_SUBSTRING_MAP: tuple[tuple[tuple[str, ...], str], ...] = (
     (("software_data_integrity",), "software_data_integrity"),
     (("logging_monitoring",), "logging_monitoring_failures"),
 )
+_RECENT_OBJECTIVE_FAMILY_COOLDOWN = 1
 
 
 def _objective_family_from_vuln_class(vuln_class: str) -> str:
@@ -803,6 +804,53 @@ def _objective_family_from_text(*parts: str) -> str | None:
 
 def _objective_family_title(family: str) -> str:
     return family.replace("_", " ").title()
+
+
+def _recent_objective_families(frontier_state: dict[str, Any], *, limit: int = _RECENT_OBJECTIVE_FAMILY_COOLDOWN) -> list[str]:
+    if limit <= 0 or not isinstance(frontier_state, dict):
+        return []
+    history = frontier_state.get("history", [])
+    if not isinstance(history, list):
+        return []
+    recent: list[str] = []
+    seen: set[str] = set()
+    for item in reversed(history):
+        if not isinstance(item, dict):
+            continue
+        family = _objective_family_from_text(item.get("objective_id", ""))
+        if not family or family in seen:
+            continue
+        recent.append(family)
+        seen.add(family)
+        if len(recent) >= limit:
+            break
+    return recent
+
+
+def _suppress_recent_objective_families(
+    objectives: list[ObjectiveScore],
+    frontier_state: dict[str, Any],
+) -> tuple[list[ObjectiveScore], dict[str, Any]]:
+    recent_families = set(_recent_objective_families(frontier_state))
+    if not recent_families:
+        return objectives, {"suppressed_ids": [], "families": []}
+
+    kept: list[ObjectiveScore] = []
+    suppressed: list[ObjectiveScore] = []
+    for item in objectives:
+        family = _objective_family_from_text(item.objective_id, item.title, item.rationale)
+        if family and family in recent_families:
+            suppressed.append(item)
+            continue
+        kept.append(item)
+
+    if not kept:
+        return objectives, {"suppressed_ids": [], "families": sorted(recent_families)}
+
+    return kept, {
+        "suppressed_ids": [item.objective_id for item in suppressed],
+        "families": sorted(recent_families),
+    }
 
 
 def _build_family_buckets(candidates: list[Candidate]) -> dict[str, dict[str, Any]]:
@@ -891,11 +939,16 @@ def _supplement_objectives_with_candidate_coverage(
 
     supplemented = list(objectives)
     existing_ids = {item.objective_id for item in objectives}
+    recent_families = set(_recent_objective_families(state.get("frontier_state", {})))
     added: list[str] = []
+    skipped_recent: list[str] = []
     for family, data in ranked_families:
         if len(supplemented) >= max_objectives:
             break
         if family in represented:
+            continue
+        if family in recent_families:
+            skipped_recent.append(family)
             continue
         obj = _make_backfill_objective(family, data, existing_ids)
         supplemented.append(obj)
@@ -910,7 +963,7 @@ def _supplement_objectives_with_candidate_coverage(
         }
         for family, data in ranked_families
     }
-    return supplemented, {"added": added, "families": summary}
+    return supplemented, {"added": added, "families": summary, "skipped_recent": sorted(set(skipped_recent))}
 
 
 def _frontier_matches_target_scope(frontier: dict[str, Any], state: GraphState) -> bool:
@@ -1920,10 +1973,12 @@ def _node_orient(state: GraphState) -> GraphState:
         objective_queue=state.get("objective_queue", []),
     )
     objectives, supplement_trace = _supplement_objectives_with_candidate_coverage(state, objectives)
+    objectives, suppression_trace = _suppress_recent_objective_families(objectives, state.get("frontier_state", {}))
     state["objective_queue"] = objectives
     planner_trace = state.setdefault("planner_trace", {})
     planner_trace["root_orient"] = trace
     planner_trace["objective_backfill"] = supplement_trace
+    planner_trace["objective_repeat_suppression"] = suppression_trace
     update_agent_runtime_context(_state_runtime(state), objective_queue=[item.to_dict() for item in objectives])
     _persist_agent_workspace_artifact(
         state,
@@ -1932,6 +1987,7 @@ def _node_orient(state: GraphState) -> GraphState:
             "objectives": [item.to_dict() for item in objectives],
             "trace": trace,
             "supplement": supplement_trace,
+            "repeat_suppression": suppression_trace,
         },
     )
     return _finalize_stage(state, "orient", f"objectives={len(objectives)}")

@@ -577,6 +577,109 @@ def test_objective_backfill_keeps_more_than_sixteen_families(tmp_path: Path) -> 
     assert "obj-auto-logging_monitoring_failures" in ids
 
 
+def test_node_orient_suppresses_recent_family_repeat_when_alternatives_exist(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runtime = SimpleNamespace(shared_context={})
+    config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
+    recent_ssrf = ObjectiveScore(
+        objective_id="obj-auto-ssrf-2",
+        title="Investigate SSRF",
+        rationale="repeat family",
+        expected_info_gain=0.84,
+        priority=0.84,
+        channels=["source", "graph", "web"],
+    )
+    seen: dict[str, object] = {}
+
+    monkeypatch.setattr(graph_mod, "_state_runtime", lambda state: runtime)
+
+    def _fake_orient(_runtime, _config, *, frontier_state, discovery_trace, run_validation, objective_queue):
+        seen["objective_ids"] = [item.objective_id for item in objective_queue]
+        return [recent_ssrf], {"engine": "stub", "objective_ids": [recent_ssrf.objective_id]}
+
+    monkeypatch.setattr(graph_mod, "orient_root_agent", _fake_orient)
+
+    state: graph_mod.GraphState = {
+        "config": config,
+        "repo_root": str(tmp_path),
+        "store": EvidenceStore(tmp_path / ".padv"),
+        "run_id": "run-orient-repeat-cooldown",
+        "mode": "variant",
+        "run_validation": False,
+        "loop_continue": True,
+        "decisions": {},
+        "candidates": [
+            Candidate(
+                candidate_id="cand-ssrf",
+                vuln_class="ssrf",
+                title="SSRF lead",
+                file_path="src/ssrf.php",
+                line=12,
+                sink="curl_exec",
+                expected_intercepts=["curl_exec"],
+                confidence=0.9,
+            ),
+            Candidate(
+                candidate_id="cand-upload",
+                vuln_class="file_upload_influence",
+                title="Upload lead",
+                file_path="src/upload.php",
+                line=24,
+                sink="move_uploaded_file",
+                expected_intercepts=["move_uploaded_file"],
+                confidence=0.8,
+            ),
+        ],
+        "static_evidence": [],
+        "selected_candidates": [],
+        "selected_static": [],
+        "objective_queue": [],
+        "hypothesis_board": [],
+        "refutations": [],
+        "experiment_board": [],
+        "witness_bundles": [],
+        "bundles": [],
+        "all_bundles": [],
+        "iteration_bundles": [],
+        "artifact_refs": [],
+        "planner_trace": {},
+        "frontier_state": {
+            **graph_mod._default_frontier_state(),
+            "history": [{"iteration": 31, "objective_id": "obj-auto-ssrf-2"}],
+        },
+        "discovery_trace": {"semantic_count": 2},
+        "agent_runtime": runtime,
+    }
+
+    out = graph_mod._node_orient(state)
+
+    ids = [item.objective_id for item in out["objective_queue"]]
+    assert "obj-auto-ssrf-2" not in ids
+    assert "obj-auto-unrestricted_file_upload" in ids
+    assert out["planner_trace"]["objective_repeat_suppression"]["suppressed_ids"] == ["obj-auto-ssrf-2"]
+
+
+def test_recent_family_suppression_keeps_queue_when_no_alternative_exists() -> None:
+    objective = ObjectiveScore(
+        objective_id="obj-auto-ssrf-2",
+        title="Investigate SSRF",
+        rationale="repeat family",
+        expected_info_gain=0.84,
+        priority=0.84,
+        channels=["source", "graph", "web"],
+    )
+
+    kept, trace = graph_mod._suppress_recent_objective_families(
+        [objective],
+        {"history": [{"iteration": 31, "objective_id": "obj-auto-ssrf-2"}]},
+    )
+
+    assert [item.objective_id for item in kept] == ["obj-auto-ssrf-2"]
+    assert trace["suppressed_ids"] == []
+    assert trace["families"] == ["ssrf"]
+
+
 def test_run_with_graph_stops_on_stagnation_without_root_continue(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

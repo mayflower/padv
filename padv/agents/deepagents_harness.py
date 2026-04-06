@@ -3287,8 +3287,25 @@ def schedule_actions_with_deepagents(
     raw_actions = response.get("actions")
     if not isinstance(raw_actions, list):
         raise AgentExecutionError("deepagents scheduler response missing actions list")
-
     by_id = {c.candidate_id: c for c in candidates}
+    triage_by_candidate = _normalize_triage_by_candidate(
+        response.get("skip_reasons"),
+        set(by_id.keys()),
+    )
+    if not raw_actions:
+        return [], {}, {
+            "engine": "deepagents",
+            "selected": [],
+            "scores": {},
+            "agent_scores": {},
+            "actions": [],
+            "notes": response.get("notes", []),
+            "triage_by_candidate": triage_by_candidate,
+            "selection_strategy": "agent-empty-selection",
+            "agent_action_count": 0,
+            "reason": "agent-no-actions",
+        }
+
     selected_scores, actions = _parse_agent_actions(raw_actions, by_id)
 
     seen_files, seen_classes = _extract_coverage_sets(frontier_state)
@@ -3309,10 +3326,6 @@ def schedule_actions_with_deepagents(
 
     selected = [by_id[cid] for cid in selected_ids]
     limited_ids = {c.candidate_id for c in selected}
-    triage_by_candidate = _normalize_triage_by_candidate(
-        response.get("skip_reasons"),
-        set(by_id.keys()),
-    )
     trace = {
         "engine": "deepagents",
         "selected": [c.candidate_id for c in selected],

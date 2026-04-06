@@ -253,6 +253,33 @@ def test_schedule_actions_captures_structured_triage_fields(monkeypatch: pytest.
     assert triage["missing_witness"] == "no class witness path"
 
 
+def test_schedule_actions_respects_explicit_empty_action_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
+    monkeypatch.setattr(
+        "padv.agents.deepagents_harness._invoke_deepagent_json",
+        lambda *args, **kwargs: {
+            "actions": [],
+            "skip_reasons": [
+                {
+                    "candidate_id": "cand-1",
+                    "reproducibility_gap": "already exhausted",
+                    "legitimacy_gap": "",
+                    "impact_gap": "",
+                    "missing_witness": "",
+                }
+            ],
+            "notes": ["no valid actions remain"],
+        },
+    )
+
+    selected, scores, trace = schedule_actions_with_deepagents([_candidate(), _candidate2()], config, max_candidates=1)
+    assert selected == []
+    assert scores == {}
+    assert trace["reason"] == "agent-no-actions"
+    assert trace["selection_strategy"] == "agent-empty-selection"
+    assert trace["triage_by_candidate"]["cand-1"]["reproducibility_gap"] == "already exhausted"
+
+
 def test_schedule_actions_prioritizes_when_actions_are_unusable(monkeypatch: pytest.MonkeyPatch) -> None:
     config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
     monkeypatch.setattr(
@@ -311,7 +338,11 @@ def test_schedule_actions_applies_class_quota_priority(monkeypatch: pytest.Monke
     c = _candidate2()
     monkeypatch.setattr(
         "padv.agents.deepagents_harness._invoke_deepagent_json",
-        lambda *args, **kwargs: {"actions": []},
+        lambda *args, **kwargs: {
+            "actions": [
+                {"candidate_id": "unknown-id", "action": "validate", "expected_info_gain": "bad", "rationale": "x"}
+            ]
+        },
     )
 
     selected, _scores, trace = schedule_actions_with_deepagents([a, b, c], config, max_candidates=2)
