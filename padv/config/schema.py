@@ -16,6 +16,7 @@ class ConfigError(ValueError):
 class TargetConfig:
     base_url: str
     request_timeout_seconds: int
+    shared_session: bool = False
 
 
 @dataclass(slots=True)
@@ -411,6 +412,7 @@ def load_config(path: str | Path) -> PadvConfig:
         target=TargetConfig(
             base_url=_get_str(target, "base_url"),
             request_timeout_seconds=_get_int(target, "request_timeout_seconds", min_value=1),
+            shared_session=_get_optional_bool(target, "shared_session", default=False),
         ),
         oracle=OracleConfig(
             request_key_header=_get_str(oracle, "request_key_header"),

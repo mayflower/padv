@@ -129,22 +129,14 @@ class HttpSession:
             return [self.resolve_value(item) for item in value]
         return value
 
-    def _learn_json_tokens(self, body: str) -> None:
-        try:
-            payload = json.loads(body)
-        except json.JSONDecodeError:
-            return
-        if not isinstance(payload, dict):
-            return
-        for key, value in payload.items():
-            normalized_key = str(key).strip()
-            if not normalized_key or isinstance(value, (dict, list, tuple)):
-                continue
-            self.tokens[normalized_key] = str(value)
-
-    def learn_from_response(self, headers: Any, body: str) -> None:
+    def learn_from_response(self, headers: Any, extraction_rules: dict[str, str] | None = None) -> None:
         self.learn_from_headers(headers)
-        self._learn_json_tokens(body)
+        if extraction_rules:
+            # Simple extraction from headers for now.
+            for token_name, header_name in extraction_rules.items():
+                value = headers.get(header_name)
+                if value:
+                    self.tokens[token_name] = value
 
 
 def _encode_body(body: Any, content_type: str | None) -> bytes | None:
@@ -174,6 +166,7 @@ def send_request(
     body: Any = None,
     cookie_jar: dict[str, str] | None = None,
     session: HttpSession | None = None,
+    token_extraction_rules: dict[str, str] | None = None,
 ) -> HttpResponse:
     full_url = url
     resolved_headers = (
@@ -215,7 +208,7 @@ def send_request(
         with urllib.request.urlopen(req, timeout=timeout_seconds) as resp:
             body_text = resp.read().decode("utf-8", errors="replace")
             if session is not None:
-                session.learn_from_response(resp.headers, body_text)
+                session.learn_from_response(resp.headers, token_extraction_rules)
             return HttpResponse(
                 status_code=getattr(resp, "status", 200),
                 headers=dict(resp.headers.items()),
@@ -224,7 +217,7 @@ def send_request(
     except urllib.error.HTTPError as exc:
         body_text = exc.read().decode("utf-8", errors="replace")
         if session is not None:
-            session.learn_from_response(exc.headers, body_text)
+            session.learn_from_response(exc.headers, token_extraction_rules)
         return HttpResponse(
             status_code=int(exc.code),
             headers=dict(exc.headers.items()),

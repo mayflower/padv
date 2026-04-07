@@ -1013,7 +1013,7 @@ def _merge_unique(existing: list[str], incoming: list[str]) -> list[str]:
 
 
 def _candidate_signal_set(candidate: Candidate) -> set[str]:
-    signals = {x.strip().lower() for x in candidate.provenance if isinstance(x, str) and x.strip()}
+    signals = {x.strip() for x in candidate.provenance if isinstance(x, str) and x.strip()}
     if candidate.web_path_hints:
         signals.add("web")
     return signals
@@ -3238,6 +3238,7 @@ def run_with_graph(
             planner_trace=planner_trace,
             decisions=decisions,
         )
+        from padv.eval.coverage import evaluate_run_coverage
         summary = RunSummary(
             run_id=run_id,
             mode=mode,
@@ -3250,6 +3251,7 @@ def run_with_graph(
             planner_trace=planner_trace,
             frontier_state=result.get("frontier_state", {}),
             candidate_outcomes=count_candidate_outcomes(bundles),
+            run_coverage=evaluate_run_coverage(bundles),
             stop_rule=stop_rule,
             stop_reason=stop_reason,
         )
@@ -3358,6 +3360,7 @@ def validate_with_graph(
             planner_trace=planner_trace,
             decisions=decisions,
         )
+        from padv.eval.coverage import evaluate_run_coverage
         summary = RunSummary(
             run_id=run_id,
             mode="variant",
@@ -3370,6 +3373,7 @@ def validate_with_graph(
             planner_trace=planner_trace,
             frontier_state={},
             candidate_outcomes=count_candidate_outcomes(bundles),
+            run_coverage=evaluate_run_coverage(bundles),
             stop_rule=stop_rule,
             stop_reason=stop_reason,
         )

@@ -18,9 +18,9 @@ def _has_oracle_hit(
     canary: str,
     config: PadvConfig,
 ) -> bool:
-    intercepts_lower = {i.lower() for i in intercepts}
+    intercepts_lower = {i.casefold() for i in intercepts}
     for call in evidence.calls:
-        if intercepts_lower and call.function.lower() not in intercepts_lower:
+        if intercepts_lower and call.function.casefold() not in intercepts_lower:
             continue
         for arg in call.args:
             if contains_canary(
@@ -37,6 +37,8 @@ def _evaluate_v0_scope(
     positive_runs: list[RuntimeEvidence],
     negative_runs: list[RuntimeEvidence],
 ) -> tuple[list[RuntimeEvidence], list[RuntimeEvidence], GateResult | None]:
+    if any(run.status == "insufficient_evidence" for run in positive_runs + negative_runs):
+        return [], [], GateResult("INSUFFICIENT_EVIDENCE", [], "V0", "oracle output truncated")
     hard_scope_failures = {"auth_failed", "missing_key", "missing_intercept", "inactive"}
     if any(run.status in hard_scope_failures for run in positive_runs):
         return [], [], GateResult("DROPPED", [], "V0", "runtime not in valid scope")
@@ -57,7 +59,7 @@ def _evaluate_v2_corroboration(
         return GateResult("DROPPED", passed, "V2", "missing static evidence")
     if not in_scope_positive_runs:
         return GateResult("DROPPED", passed, "V2", "missing runtime evidence")
-    signal_set = {s.strip().lower() for s in (evidence_signals or []) if isinstance(s, str) and s.strip()}
+    signal_set = {s.strip().casefold() for s in (evidence_signals or []) if isinstance(s, str) and s.strip()}
     if len(signal_set) < 2:
         return GateResult("DROPPED", passed, "V2", "insufficient multi-evidence corroboration")
     return None

@@ -743,7 +743,7 @@ def _handoff_cache_key(
         "response_contract": response_contract,
         "config_signature": _handoff_config_signature(config),
         "code_signature": _handoff_code_signature(),
-        "prompt_version": _handoff_prompt_version(),
+        "prompt_version": _handoff_prompt_version(category),
         "run_scope": _handoff_cache_run_scope(session, category),
         "envelope": _normalize_cache_value(envelope),
     }
@@ -790,8 +790,18 @@ def _handoff_code_signature() -> str:
     return signature
 
 
-def _handoff_prompt_version() -> str:
-    return str(_HANDOFF_CACHE_PROMPT_VERSION)
+_HANDOFF_CACHE_PROMPT_VERSIONS = {
+    "proposer": "2026-04-06-proposer",
+    "skeptic": "2026-04-06-skeptic",
+    "auth": "2026-04-06-auth",
+    "planner": "2026-04-06-planner",
+}
+
+def _handoff_prompt_version(category: str) -> str:
+    for prefix, version in _HANDOFF_CACHE_PROMPT_VERSIONS.items():
+        if prefix in category:
+            return version
+    return _HANDOFF_CACHE_PROMPT_VERSIONS["planner"]
 
 
 def _handoff_cache_run_scope(session: AgentSession, category: str) -> str:

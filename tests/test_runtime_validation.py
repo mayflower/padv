@@ -9,6 +9,7 @@ from urllib.parse import parse_qs
 import pytest
 
 from padv.config.schema import load_config
+from padv.dynamic.http.runner import HttpResponse
 from padv.models import (
     Candidate,
     CanaryMatchRule,
@@ -182,10 +183,8 @@ def test_validate_runtime_executes_structured_steps_not_legacy_request_arrays(
     plan.negative_requests = [{"method": "GET", "path": "/legacy-negative", "query": {"marker": "legacy"}}]
     seen_paths: list[str] = []
 
-    class _Resp:
-        headers: dict[str, str] = {}
-        status_code: int = 200
-        body: str = ""
+    def _Resp():
+        return HttpResponse(status_code=200, headers={}, body="")
 
     def _fake_send_request(*args, **kwargs):
         seen_paths.append(str(kwargs.get("url", "")))
@@ -306,10 +305,8 @@ def test_validate_runtime_forwards_auth_cookies(monkeypatch: pytest.MonkeyPatch,
     )
     seen_cookie_jars: list[dict[str, str]] = []
 
-    class _Resp:
-        headers: dict[str, str] = {}
-        status_code: int = 200
-        body: str = ""
+    def _Resp():
+        return HttpResponse(status_code=200, headers={}, body="")
 
     def _fake_send_request(*args, **kwargs):
         seen_cookie_jars.append(dict(kwargs.get("cookie_jar", {})))
@@ -385,10 +382,8 @@ def test_validate_runtime_uses_distinct_sessions_per_candidate(monkeypatch: pyte
     )
     sessions_by_candidate: dict[str, object] = {}
 
-    class _Resp:
-        headers: dict[str, str] = {}
-        status_code: int = 200
-        body: str = ""
+    def _Resp():
+        return HttpResponse(status_code=200, headers={}, body="")
 
     def _fake_send_request(*args, **kwargs):
         headers = kwargs.get("headers", {})
@@ -469,7 +464,7 @@ def test_validate_runtime_executes_structured_csrf_flow(monkeypatch: pytest.Monk
         canary="csrf-token",
         steps=[
             HttpStep(method="GET", path="/login", expectations=HttpExpectations(status_codes=[200])),
-            HttpStep(method="GET", path="/token", expectations=HttpExpectations(status_codes=[200])),
+            HttpStep(method="GET", path="/token", token_extraction_rules={"csrf_token": "X-CSRF-Token"}, expectations=HttpExpectations(status_codes=[200])),
             HttpStep(
                 method="POST",
                 path="/action",
@@ -501,10 +496,10 @@ def test_validate_runtime_executes_structured_csrf_flow(monkeypatch: pytest.Monk
                     return
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
+                self.send_header("X-CSRF-Token", "token-123")
                 self.end_headers()
                 self.wfile.write(b'{"csrf_token":"token-123"}')
-                return
-            self.send_response(404)
+                return            self.send_response(404)
             self.end_headers()
 
         def do_POST(self) -> None:  # noqa: N802
@@ -592,10 +587,8 @@ def test_validate_runtime_passes_shared_witness_contract_and_witness(monkeypatch
     )
     seen: dict[str, object] = {}
 
-    class _Resp:
-        headers: dict[str, str] = {}
-        status_code: int = 200
-        body: str = ""
+    def _Resp():
+        return HttpResponse(status_code=200, headers={}, body="")
 
     monkeypatch.setattr("padv.orchestrator.runtime.send_request", lambda *args, **kwargs: _Resp())
     monkeypatch.setattr(
@@ -658,10 +651,8 @@ def test_validate_runtime_embeds_candidate_hypotheses(monkeypatch: pytest.Monkey
         oracle_functions=["mysqli_query"],
     )
 
-    class _Resp:
-        headers: dict[str, str] = {}
-        status_code: int = 200
-        body: str = ""
+    def _Resp():
+        return HttpResponse(status_code=200, headers={}, body="")
 
     monkeypatch.setattr("padv.orchestrator.runtime.send_request", lambda *args, **kwargs: _Resp())
     monkeypatch.setattr(
@@ -730,10 +721,8 @@ def test_validate_runtime_associates_static_evidence_via_evidence_refs(
     )
     seen_query_ids: list[list[str]] = []
 
-    class _Resp:
-        headers: dict[str, str] = {}
-        status_code: int = 200
-        body: str = ""
+    def _Resp():
+        return HttpResponse(status_code=200, headers={}, body="")
 
     monkeypatch.setattr("padv.orchestrator.runtime.send_request", lambda *args, **kwargs: _Resp())
     monkeypatch.setattr(
@@ -807,10 +796,8 @@ def test_validate_runtime_uses_oracle_functions_and_preserves_request_headers(mo
     seen_headers: list[dict[str, str]] = []
     seen_bodies: list[object] = []
 
-    class _Resp:
-        headers: dict[str, str] = {}
-        status_code: int = 200
-        body: str = ""
+    def _Resp():
+        return HttpResponse(status_code=200, headers={}, body="")
 
     def _fake_send_request(*args, **kwargs):
         seen_headers.append(dict(kwargs.get("headers", {})))
@@ -872,10 +859,8 @@ def test_validate_runtime_populates_typed_runtime_evidence(monkeypatch: pytest.M
         class_contract_id="runtime:sql_injection_boundary",
     )
 
-    class _Resp:
-        headers: dict[str, str] = {}
-        status_code: int = 200
-        body: str = "mysql syntax error near padv-canary-typed"
+    def _Resp():
+        return HttpResponse(status_code=200, headers={}, body="mysql syntax error near padv-canary-typed")
 
     monkeypatch.setattr("padv.orchestrator.runtime.send_request", lambda *args, **kwargs: _Resp())
     monkeypatch.setattr(

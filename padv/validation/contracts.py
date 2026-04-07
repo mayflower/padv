@@ -38,7 +38,7 @@ _SQL_ERROR_MARKERS = SQL_ERROR_MARKERS
 _WITNESS_CONTRACT_OVERRIDES: dict[str, dict[str, object]] = {
     "sql_injection_boundary": {
         "required_all": ["sql_sink_oracle_witness"],
-        "required_any": ["sql_status_diff_witness", "sql_body_diff_witness", "sql_error_witness"],
+        "required_any": ["sql_status_diff_witness", "sql_body_diff_witness"],
     },
     "command_injection_boundary": {"required_all": ["command_sink_oracle_witness"], "required_any": []},
     "code_injection_boundary": {"required_all": ["code_sink_oracle_witness"], "required_any": []},
@@ -325,20 +325,6 @@ def _has_body_diff(positive_runs: list[RuntimeEvidence], negative_runs: list[Run
     return False
 
 
-def _has_sql_error_witness(positive_runs: list[RuntimeEvidence], negative_runs: list[RuntimeEvidence]) -> bool:
-    positive_hit = any(
-        any(marker in (run.body_excerpt or "").casefold() for marker in _SQL_ERROR_MARKERS)
-        for run in positive_runs
-    )
-    if not positive_hit:
-        return False
-    negative_hit = any(
-        any(marker in (run.body_excerpt or "").casefold() for marker in _SQL_ERROR_MARKERS)
-        for run in negative_runs
-    )
-    return not negative_hit
-
-
 def _call_args(runs: list[RuntimeEvidence], intercepts: set[str]) -> list[str]:
     values: list[str] = []
     lowered_intercepts = {x.casefold() for x in intercepts if isinstance(x, str) and x.strip()}
@@ -406,8 +392,6 @@ def _derive_sql_injection_flags(
         flags.add("sql_status_diff_witness")
     if _has_body_diff(positive_runs, negative_runs):
         flags.add("sql_body_diff_witness")
-    if _has_sql_error_witness(positive_runs, negative_runs):
-        flags.add("sql_error_witness")
     return flags
 
 

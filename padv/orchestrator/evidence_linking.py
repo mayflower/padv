@@ -137,7 +137,8 @@ def _matches_file_line_ref(ref: str, file_path: str, line: int) -> bool:
 
 
 def candidate_link_refs(candidate: Candidate, *, extra_refs: Iterable[str] = ()) -> set[str]:
-    refs = _normalized_refs(list(candidate.evidence_refs) + list(extra_refs))
+    all_refs = list(candidate.evidence_refs) + getattr(candidate, 'static_evidence_refs', []) + list(extra_refs)
+    refs = _normalized_refs(all_refs)
     refs.add(str(candidate.candidate_uid).strip())
     refs.add(str(candidate.candidate_id).strip())
     if candidate.file_path and candidate.line:

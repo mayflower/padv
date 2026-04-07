@@ -6,6 +6,7 @@ import pytest
 
 from padv.config.schema import load_config
 from padv.gates.engine import evaluate_candidate
+from padv.dynamic.http.runner import HttpResponse
 from padv.models import Candidate, DifferentialPair, GateResult, RuntimeEvidence, StaticEvidence, ValidationPlan
 from padv.orchestrator.differential import build_unprivileged_request, compare_responses, needs_differential
 from padv.orchestrator.runtime import validate_candidates_runtime
@@ -222,10 +223,8 @@ def test_differential_request_consumes_existing_budget(monkeypatch: pytest.Monke
     send_calls = {"count": 0}
     seen_pairs: list[DifferentialPair] = []
 
-    class _Resp:
-        headers: dict[str, str] = {}
-        status_code: int = 200
-        body: str = "ok"
+    def _Resp():
+        return HttpResponse(status_code=200, headers={}, body="ok")
 
     def _fake_send_request(*args, **kwargs):
         send_calls["count"] += 1
@@ -281,10 +280,8 @@ def test_runtime_differential_uses_configured_auth_levels(monkeypatch: pytest.Mo
     send_calls = {"count": 0}
     seen_pairs: list[DifferentialPair] = []
 
-    class _Resp:
-        headers: dict[str, str] = {}
-        status_code: int = 200
-        body: str = "ok"
+    def _Resp():
+        return HttpResponse(status_code=200, headers={}, body="ok")
 
     def _fake_send_request(*args, **kwargs):
         send_calls["count"] += 1

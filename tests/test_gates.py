@@ -341,9 +341,9 @@ def test_gate_drops_truncated_runtime_evidence() -> None:
         vuln_class="legacy_probe",
     )
 
-    assert result.decision == "DROPPED"
-    assert result.failed_gate == "V5"
-    assert result.reason == "runtime evidence truncated"
+    assert result.decision == "INSUFFICIENT_EVIDENCE"
+    assert result.failed_gate == "V0"
+    assert "truncated" in result.reason
 
 
 def test_gate_returns_confirmed_analysis_for_analysis_only_candidate() -> None:

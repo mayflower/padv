@@ -3026,7 +3026,11 @@ def test_handoff_cache_key_changes_when_prompt_version_changes(
         workspace_role="source",
         delegated_role=None,
     )
-    monkeypatch.setattr("padv.agents.deepagents_harness._HANDOFF_CACHE_PROMPT_VERSION", "2026-04-07")
+    monkeypatch.setitem(
+        __import__("padv.agents.deepagents_harness").agents.deepagents_harness._HANDOFF_CACHE_PROMPT_VERSIONS,
+        "planner",
+        "2026-04-07",
+    )
     key_b = _handoff_cache_key(
         session,
         config=config,

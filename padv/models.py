@@ -49,6 +49,23 @@ def count_candidate_outcomes(bundles: list[Any]) -> dict[str, int]:
 
 
 @dataclass(slots=True)
+class AuthBoundaryContract:
+    unauth_status_codes: list[int]
+    unauth_redirect_patterns: list[str]
+    expected_session_cookies: list[str]
+    csrf_token_name: str | None = None
+
+@dataclass(slots=True)
+class CandidateSeed:
+    seed_id: str
+    vuln_class: str
+    file_path: str
+    symbol: str
+    why: str
+    requested_static_checks: list[str]
+    entrypoint_hint: str | None = None
+
+@dataclass(slots=True)
 class Candidate:
     candidate_id: str
     vuln_class: str
@@ -62,6 +79,7 @@ class Candidate:
     notes: str = ""
     provenance: list[str] = field(default_factory=list)
     evidence_refs: list[str] = field(default_factory=list)
+    static_evidence_refs: list[str] = field(default_factory=list)
     confidence: float = 0.0
     auth_requirements: list[str] = field(default_factory=list)
     web_path_hints: list[str] = field(default_factory=list)
@@ -100,6 +118,23 @@ class StaticEvidence:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(slots=True)
+class StaticEvidenceRequest:
+    seed_id: str
+    vuln_class: str
+    file_path: str
+    symbol: str
+    requested_checks: list[str]
+
+@dataclass(slots=True)
+class StaticEvidenceResult:
+    seed_id: str
+    status: str
+    reason: str
+    evidence: list[StaticEvidence]
+    expected_intercepts: list[str]
 
 
 @dataclass(slots=True)
@@ -344,6 +379,7 @@ class RunSummary:
     planner_trace: dict[str, Any] = field(default_factory=dict)
     frontier_state: dict[str, Any] = field(default_factory=dict)
     candidate_outcomes: dict[str, int] = field(default_factory=default_candidate_outcomes)
+    run_coverage: dict[str, str] = field(default_factory=dict)
     stop_rule: str = ""
     stop_reason: str = ""
 
@@ -469,6 +505,7 @@ class HttpStep:
     body: Any = None
     body_ref: str = ""
     cookies: dict[str, str] = field(default_factory=dict)
+    token_extraction_rules: dict[str, str] = field(default_factory=dict)
     expectations: HttpExpectations = field(default_factory=HttpExpectations)
 
     def __post_init__(self) -> None:
@@ -500,6 +537,8 @@ class HttpStep:
             request["body_text"] = "" if self.body is None else str(self.body)
         elif self.body_type != "none" and self.body is not None:
             request["body"] = self.body
+        if self.token_extraction_rules:
+            request["token_extraction_rules"] = dict(self.token_extraction_rules)
         return request
 
     def to_dict(self) -> dict[str, Any]:
@@ -513,6 +552,7 @@ class HttpStep:
             "body": self.body,
             "body_ref": self.body_ref,
             "cookies": dict(self.cookies),
+            "token_extraction_rules": dict(self.token_extraction_rules),
             "expectations": self.expectations.to_dict(),
         }
 

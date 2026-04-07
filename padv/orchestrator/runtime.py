@@ -9,7 +9,7 @@ from typing import Any
 from dataclasses import dataclass
 
 from padv.config.schema import PadvConfig
-from padv.dynamic.http.runner import HttpSession, RequestError, send_request
+from padv.dynamic.http.runner import HttpSession, RequestError, send_request, HttpResponse
 from padv.dynamic.sandbox import adapter as sandbox_adapter
 from padv.gates.engine import evaluate_candidate
 from padv.models import (
@@ -27,6 +27,7 @@ from padv.models import (
     ValidationPlan,
     WitnessEvidence,
     utc_now_iso,
+    AuthBoundaryContract,
 )
 from padv.oracle.morcilla import parse_response_headers, sanitized_runtime_evidence
 from padv.orchestrator.differential import (
@@ -77,7 +78,6 @@ _AUTHZ_PROBE_CLASSES = {
 }
 
 _ERROR_MARKERS = ("warning:", "notice:", "fatal error", "stack trace", "uncaught exception")
-_LOGIN_MARKERS = ("login", "sign in", "signin", "anmelden", "auth", "passwort", "password")
 _SQL_ERROR_MARKERS = SQL_ERROR_MARKERS
 
 _CLASS_ORACLE_WITNESS_FLAGS = CLASS_ORACLE_WITNESS_FLAGS
@@ -436,39 +436,11 @@ def _status_ok(status_code: int) -> bool:
     return 200 <= status_code < 400
 
 
-def _request_has_token(request_spec: dict[str, Any]) -> bool:
-    keys: list[str] = []
-    for key in ("query", "body"):
-        value = request_spec.get(key)
-        if isinstance(value, dict):
-            keys.extend(str(k).casefold() for k in value.keys())
-    return any(("csrf" in key) or ("token" in key) or ("xsrf" in key) for key in keys)
-
-
-def _request_has_id(request_spec: dict[str, Any]) -> bool:
-    query = request_spec.get("query")
-    if not isinstance(query, dict):
-        return False
-    for key in query.keys():
-        norm = str(key).strip().casefold()
-        if norm == "id" or norm.endswith("_id") or norm.endswith("id"):
-            return True
-    return False
-
-
 def _extract_set_cookie(headers: dict[str, str]) -> str:
     for key, value in headers.items():
         if key.casefold() == "set-cookie":
             return value
     return ""
-
-
-def _looks_like_login(response: Any) -> bool:
-    location = str(response.headers.get("Location", "") or response.headers.get("location", "")).casefold()
-    body = (response.body or "").casefold()
-    if "login" in location or "signin" in location or "auth" in location:
-        return True
-    return any(marker in body for marker in _LOGIN_MARKERS)
 
 
 def _normalize_gate_preconditions(
@@ -537,80 +509,72 @@ def _derive_body_canary_flags(body: str, canary: str) -> tuple[set[str], bool]:
 def _derive_body_marker_flags(body_lower: str, has_raw_canary: bool) -> set[str]:
     flags: set[str] = set()
     if ("phpinfo()" in body_lower) or ("<title>phpinfo()" in body_lower) or ("php version" in body_lower):
-        flags.add("phpinfo_marker")
+        flags.add("diagnostic_phpinfo_marker")
     if any(marker in body_lower for marker in _ERROR_MARKERS):
         if has_raw_canary:
-            flags.add("verbose_error_leak")
-        flags.add("debug_leak")
+            flags.add("diagnostic_verbose_error_leak")
+        flags.add("diagnostic_debug_leak")
     if any(marker in body_lower for marker in _SQL_ERROR_MARKERS):
-        flags.add("sql_error_witness")
+        flags.add("diagnostic_sql_error")
     return flags
 
 
-def _derive_header_flags(response: Any) -> set[str]:
+def _derive_header_flags(response: HttpResponse) -> set[str]:
     header_keys = {k.casefold() for k in response.headers.keys()}
     if "x-powered-by" in header_keys or "server" in header_keys:
         return {"info_disclosure_header"}
     return set()
 
 
-def _check_authz_bypass_status(response: Any, anonymous_probe: Any) -> bool:
-    return (
-        _status_ok(int(response.status_code))
-        and _status_ok(int(anonymous_probe.status_code))
-        and not _looks_like_login(response)
-        and not _looks_like_login(anonymous_probe)
-    )
-
-
-def _check_idor_bypass(response: Any, anonymous_probe: Any, request_spec: dict[str, Any]) -> bool:
-    if not _request_has_id(request_spec):
+def _check_authz_bypass_status(response: HttpResponse, anonymous_probe: HttpResponse, auth_contract: AuthBoundaryContract | None = None) -> bool:
+    if not isinstance(response, HttpResponse) or not isinstance(anonymous_probe, HttpResponse):
+        raise TypeError("Expected HttpResponse for response and anonymous_probe")
+    if not _status_ok(int(response.status_code)):
         return False
-    if not _status_ok(int(response.status_code)) or not _status_ok(int(anonymous_probe.status_code)):
-        return False
-    return (response.body or "") != (anonymous_probe.body or "")
-
-
-def _check_csrf_missing_token(response: Any, request_spec: dict[str, Any]) -> bool:
-    method = str(request_spec.get("method", "GET")).upper()
-    if method not in {"POST", "PUT", "PATCH", "DELETE"}:
-        return False
-    return not _request_has_token(request_spec) and _status_ok(int(response.status_code))
+    if auth_contract:
+        anon_status = int(anonymous_probe.status_code)
+        if anon_status in auth_contract.unauth_status_codes:
+            return False
+        location = str(anonymous_probe.headers.get("Location", "") or anonymous_probe.headers.get("location", ""))
+        if any(p in location for p in auth_contract.unauth_redirect_patterns if p):
+            return False
+        return _status_ok(anon_status)
+    return _status_ok(int(anonymous_probe.status_code))
 
 
 def _derive_authz_probe_flags(
     candidate: Candidate,
-    response: Any,
-    anonymous_probe: Any,
+    response: HttpResponse,
+    anonymous_probe: HttpResponse,
     request_spec: dict[str, Any],
+    auth_contract: AuthBoundaryContract | None = None,
 ) -> set[str]:
+    if not isinstance(response, HttpResponse) or not isinstance(anonymous_probe, HttpResponse):
+        raise TypeError("Expected HttpResponse for response and anonymous_probe")
     flags: set[str] = {"authz_pair_observed"}
 
-    if _check_authz_bypass_status(response, anonymous_probe):
+    if _check_authz_bypass_status(response, anonymous_probe, auth_contract):
         flags.add("authz_bypass_status")
 
     if candidate.vuln_class == "auth_and_session_failures":
-        if _status_ok(int(anonymous_probe.status_code)) and not _looks_like_login(anonymous_probe):
+        if _check_authz_bypass_status(response, anonymous_probe, auth_contract):
             flags.add("auth_bypass")
-
-    if candidate.vuln_class == "idor_invariant_missing" and _check_idor_bypass(response, anonymous_probe, request_spec):
-        flags.add("idor_bypass")
-
-    if candidate.vuln_class == "csrf_invariant_missing" and _check_csrf_missing_token(response, request_spec):
-        flags.add("csrf_missing_token_acceptance")
 
     return flags
 
 
-def _derive_session_fixation_flags(response: Any, cookie_jar: dict[str, str]) -> set[str]:
+def _derive_session_fixation_flags(response: HttpResponse, cookie_jar: dict[str, str], auth_contract: AuthBoundaryContract | None) -> set[str]:
+    if not isinstance(response, HttpResponse):
+        raise TypeError("Expected HttpResponse for response")
     flags: set[str] = set()
+    if not auth_contract or not auth_contract.expected_session_cookies:
+        return flags
+        
     set_cookie = _extract_set_cookie(response.headers)
     if cookie_jar and set_cookie:
-        for key, value in cookie_jar.items():
-            key_norm = str(key).casefold()
-            if "sess" not in key_norm and "php" not in key_norm:
-                continue
-            if f"{key}={value}" in set_cookie:
+        for expected in auth_contract.expected_session_cookies:
+            val = cookie_jar.get(expected)
+            if val and f"{expected}={val}" in set_cookie:
                 flags.add("session_id_not_rotated")
     elif cookie_jar and not set_cookie:
         flags.add("session_cookie_not_rotated")
@@ -619,14 +583,19 @@ def _derive_session_fixation_flags(response: Any, cookie_jar: dict[str, str]) ->
 
 def _collect_analysis_flags(
     runtime: RuntimeEvidence,
-    response: Any,
+    response: HttpResponse,
     candidate: Candidate,
     plan: ValidationPlan,
     config: PadvConfig,
     request_spec: dict[str, Any],
     cookie_jar: dict[str, str],
-    anonymous_probe: Any | None,
+    anonymous_probe: HttpResponse | None,
+    auth_contract: AuthBoundaryContract | None = None,
 ) -> set[str]:
+    if not isinstance(response, HttpResponse):
+        raise TypeError("Expected HttpResponse for response")
+    if anonymous_probe is not None and not isinstance(anonymous_probe, HttpResponse):
+        raise TypeError("Expected HttpResponse for anonymous_probe")
     flags = {x for x in runtime.analysis_flags if isinstance(x, str) and x}
     body = response.body or ""
 
@@ -640,30 +609,33 @@ def _collect_analysis_flags(
         flags.add(witness_flag)
 
     if candidate.vuln_class in _AUTHZ_PROBE_CLASSES and anonymous_probe is not None:
-        flags |= _derive_authz_probe_flags(candidate, response, anonymous_probe, request_spec)
+        flags |= _derive_authz_probe_flags(candidate, response, anonymous_probe, request_spec, auth_contract)
 
     if candidate.vuln_class == "session_fixation_invariant":
-        flags |= _derive_session_fixation_flags(response, cookie_jar)
+        flags |= _derive_session_fixation_flags(response, cookie_jar, auth_contract)
 
     return flags
 
 
 def _annotate_runtime_evidence(
     runtime: RuntimeEvidence,
-    response: Any,
+    response: HttpResponse,
     candidate: Candidate,
     plan: ValidationPlan,
     config: PadvConfig,
     request_spec: dict[str, Any],
     cookie_jar: dict[str, str],
     elapsed_ms: int | None,
-    anonymous_probe: Any | None = None,
+    anonymous_probe: HttpResponse | None = None,
+    auth_contract: AuthBoundaryContract | None = None,
 ) -> RuntimeEvidence:
+    if not isinstance(response, HttpResponse):
+        raise TypeError("Expected HttpResponse for response")
     runtime.http_status = int(response.status_code)
     runtime.location = str(response.headers.get("Location", "") or response.headers.get("location", ""))
     runtime.body_excerpt = (response.body or "")[:2000]
 
-    flags = _collect_analysis_flags(runtime, response, candidate, plan, config, request_spec, cookie_jar, anonymous_probe)
+    flags = _collect_analysis_flags(runtime, response, candidate, plan, config, request_spec, cookie_jar, anonymous_probe, auth_contract)
     runtime.analysis_flags = sorted(flags)
 
     runtime.aux = dict(runtime.aux)
@@ -792,9 +764,9 @@ def _try_anonymous_probe(
             timeout_seconds=config.target.request_timeout_seconds,
             query=request_spec.get("query"),
             body=request_spec.get("body", request_spec.get("body_text")), cookie_jar={},
-            session=HttpSession(),
+            session=None,
+            token_extraction_rules=request_spec.get("token_extraction_rules"),
         )
-        return probe, 1
     except RequestError:
         return None, 0
 
@@ -825,6 +797,7 @@ def _run_positive_phase(
                 query=request_spec.get("query"),
                 body=request_spec.get("body", request_spec.get("body_text")), cookie_jar=cookie_jar,
                 session=session,
+                token_extraction_rules=request_spec.get("token_extraction_rules"),
             )
             runtime = parse_response_headers(req_id, response.headers, config.oracle)
             anonymous_probe, probe_cost = _try_anonymous_probe(config, request_spec, candidate, cookie_jar, budget, candidate_deadline)
@@ -873,12 +846,14 @@ def _run_negative_phase(
                 query=request_spec.get("query"),
                 body=request_spec.get("body", request_spec.get("body_text")), cookie_jar=cookie_jar,
                 session=session,
+                token_extraction_rules=request_spec.get("token_extraction_rules"),
             )
             runtime = parse_response_headers(req_id, response.headers, config.oracle)
             runtime = _annotate_runtime_evidence(
                 runtime=runtime, response=response, candidate=candidate, plan=plan,
                 config=config, request_spec=request_spec, cookie_jar=cookie_jar,
                 elapsed_ms=int((monotonic() - req_started) * 1000), anonymous_probe=None,
+                auth_contract=ctx.auth_contract,
             )
         except RequestError as exc:
             runtime = _make_failed_runtime(req_id, exc)
@@ -913,13 +888,13 @@ def _execute_differential_request(
     session = HttpSession.from_cookie_jar(unpriv_cookie_jar)
     try:
         req_started = monotonic()
-        response = send_request(
-            url=_target_url(config.target.base_url, unpriv_request),
+        response = send_request(            url=_target_url(config.target.base_url, unpriv_request),
             method=unpriv_request.get("method", "GET"), headers=headers,
             timeout_seconds=config.target.request_timeout_seconds,
             query=unpriv_request.get("query"),
             body=unpriv_request.get("body", unpriv_request.get("body_text")), cookie_jar=unpriv_cookie_jar,
             session=session,
+            token_extraction_rules=unpriv_request.get("token_extraction_rules"),
         )
         unpriv_runtime = parse_response_headers(req_id, response.headers, config.oracle)
         unpriv_runtime = _annotate_runtime_evidence(
@@ -985,11 +960,11 @@ def _run_differential_phase(
 
 def _collect_evidence_signals(candidate_static: list[StaticEvidence], candidate: Candidate) -> list[str]:
     query_signals = {
-        item.query_id.split("::", 1)[0].strip().lower()
+        item.query_id.split("::", 1)[0].strip()
         for item in candidate_static
         if isinstance(item.query_id, str) and item.query_id.strip()
     }
-    candidate_signals = {x.strip().lower() for x in candidate.provenance if isinstance(x, str) and x.strip()}
+    candidate_signals = {x.strip() for x in candidate.provenance if isinstance(x, str) and x.strip()}
     if candidate.web_path_hints:
         candidate_signals.add("web")
     return sorted(query_signals | candidate_signals)
@@ -1159,6 +1134,8 @@ class _ValidationContext:
     planner_trace: dict[str, Any]
     discovery_trace: dict[str, Any]
     artifact_refs: list[str]
+    auth_contract: AuthBoundaryContract | None = None
+    shared_session: HttpSession | None = None
 
 
 @dataclass(frozen=True)
@@ -1193,7 +1170,7 @@ def _validate_single_candidate_runtime(
     if plan.budgets.max_requests > 0:
         effective_request_budget = min(effective_request_budget, plan.budgets.max_requests)
     total_cost = 0
-    session = HttpSession.from_cookie_jar(ctx.cookie_jar)
+    session = ctx.shared_session if ctx.shared_session is not None else HttpSession.from_cookie_jar(ctx.cookie_jar)
 
     positive_runs, repro_ids, pos_cost = _run_positive_phase(
         ctx, candidate, plan, effective_request_budget, candidate_deadline, attempts, seen_flags, session,
@@ -1319,6 +1296,7 @@ def validate_candidates_runtime(
     discovery_trace: dict[str, Any] | None = None,
     artifact_refs: list[str] | None = None,
     auth_state: dict[str, Any] | None = None,
+    auth_contract: AuthBoundaryContract | None = None,
 ) -> tuple[list[EvidenceBundle], dict[str, int]]:
     plans_by_candidate = plans_by_candidate or {}
     planner_trace = planner_trace or {}
@@ -1335,11 +1313,14 @@ def validate_candidates_runtime(
     if config.sandbox.reset_cmd:
         sandbox_adapter.reset(config.sandbox)
 
+    shared_session = HttpSession.from_cookie_jar(cookie_jar) if config.target.shared_session else None
+
     ctx = _ValidationContext(
         config=config, store=store, run_id=run_id,
         cookie_jar=cookie_jar, auth_state=auth_state,
         planner_trace=planner_trace, discovery_trace=discovery_trace,
-        artifact_refs=artifact_refs,
+        artifact_refs=artifact_refs, auth_contract=auth_contract,
+        shared_session=shared_session,
     )
 
     static_by_candidate = group_static_evidence_by_candidate(candidates, static_evidence)

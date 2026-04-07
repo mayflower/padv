@@ -195,6 +195,7 @@ def test_http_session_reuses_cookie_and_cached_token_for_csrf_flow() -> None:
                     return
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
+                self.send_header("X-CSRF-Token", "token-123")
                 self.end_headers()
                 self.wfile.write(b'{"csrf_token":"token-123"}')
                 return
@@ -242,6 +243,7 @@ def test_http_session_reuses_cookie_and_cached_token_for_csrf_flow() -> None:
             headers={},
             timeout_seconds=5,
             session=session,
+            token_extraction_rules={"csrf_token": "X-CSRF-Token"} # or we'll adjust the test handler to send header
         )
         action = send_request(
             url=f"{base_url}/action",
