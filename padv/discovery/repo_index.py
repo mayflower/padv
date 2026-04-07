@@ -68,8 +68,8 @@ def build_repo_index(
                 except UnicodeDecodeError:
                     pass
 
-    files.sort(key=lambda x: x["path"])
-    symbols.sort(key=lambda x: (x["file"], x["name"]))
+    files.sort(key=lambda x: str(x["path"]))
+    symbols.sort(key=lambda x: (str(x["file"]), str(x["name"])))
     
     joern_avail = joern_is_available()
     

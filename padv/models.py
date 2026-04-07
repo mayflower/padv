@@ -658,11 +658,11 @@ def _coerce_http_step(value: Any) -> HttpStep | None:
         path=value.get("path", ""),
         url=value.get("url", ""),
         headers=headers,
-        query=value.get("query"),
+        query=value.get("query") or {},
         body_type=body_type,
         body=body,
         body_ref=value.get("body_ref", ""),
-        cookies=value.get("cookies"),
+        cookies=value.get("cookies") or {},
         expectations=normalized_expectations,
     )
 

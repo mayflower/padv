@@ -7,6 +7,7 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+from dataclasses import asdict
 
 from padv.config.schema import PadvConfig
 from padv import __version__ as PADV_VERSION
@@ -44,8 +45,6 @@ def _code_signature() -> str:
     with _CODE_SIGNATURE_LOCK:
         _CODE_SIGNATURE_CACHE = (snapshot_key, signature)
     return signature
-
-from dataclasses import asdict
 
 def _config_signature(config: PadvConfig) -> str:
     payload = asdict(config)

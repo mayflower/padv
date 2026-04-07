@@ -506,13 +506,13 @@ def profile_for_vuln_class(vuln_class: str | None) -> ValidationClassProfile:
         canonical_class=canonical,
         validation_mode=validation_mode,
         class_contract_id=f"{validation_mode}:{canonical or 'unknown'}",
-        required_request_shape=list(base["required_request_shape"]),
-        required_witnesses=list(base["required_witnesses"]),
-        required_negative_controls=list(base["required_negative_controls"]),
-        allowed_transports=list(base["allowed_transports"]),
-        auth_handling=str(base["auth_handling"]),
-        min_positive_requests=int(base["min_positive_requests"]),
-        min_negative_controls=int(base["min_negative_controls"]),
+        required_request_shape=list(base.get("required_request_shape") or []),
+        required_witnesses=list(base.get("required_witnesses") or []),
+        required_negative_controls=list(base.get("required_negative_controls") or []),
+        allowed_transports=list(base.get("allowed_transports") or []),
+        auth_handling=str(base.get("auth_handling") or ""),
+        min_positive_requests=int(base.get("min_positive_requests") or 0),
+        min_negative_controls=int(base.get("min_negative_controls") or 0),
     )
 
 

@@ -355,10 +355,10 @@ def _normalize_triage_entry(raw: Any) -> dict[str, str]:
     if not isinstance(raw, dict):
         return dict.fromkeys(_TRIAGE_FIELDS, "")
     normalized: dict[str, str] = {}
-    for field in _TRIAGE_FIELDS:
-        value = raw.get(field, "")
+    for triage_field in _TRIAGE_FIELDS:
+        value = raw.get(triage_field, "")
         text = str(value).strip() if value is not None else ""
-        normalized[field] = text
+        normalized[triage_field] = text
     return normalized
 
 
@@ -538,9 +538,9 @@ def ensure_agent_session(
         "You are a strict security planning sub-agent for web exploitation discovery and validation. "
         "Return JSON only and avoid markdown."
     )
-    tools = _build_filesystem_tools(repo_root) if repo_root and role != "root" else []
+    tools = _build_filesystem_tools(repo_root) if repo_root else []
     checkpointer = FileBackedMemorySaver(_checkpoint_path(Path(".padv") / "langgraph", "legacy", thread_id))
-    middleware = []
+    middleware: list[Any] = []
     try:
         agent = create_deep_agent(
             model=model,

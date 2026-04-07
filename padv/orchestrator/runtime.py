@@ -767,6 +767,7 @@ def _try_anonymous_probe(
             session=None,
             token_extraction_rules=request_spec.get("token_extraction_rules"),
         )
+        return probe, 1
     except RequestError:
         return None, 0
 

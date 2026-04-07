@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Any
-
 from padv.models import EvidenceBundle
 
 def evaluate_run_coverage(bundles: list[EvidenceBundle]) -> dict[str, str]:

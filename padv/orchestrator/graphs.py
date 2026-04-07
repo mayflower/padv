@@ -56,7 +56,6 @@ from padv.models import (
 from padv.orchestrator.evidence_linking import select_linked_evidence
 from padv.orchestrator.runtime import new_run_id, validate_candidates_runtime
 from padv.static.joern.adapter import discover_candidates_with_meta
-from padv.static.joern.query_sets import VULN_CLASS_SPECS
 from padv.store.evidence_store import EvidenceStore
 from padv.taxonomy import runtime_validatable_classes
 from padv.validation.preconditions import merge_gate_preconditions
@@ -2923,7 +2922,6 @@ def _node_persist(state: GraphState) -> GraphState:
     if run_store is not None:
         run_store.save_candidates(state.get("candidates", []))
         run_store.save_static_evidence(state.get("static_evidence", []))
-        save_json_artifact = run_store.save_json_artifact
     else:
         store.save_candidates(state.get("candidates", []))
         store.save_static_evidence(state.get("static_evidence", []))
