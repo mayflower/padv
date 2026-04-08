@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import replace
-from typing import cast
+from typing import Any, Sequence, cast, Iterable, Mapping
 
 from padv.config.schema import PadvConfig
 from padv.models import Candidate, DifferentialPair, RuntimeEvidence, ValidationClassProfile, Witness, WitnessContract
@@ -209,10 +209,17 @@ def runtime_witness_contracts() -> dict[str, WitnessContract]:
 def witness_contract_for_vuln_class(vuln_class: str | None) -> WitnessContract:
     canonical = canonicalize_vuln_class(vuln_class)
     override = _WITNESS_CONTRACT_OVERRIDES.get(canonical, {})
-    required_all = [str(x).strip() for x in override.get("required_all", []) if str(x).strip()]
-    required_any = [str(x).strip() for x in override.get("required_any", []) if str(x).strip()]
+    
+    # Cast to ensure mypy knows these are iterables
+    raw_required_all = cast(Iterable[Any], override.get("required_all", []))
+    raw_required_any = cast(Iterable[Any], override.get("required_any", []))
+    raw_negative = cast(Iterable[Any], override.get("negative_must_not_include", []))
+    
+    required_all = [str(x).strip() for x in raw_required_all if str(x).strip()]
+    required_any = [str(x).strip() for x in raw_required_any if str(x).strip()]
     enforce_negative_clean = bool(override.get("enforce_negative_clean", True))
-    negative_must_not_include = [str(x).strip() for x in override.get("negative_must_not_include", []) if str(x).strip()]
+    negative_must_not_include = [str(x).strip() for x in raw_negative if str(x).strip()]
+    
     if enforce_negative_clean and not negative_must_not_include:
         negative_must_not_include = [*required_all, *required_any]
     return WitnessContract(
@@ -506,13 +513,13 @@ def profile_for_vuln_class(vuln_class: str | None) -> ValidationClassProfile:
         canonical_class=canonical,
         validation_mode=validation_mode,
         class_contract_id=f"{validation_mode}:{canonical or 'unknown'}",
-        required_request_shape=list(base.get("required_request_shape") or []),
-        required_witnesses=list(base.get("required_witnesses") or []),
-        required_negative_controls=list(base.get("required_negative_controls") or []),
-        allowed_transports=list(base.get("allowed_transports") or []),
+        required_request_shape=list(cast(Iterable[Any], base.get("required_request_shape") or [])),
+        required_witnesses=list(cast(Iterable[Any], base.get("required_witnesses") or [])),
+        required_negative_controls=list(cast(Iterable[Any], base.get("required_negative_controls") or [])),
+        allowed_transports=list(cast(Iterable[Any], base.get("allowed_transports") or [])),
         auth_handling=str(base.get("auth_handling") or ""),
-        min_positive_requests=int(base.get("min_positive_requests") or 0),
-        min_negative_controls=int(base.get("min_negative_controls") or 0),
+        min_positive_requests=int(cast(Any, base.get("min_positive_requests") or 0)),
+        min_negative_controls=int(cast(Any, base.get("min_negative_controls") or 0)),
     )
 
 

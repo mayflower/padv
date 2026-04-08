@@ -40,7 +40,12 @@ from padv.models import (
     WitnessBundle,
 )
 from padv.validation.contracts import apply_validation_profile, profile_for_vuln_class
-from padv.validation.preconditions import ensure_no_legacy_preconditions, merge_gate_preconditions
+from padv.validation.preconditions import (
+    GatePreconditions,
+    ensure_no_legacy_preconditions,
+    merge_gate_preconditions,
+    migrate_legacy_preconditions,
+)
 
 try:
     from langchain.agents.middleware.types import AgentMiddleware  # type: ignore[import-not-found]
@@ -2639,14 +2644,14 @@ def _normalize_objectives(raw: Any) -> list[ObjectiveScore]:
         objective_id = str(item.get("objective_id", "")).strip() or f"obj-{idx:03d}"
         title = str(item.get("title", "")).strip() or objective_id
         rationale = str(item.get("rationale", "")).strip() or "agent objective"
-        score = item.get("expected_info_gain", 0.0)
+        score = item.get("expected_info_gain")
         priority = item.get("priority", score)
         try:
-            expected_info_gain = float(score)
+            expected_info_gain = float(score) if score is not None else 0.0
         except Exception:
             expected_info_gain = 0.0
         try:
-            normalized_priority = float(priority)
+            normalized_priority = float(priority) if priority is not None else expected_info_gain
         except Exception:
             normalized_priority = expected_info_gain
         channels = [
@@ -3522,7 +3527,7 @@ def _normalize_validation_plan_response(
         response.get("gate_preconditions"),
     )
     if gate_preconditions.is_empty():
-        ensure_no_legacy_preconditions(
+        gate_preconditions = migrate_legacy_preconditions(
             preconditions=candidate.preconditions,
             auth_requirements=candidate.auth_requirements,
         )

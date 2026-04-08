@@ -158,6 +158,7 @@ class GraphState(TypedDict, total=False):
     refutations: list[Refutation]
     experiment_board: list[ExperimentAttempt]
     runtime_history: list[dict[str, Any]]
+    soft_yield: bool
     witness_bundles: list[WitnessBundle]
     gate_history: list[dict[str, Any]]
     auth_contexts: dict[str, Any]
@@ -189,8 +190,8 @@ def _safe_copy_candidate(candidate: Candidate) -> Candidate:
 
 
 def _stable_serialize(value: Any) -> Any:
-    if is_dataclass(value):
-        return _stable_serialize(asdict(value))
+    if is_dataclass(value) and not isinstance(value, type):
+        return _stable_serialize(asdict(cast(Any, value)))
     if isinstance(value, dict):
         return {str(key): _stable_serialize(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
@@ -271,7 +272,7 @@ def _collect_serialized_state_fields(state: GraphState) -> dict[str, Any]:
     )
     for state_key, payload_key in _SERIALIZED_LIST_FIELDS:
         value = state.get(state_key)
-        if value is not None:
+        if isinstance(value, (list, tuple)):
             payload[payload_key] = _serialize_runtime_context_items(value)
 
     _STABLE_SERIALIZE_LIST_FIELDS: tuple[str, ...] = ("gate_history", "runtime_history")
@@ -1898,7 +1899,7 @@ def _selected_static_for_hypotheses(hypotheses: list[Hypothesis], static_evidenc
     return select_linked_evidence(
         [item.candidate for item in hypotheses],
         static_evidence,
-        extra_refs_by_candidate=extra_refs_by_candidate,
+        extra_refs_by_candidate=cast(dict[str, Iterable[str]], extra_refs_by_candidate),
     ).static_evidence
 
 
@@ -2113,7 +2114,9 @@ def _merge_context_deltas(state: GraphState) -> None:
     """Merge all research branch context deltas into the agent runtime."""
     runtime = _state_runtime(state)
     for key in ("source_context_delta", "graph_context_delta", "web_context_delta"):
-        merge_agent_runtime_context_delta(runtime, state.get(key, {}))
+        delta = state.get(key)
+        if isinstance(delta, dict):
+            merge_agent_runtime_context_delta(runtime, cast(dict[str, Any], delta))
 
 
 def _handle_zero_findings(
@@ -2238,11 +2241,11 @@ def _node_skeptic_challenge(state: GraphState) -> GraphState:
     state["hypothesis_board"] = current_hypotheses
     state["candidates"] = [_candidate_from_hypothesis(item) for item in current_hypotheses]
     state["static_evidence"] = _selected_static_for_hypotheses(current_hypotheses, _full_static_evidence_pool(state))
-    trace: dict[str, Any] = {"engine": "deepagents", "rounds": round_traces}
+    skeptic_trace: dict[str, Any] = {"engine": "deepagents", "rounds": round_traces}
     if round_traces:
-        trace.update(dict(round_traces[-1]))
-        trace["rounds"] = round_traces
-    state.setdefault("planner_trace", {})["skeptic"] = trace
+        skeptic_trace.update(dict(round_traces[-1]))
+        skeptic_trace["rounds"] = round_traces
+    state.setdefault("planner_trace", {})["skeptic"] = skeptic_trace
     runtime = _state_runtime(state)
     update_agent_runtime_context(
         runtime,
@@ -2254,7 +2257,7 @@ def _node_skeptic_challenge(state: GraphState) -> GraphState:
     _persist_agent_workspace_artifact(
         state,
         "refutations",
-        {"refutations": [item.to_dict() for item in all_refutations], "trace": trace},
+        {"refutations": [item.to_dict() for item in all_refutations], "trace": skeptic_trace},
     )
     return _finalize_stage(state, "skeptic_challenge", f"remaining={len(state['hypothesis_board'])}")
 
@@ -2466,7 +2469,12 @@ def _node_deterministic_gate(state: GraphState) -> GraphState:
 
 def _node_continue_or_stop(state: GraphState) -> GraphState:
     _emit_progress(state, "continue_or_stop", "start")
-    remaining = [item for item in state.get("objective_queue", []) if state.get("active_objective") is None or item.objective_id != state["active_objective"].objective_id]
+    active = state.get("active_objective")
+    active_id = getattr(active, "objective_id", None) if active else None
+    remaining = [
+        item for item in state.get("objective_queue", [])
+        if active_id is None or item.objective_id != active_id
+    ]
     state["objective_queue"] = remaining
     should_continue, trace = _deterministic_continue_decision(state, remaining)
     state["loop_continue"] = should_continue
@@ -2719,14 +2727,14 @@ def _node_frontier_update(state: GraphState) -> GraphState:
         "web_paths": _merge_unique(old_cov.get("web_paths", []), new_cov.get("web_paths", [])),
     }
 
-    for item in state.get("hypothesis_board", [])[:100]:
+    for hyp in state.get("hypothesis_board", [])[:100]:
         frontier.setdefault("hypotheses", []).append(
             {
-                "hypothesis_id": item.hypothesis_id,
-                "candidate_id": item.candidate.candidate_id,
-                "vuln_class": item.vuln_class,
-                "rationale": item.rationale,
-                "score": item.confidence,
+                "hypothesis_id": hyp.hypothesis_id,
+                "candidate_id": hyp.candidate.candidate_id,
+                "vuln_class": hyp.vuln_class,
+                "rationale": hyp.rationale,
+                "score": hyp.confidence,
                 "iteration": iteration,
             }
         )
@@ -2740,11 +2748,11 @@ def _node_frontier_update(state: GraphState) -> GraphState:
             }
         )
 
-    for item in state.get("refutations", [])[:100]:
-        if item.evidence_refs:
-            for ref in item.evidence_refs[:10]:
+    for ref in state.get("refutations", [])[:100]:
+        if ref.evidence_refs:
+            for r in ref.evidence_refs[:10]:
                 frontier.setdefault("failed_paths", []).append(
-                    {"path": ref, "reason": item.summary, "iteration": iteration}
+                    {"path": r, "reason": ref.summary, "iteration": iteration}
                 )
 
     runtime_attempts, runtime_summary = _runtime_feedback_from_bundles(
@@ -3093,14 +3101,14 @@ def _run_langgraph(state: GraphState, include_validation: bool) -> GraphState:
     state["store"].save_resume_metadata(
         str(state.get("run_id") or ""),
         _graph_resume_payload(
-            result if isinstance(result, dict) else state,
+            cast(GraphState, result) if isinstance(result, dict) else state,
             thread_id=thread_id,
             checkpoint_id=checkpoint_id,
             status="completed",
             next_nodes=next_nodes,
         ),
     )
-    _emit_progress(result if isinstance(result, dict) else state, "graph", "done", "langgraph complete")
+    _emit_progress(cast(GraphState, result) if isinstance(result, dict) else state, "graph", "done", "langgraph complete")
     return result
 
 

@@ -50,6 +50,7 @@ from padv.models import (
     WitnessBundle,
     WitnessEvidence,
 )
+from padv.validation.preconditions import GatePreconditions
 from padv.store.evidence_store import EvidenceStore
 
 
@@ -120,6 +121,7 @@ _ALLOWED_MSGPACK_TYPES = (
     ResponseEvidence,
     OracleEvidence,
     EnvironmentFacts,
+    GatePreconditions,
 )
 
 

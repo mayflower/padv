@@ -56,6 +56,7 @@ from padv.validation.preconditions import (
     ensure_no_legacy_preconditions,
     merge_gate_preconditions,
     resolve_gate_preconditions,
+    migrate_legacy_preconditions,
 )
 
 
@@ -135,9 +136,12 @@ def _request_transport(request_spec: dict[str, Any]) -> str:
 
 
 def _request_evidence(request_id: str, request_spec: dict[str, Any], auth_context: str) -> RequestEvidence:
-    query = request_spec.get("query") if isinstance(request_spec.get("query"), dict) else {}
-    body = request_spec.get("body") if isinstance(request_spec.get("body"), dict) else {}
-    headers = request_spec.get("headers") if isinstance(request_spec.get("headers"), dict) else {}
+    raw_query = request_spec.get("query")
+    query = raw_query if isinstance(raw_query, dict) else {}
+    raw_body = request_spec.get("body")
+    body = raw_body if isinstance(raw_body, dict) else {}
+    raw_headers = request_spec.get("headers")
+    headers = raw_headers if isinstance(raw_headers, dict) else {}
     placements: list[str] = []
     if query:
         placements.append("query")
@@ -455,7 +459,7 @@ def _normalize_gate_preconditions(
         getattr(plan, "gate_preconditions", None),
     )
     if parsed.is_empty():
-        ensure_no_legacy_preconditions(
+        parsed = migrate_legacy_preconditions(
             preconditions=candidate.preconditions,
             auth_requirements=candidate.auth_requirements,
         )
