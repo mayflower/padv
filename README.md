@@ -89,6 +89,37 @@ export ANTHROPIC_API_KEY=...
 uv run padv analyze --config padv.toml --repo-root /path/to/php/repo
 ```
 
+## Onboarding a New Application
+
+To test your own PHP application with `padv`, follow these steps:
+
+### 1. Instrument with Morcilla (Runtime Oracle)
+`padv` requires the [Morcilla](https://github.com/mayflower/morcilla) PHP extension to observe internal function calls and confirm vulnerabilities.
+- Build and install the Morcilla extension on your target's PHP environment.
+- Ensure the extension is enabled (`php -m | grep morcilla`).
+
+### 2. Generate a SCIP Index
+The agent uses a SCIP index to understand your project's structure and symbols.
+- Install `scip-php`.
+- Run `scip-php` in your repository root:
+  ```bash
+  scip-php index
+  ```
+- This generates an index file (usually in `.index/index.scip`).
+
+### 3. Configure `padv.toml`
+Create a configuration file for your project:
+- `[target].base_url`: The URL where your instrumented app is running.
+- `[target].repo_root`: Local path to your PHP source code.
+- `[oracle].api_key`: Must match the `morcilla.api_key` in your target's `php.ini`.
+- `[scip].enabled = true`: Ensure SCIP is enabled to provide the agent with high-fidelity grounding.
+
+### 4. Run Discovery
+Start with an analysis run to see what the agent identifies:
+```bash
+uv run padv analyze --config your-project.toml --repo-root /path/to/your/repo
+```
+
 ## Core Commands
 
 Top-level help:

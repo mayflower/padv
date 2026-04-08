@@ -1,6 +1,7 @@
 [target]
 base_url = "http://127.0.0.1:8080/index.php"
 request_timeout_seconds = 10
+shared_session = false
 
 [oracle]
 request_key_header = "Morcilla-Key"
@@ -58,7 +59,7 @@ timeout_seconds = 600
 
 [llm]
 provider = "anthropic"
-model = "claude-sonnet-4-5-20250929"
+model = "claude-haiku-4-5-20251001"
 api_key_env = "ANTHROPIC_API_KEY"
 temperature = 0.0
 max_tokens = 4096

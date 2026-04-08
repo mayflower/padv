@@ -299,11 +299,43 @@ def _cmd_show(args: argparse.Namespace) -> int:
         return 0
 
     if args.run_id:
-        run = store.load_run_summary(args.run_id)
-        if run is None:
+        data = store.load_run_summary(args.run_id)
+        if data is None:
             _print_json({"error": f"run not found: {args.run_id}"})
             return 1
-        _print_json(run)
+        
+        # Could be dict or dataclass depending on store implementation
+        if hasattr(data, "to_dict"):
+            data = data.to_dict()
+            
+        # High-signal human-readable output
+        print(f"\nRun Summary: {data.get('run_id')}")
+        print(f"{'='*40}")
+        print(f"Status:      {data.get('status', 'unknown')}")
+        print(f"Mode:        {data.get('mode', 'unknown')}")
+        print(f"Started:     {data.get('started_at', 'unknown')}")
+        print(f"Completed:   {data.get('completed_at', 'unknown')}")
+        print(f"Stop Rule:   {data.get('stop_rule', 'n/a')}")
+        print(f"Stop Reason: {data.get('stop_reason', 'n/a')}")
+        
+        outcomes = data.get('candidate_outcomes', {})
+        if outcomes:
+            print(f"\nOutcomes:")
+            print(f"{'-'*40}")
+            for outcome, count in sorted(outcomes.items()):
+                if count > 0:
+                    print(f"{outcome:<25} {count:>3}")
+                
+        coverage = data.get('run_coverage', {})
+        if coverage:
+            print(f"\nCoverage:")
+            print(f"{'-'*40}")
+            for vuln_class, level in sorted(coverage.items()):
+                print(f"{vuln_class:<35} {level}")
+        
+        print(f"\nArtifacts: {len(data.get('artifact_refs', []))}")
+        print(f"Bundles:   {len(data.get('bundle_ids', []))}")
+        print(f"{'='*40}\n")
         return 0
 
     candidate_source = store.for_run(args.scope_run_id).load_candidates() if args.scope_run_id else store.load_candidates()

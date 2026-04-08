@@ -375,6 +375,7 @@ class RunSummary:
     total_candidates: int
     decisions: dict[str, int]
     bundle_ids: list[str]
+    status: str = "completed"
     discovery_trace: dict[str, Any] = field(default_factory=dict)
     planner_trace: dict[str, Any] = field(default_factory=dict)
     frontier_state: dict[str, Any] = field(default_factory=dict)
