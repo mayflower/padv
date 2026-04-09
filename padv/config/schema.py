@@ -286,7 +286,7 @@ def load_config(path: str | Path) -> PadvConfig:
     web = _require_section(data, "web")
     differential = _require_section(data, "differential")
 
-    _reject_unknown_keys("target", target, {"base_url", "request_timeout_seconds"})
+    _reject_unknown_keys("target", target, {"base_url", "request_timeout_seconds", "shared_session"})
     _reject_unknown_keys(
         "oracle",
         oracle,

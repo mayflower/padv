@@ -116,6 +116,7 @@ def _write_config(tmp_path: Path, text: str, filename: str = "cfg.toml") -> Path
 def test_load_config_success() -> None:
     config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
     assert config.target.base_url.startswith("http://")
+    assert config.target.shared_session is False
     assert config.budgets.max_candidates > 0
     assert config.oracle.result_encoding == "base64-json"
     assert config.joern.parse_command == "joern-parse"
@@ -186,3 +187,16 @@ def test_load_config_rejects_non_anthropic_provider(tmp_path: Path) -> None:
     path = _write_config(tmp_path, text, "invalid-provider.toml")
     with pytest.raises(ConfigError, match="llm.provider must be anthropic"):
         load_config(path)
+
+
+def test_load_config_accepts_shared_session_target_flag(tmp_path: Path) -> None:
+    text = _strict_config_text().replace(
+        'request_timeout_seconds = 10',
+        'request_timeout_seconds = 10\nshared_session = true',
+        1,
+    )
+    path = _write_config(tmp_path, text, "shared-session.toml")
+
+    config = load_config(path)
+
+    assert config.target.shared_session is True

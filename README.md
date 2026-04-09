@@ -259,6 +259,7 @@ Show details for one stored object.
 
 ```bash
 uv run padv show --config padv.toml --run-id run-1234abcd
+uv run padv show --config padv.toml --run-id run-1234abcd --format text
 uv run padv show --config padv.toml --bundle-id bundle-run-1234abcd-cand-00010
 uv run padv show --config padv.toml --candidate-id cand-00010
 ```

@@ -44,7 +44,6 @@ from padv.validation.preconditions import (
     GatePreconditions,
     ensure_no_legacy_preconditions,
     merge_gate_preconditions,
-    migrate_legacy_preconditions,
 )
 
 try:
@@ -3527,7 +3526,7 @@ def _normalize_validation_plan_response(
         response.get("gate_preconditions"),
     )
     if gate_preconditions.is_empty():
-        gate_preconditions = migrate_legacy_preconditions(
+        ensure_no_legacy_preconditions(
             preconditions=candidate.preconditions,
             auth_requirements=candidate.auth_requirements,
         )

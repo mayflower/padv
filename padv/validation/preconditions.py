@@ -3,7 +3,6 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
-import re
 
 
 class InvalidGatePreconditionsError(TypeError):
@@ -170,54 +169,6 @@ def merge_gate_preconditions(
         )
         merged.unknown_blockers = _normalized_strings([*merged.unknown_blockers, *item.unknown_blockers])
     return merged
-
-
-def migrate_legacy_preconditions(
-    *,
-    preconditions: Sequence[str] | None = None,
-    auth_requirements: Sequence[str] | None = None,
-) -> GatePreconditions:
-    """Migrate legacy string-based preconditions to the modern typed GatePreconditions."""
-    out = GatePreconditions()
-    
-    # Requirement-indicative keywords
-    BLOCKER_KEYWORDS = (
-        "must", "required", "needs", "requires", "dependency", "security level",
-        "extension", "enabled", "exist", "valid"
-    )
-    
-    # Environment/Browser notes that should NOT block validation
-    SOFT_BLOCKER_KEYWORDS = (
-        "browser", "javascript", "enabled", "modern", "victim", "support", "syntax"
-    )
-    
-    all_legacy = _normalized_strings(list(preconditions or []) + list(auth_requirements or []))
-    for legacy in all_legacy:
-        norm = legacy.casefold()
-        
-        # 1. Map to boolean flags
-        if "auth" in norm:
-            out.requires_auth = True
-        elif "session" in norm:
-            out.requires_session = True
-        elif "csrf" in norm or "xsrf" in norm:
-            out.requires_csrf_token = True
-        elif "upload" in norm:
-            out.requires_upload = True
-        elif "seed" in norm:
-            out.requires_seed = True
-        
-        # 2. Filter out soft blockers (browser capabilities, etc.)
-        elif any(kw in norm for kw in SOFT_BLOCKER_KEYWORDS):
-            continue
-            
-        # 3. Only consider it a "blocker" if it uses requirement-indicative language.
-        # Otherwise, treat it as a descriptive note which doesn't block validation.
-        elif any(kw in norm for kw in BLOCKER_KEYWORDS):
-            out.unknown_blockers.append(legacy)
-            
-    return out
-
 
 def ensure_no_legacy_preconditions(
     *,
