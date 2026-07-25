@@ -11,7 +11,7 @@ from padv.models import (
     Witness,
     WitnessContract,
 )
-from padv.taxonomy import contains_canary, runtime_validatable_classes
+from padv.taxonomy import KNOWN_WITNESS_FLAGS, contains_canary, runtime_validatable_classes
 from padv.validation.contracts import build_runtime_witness, witness_contract_for_vuln_class
 from padv.validation.preconditions import GatePreconditions, coerce_gate_preconditions
 
@@ -97,6 +97,18 @@ def _evaluate_v3v4_runtime_class(
     negative_flags = {str(x).strip().casefold() for x in witness.negative_flags if str(x).strip()}
     required_all = {str(x).strip().casefold() for x in contract.required_all if str(x).strip()}
     required_any = {str(x).strip().casefold() for x in contract.required_any if str(x).strip()}
+
+    # A contract that asks for a witness nothing emits cannot be satisfied by any
+    # candidate. Failing it as REFUTED would report a confident negative result
+    # for an experiment that never ran.
+    unproducible = sorted((required_all | required_any) - KNOWN_WITNESS_FLAGS)
+    if unproducible:
+        return GateResult(
+            "INCONCLUSIVE",
+            passed,
+            "V3",
+            f"contract requires witnesses this build cannot produce: {', '.join(unproducible)}",
+        )
 
     if (required_all and not required_all.issubset(positive_flags)) or (
         required_any and not (positive_flags & required_any)

@@ -53,6 +53,53 @@ CLASS_ORACLE_WITNESS_FLAGS: dict[str, str] = {
     "security_misconfiguration": "misconfiguration_sink_oracle_witness",
 }
 
+# Every witness flag the runtime can actually produce. A contract that requires
+# something outside this set can never be satisfied, so the gate treats it as an
+# experiment it cannot run rather than as a refutation. Kept in sync with the
+# derivers by tests/test_witness_contract_vocabulary.py.
+KNOWN_WITNESS_FLAGS: frozenset[str] = frozenset(
+    {
+        # sink oracle witnesses, one per class (see CLASS_ORACLE_WITNESS_FLAGS)
+        "code_sink_oracle_witness",
+        "command_sink_oracle_witness",
+        "deserialization_sink_oracle_witness",
+        "file_sink_oracle_witness",
+        "gadget_sink_oracle_witness",
+        "header_sink_oracle_witness",
+        "ldap_sink_oracle_witness",
+        "misconfiguration_sink_oracle_witness",
+        "regex_sink_oracle_witness",
+        "sql_sink_oracle_witness",
+        "ssrf_sink_oracle_witness",
+        "upload_sink_oracle_witness",
+        "xml_sink_oracle_witness",
+        "xpath_sink_oracle_witness",
+        "xxe_sink_oracle_witness",
+        # sink argument shape
+        "ssrf_url_arg_witness",
+        "xxe_entity_witness",
+        # response differentials
+        "sql_body_diff_witness",
+        "sql_status_diff_witness",
+        # reflection and execution context
+        "body_canary",
+        "xss_raw_canary",
+        "xss_dom_witness",
+        # authz, session and auth invariants
+        "auth_bypass",
+        "authz_bypass_status",
+        "authz_pair_observed",
+        "session_cookie_not_rotated",
+        "session_id_not_rotated",
+        # diagnostics: reported, never sufficient on their own
+        "diagnostic_debug_leak",
+        "diagnostic_phpinfo_marker",
+        "diagnostic_sql_error",
+        "diagnostic_verbose_error_leak",
+        "info_disclosure_header",
+    }
+)
+
 AUTHZ_VULN_CLASSES: frozenset[str] = frozenset(
     {
         "broken_access_control",

@@ -24,6 +24,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   is now parsed and the flag is set only when the canary occupies an executable
   position — script text, an `on*` handler attribute, or a `javascript:` URL —
   and the flag records which one.
+- **A contract that requires a witness nothing emits is INCONCLUSIVE, not
+  REFUTED.** `csrf_invariant_missing` required `csrf_missing_token_acceptance`
+  and `idor_invariant_missing` required `idor_bypass`; neither flag is produced
+  anywhere, so both classes failed V3 on every candidate and reported a
+  confident negative result for an experiment that could not run. The producible
+  vocabulary is now declared in `padv.taxonomy.KNOWN_WITNESS_FLAGS`, the gate
+  fails closed against it, and the two known gaps are listed in
+  `UNIMPLEMENTED_WITNESS_CLASSES` so nothing new can join them unnoticed.
+  `debug_output_leak` and `information_disclosure` referenced flag names the
+  derivers never emitted (`debug_leak` vs `diagnostic_debug_leak`); those are
+  corrected.
 - **The benchmark target is pinned.** `scripts/mutillidae_e2e.sh` fetched a
   moving branch tip and `reset --hard` onto it, so two runs on different days
   measured different code. It now fetches a fixed commit

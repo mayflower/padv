@@ -35,6 +35,21 @@ _CLASS_ORACLE_WITNESS_FLAGS = CLASS_ORACLE_WITNESS_FLAGS
 
 _SQL_ERROR_MARKERS = SQL_ERROR_MARKERS
 
+# Classes whose contract names a witness the runtime cannot yet produce, so no
+# candidate of that class can be validated. They are listed rather than quietly
+# left broken: the gate reports INCONCLUSIVE with the missing flag named, and
+# tests/test_witness_contract_vocabulary.py fails if anything else joins them or
+# if one of these becomes producible without being removed here.
+#
+# csrf_missing_token_acceptance and idor_bypass both need a typed
+# principal/resource/action comparison that does not exist yet.
+UNIMPLEMENTED_WITNESS_CLASSES: frozenset[str] = frozenset(
+    {
+        "csrf_invariant_missing",
+        "idor_invariant_missing",
+    }
+)
+
 _WITNESS_CONTRACT_OVERRIDES: dict[str, dict[str, object]] = {
     "sql_injection_boundary": {
         "required_all": ["sql_sink_oracle_witness"],
@@ -47,8 +62,8 @@ _WITNESS_CONTRACT_OVERRIDES: dict[str, dict[str, object]] = {
     "file_boundary_influence": {"required_all": ["file_sink_oracle_witness"], "required_any": []},
     "file_upload_influence": {"required_all": ["upload_sink_oracle_witness"], "required_any": []},
     "xss_output_boundary": {"required_all": ["xss_dom_witness"], "required_any": []},
-    "debug_output_leak": {"required_all": [], "required_any": ["debug_leak", "verbose_error_leak", "phpinfo_marker"]},
-    "information_disclosure": {"required_all": [], "required_any": ["info_disclosure_header", "verbose_error_leak", "phpinfo_marker"]},
+    "debug_output_leak": {"required_all": [], "required_any": ["diagnostic_debug_leak", "diagnostic_verbose_error_leak", "diagnostic_phpinfo_marker"]},
+    "information_disclosure": {"required_all": [], "required_any": ["info_disclosure_header", "diagnostic_verbose_error_leak", "diagnostic_phpinfo_marker"]},
     "outbound_request_influence": {"required_all": ["ssrf_sink_oracle_witness", "ssrf_url_arg_witness"], "required_any": []},
     "ssrf": {"required_all": ["ssrf_sink_oracle_witness", "ssrf_url_arg_witness"], "required_any": []},
     "xxe_influence": {"required_all": ["xxe_sink_oracle_witness", "xxe_entity_witness"], "required_any": []},

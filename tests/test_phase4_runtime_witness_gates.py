@@ -152,8 +152,11 @@ def test_gate_uses_shared_witness_contract_provider(monkeypatch) -> None:
         vuln_class="ssrf",
     )
 
-    assert result.decision == "REFUTED"
+    # The injected contract asks for a flag no deriver emits, so the gate cannot
+    # run the experiment at all — and says which witness it is missing.
+    assert result.decision == "INCONCLUSIVE"
     assert result.failed_gate == "V3"
+    assert "custom_contract_only" in result.reason
 
 
 def _runtime_call(

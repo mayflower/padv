@@ -9,6 +9,7 @@ from padv.gates.engine import evaluate_candidate
 from padv.models import RuntimeEvidence, StaticEvidence
 from padv.static.joern.query_sets import VULN_CLASS_SPECS
 from padv.validation.preconditions import GatePreconditions
+from padv.validation.contracts import UNIMPLEMENTED_WITNESS_CLASSES
 
 
 def _runtime(request_id: str) -> RuntimeEvidence:
@@ -58,5 +59,13 @@ def test_runtime_validatable_class_without_witness_never_validates(
         evidence_signals=["joern", "scip"],
         vuln_class=vuln_class,
     )
-    assert result.decision == "REFUTED"
+    assert result.decision != "VALIDATED"
     assert result.failed_gate == "V3"
+    if vuln_class in UNIMPLEMENTED_WITNESS_CLASSES:
+        # No deriver can produce this class's contracted witness, so the
+        # experiment never ran; calling that a refutation would overstate it.
+        assert result.decision == "INCONCLUSIVE"
+        assert "cannot produce" in result.reason
+    else:
+        assert result.decision == "REFUTED"
+        assert result.refutation is not None
