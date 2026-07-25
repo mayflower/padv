@@ -17,6 +17,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   `_process_candidate` built a `CONFIRMED_ANALYSIS_FINDING` bundle directly for
   every non-runtime-validatable candidate, which made the A-gates unreachable in
   production regardless of what the engine enforced.
+- **The XSS witness depends on where the canary landed, not on what else is on
+  the page.** `xss_dom_witness` required a raw canary in the body plus the
+  substring `<script` (or `onerror=`/`onload=`) anywhere in it. Nearly every page
+  loads a script, so that reduced to "the canary was reflected at all". The body
+  is now parsed and the flag is set only when the canary occupies an executable
+  position — script text, an `on*` handler attribute, or a `javascript:` URL —
+  and the flag records which one.
+- **The benchmark target is pinned.** `scripts/mutillidae_e2e.sh` fetched a
+  moving branch tip and `reset --hard` onto it, so two runs on different days
+  measured different code. It now fetches a fixed commit
+  (`MUTILLIDAE_REF`, `MUTILLIDAE_DOCKER_REF`), detaches onto it, verifies the
+  resolved SHA, and writes `targets/targets.lock.json` recording what was
+  actually measured, including the morcilla commit.
 - Persisted bundles carry a `schema_version`, and reading an older one migrates
   it conservatively (`migrate_bundle_payload`): retired decisions degrade to
   `INCONCLUSIVE` rather than being promoted to a refutation the recorded

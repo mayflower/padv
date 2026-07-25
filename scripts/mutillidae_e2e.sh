@@ -5,6 +5,10 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TARGET_REPO_DIR="${ROOT_DIR}/targets/mutillidae"
 TARGET_RUNTIME_DIR="${ROOT_DIR}/targets/mutillidae-docker"
 MORCILLA_SRC_DIR="${MORCILLA_SRC_DIR:?Set MORCILLA_SRC_DIR to your morcilla extension source (https://github.com/mayflower/morcilla)}"
+# Pinned benchmark target. Override to measure a different revision, but never
+# leave it floating: a moving branch tip makes two runs incomparable.
+MUTILLIDAE_REF="${MUTILLIDAE_REF:-84f2c00d9141dbb9e26a448c8288e651e0b5bb04}"        # 2.12.7
+MUTILLIDAE_DOCKER_REF="${MUTILLIDAE_DOCKER_REF:-b5920113ad30dd92c893b2f44230fb5bf99f3601}"
 MORCILLA_SYNC_DIR="${TARGET_REPO_DIR}/.docker/morcilla/ext/morcilla"
 APP_COMPOSE_FILE="${ROOT_DIR}/docker-compose.mutillidae.yml"
 SCANNER_COMPOSE_FILE="${ROOT_DIR}/docker-compose.yml"
@@ -34,25 +38,57 @@ require_cmd() {
   fi
 }
 
-clone_or_update_repo() {
+checkout_pinned_repo() {
+  # Benchmark numbers are only comparable when the target is identical, so the
+  # checkout is pinned to a commit rather than followed to a branch tip.
   local url="$1"
   local dir="$2"
+  local ref="$3"
+
+  if [ -z "${ref}" ]; then
+    echo "refusing to check out ${url} without a pinned ref" >&2
+    exit 1
+  fi
+
   mkdir -p "${ROOT_DIR}/targets"
   if [ ! -d "${dir}/.git" ]; then
     log "cloning ${url} into ${dir}"
-    git clone --depth 1 "${url}" "${dir}"
-    return 0
+    git init --quiet "${dir}"
+    git -C "${dir}" remote add origin "${url}"
   fi
 
-  log "updating checkout ${dir}"
-  git -C "${dir}" fetch --depth 1 origin
-  local branch
-  branch="$(git -C "${dir}" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's@^origin/@@')"
-  if [ -z "${branch}" ]; then
-    branch="$(git -C "${dir}" branch --show-current)"
+  log "checking out ${url} at ${ref}"
+  git -C "${dir}" fetch --quiet --depth 1 origin "${ref}"
+  git -C "${dir}" checkout --quiet --detach FETCH_HEAD
+
+  local resolved
+  resolved="$(git -C "${dir}" rev-parse HEAD)"
+  if [ "${resolved}" != "${ref}" ]; then
+    echo "pinned ref ${ref} resolved to ${resolved} for ${url}" >&2
+    exit 1
   fi
-  git -C "${dir}" checkout "${branch}"
-  git -C "${dir}" reset --hard "origin/${branch}"
+}
+
+write_target_lock() {
+  # Records exactly what was measured, so a result can be traced to its inputs.
+  local lock_file="${ROOT_DIR}/targets/targets.lock.json"
+  cat >"${lock_file}" <<EOF
+{
+  "mutillidae": {
+    "url": "https://github.com/webpwnized/mutillidae.git",
+    "commit": "$(git -C "${TARGET_REPO_DIR}" rev-parse HEAD)"
+  },
+  "mutillidae_docker": {
+    "url": "https://github.com/webpwnized/mutillidae-docker.git",
+    "commit": "$(git -C "${TARGET_RUNTIME_DIR}" rev-parse HEAD)"
+  },
+  "morcilla": {
+    "path": "${MORCILLA_SRC_DIR}",
+    "commit": "$(git -C "${MORCILLA_SRC_DIR}" rev-parse HEAD 2>/dev/null || echo unknown)"
+  }
+}
+EOF
+  log "wrote ${lock_file}"
 }
 
 sync_morcilla_sources() {
@@ -211,8 +247,9 @@ cmd_setup() {
   require_cmd rsync
   require_cmd curl
 
-  clone_or_update_repo https://github.com/webpwnized/mutillidae.git "${TARGET_REPO_DIR}"
-  clone_or_update_repo https://github.com/webpwnized/mutillidae-docker.git "${TARGET_RUNTIME_DIR}"
+  checkout_pinned_repo https://github.com/webpwnized/mutillidae.git "${TARGET_REPO_DIR}" "${MUTILLIDAE_REF}"
+  checkout_pinned_repo https://github.com/webpwnized/mutillidae-docker.git "${TARGET_RUNTIME_DIR}" "${MUTILLIDAE_DOCKER_REF}"
+  write_target_lock
   sync_morcilla_sources
   start_mutillidae_stack
   wait_for_http "http://127.0.0.1:18080/" 240

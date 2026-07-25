@@ -135,3 +135,28 @@ def test_scanner_dockerfile_uses_dependency_layer_not_editable_install() -> None
     assert "pip install -r /tmp/requirements.txt" in dockerfile
     assert "pip install -e ." not in dockerfile
     assert 'ENTRYPOINT ["python", "-m", "padv.cli.main"]' in dockerfile
+
+
+def test_mutillidae_e2e_pins_the_benchmark_target() -> None:
+    """A moving branch tip makes two benchmark runs incomparable."""
+    root = Path(__file__).resolve().parents[1]
+    script = _read(root / "scripts" / "mutillidae_e2e.sh")
+
+    assert "MUTILLIDAE_REF=" in script
+    assert "MUTILLIDAE_DOCKER_REF=" in script
+    assert "--detach FETCH_HEAD" in script
+
+    # The old behaviour: follow whatever the default branch points at today.
+    assert "reset --hard" not in script
+    assert "symbolic-ref" not in script
+
+    # The checkout must verify it actually landed on the pinned commit.
+    assert 'if [ "${resolved}" != "${ref}" ]' in script
+    # And record what was measured.
+    assert "targets.lock.json" in script
+
+
+def test_mutillidae_e2e_refuses_an_empty_pin() -> None:
+    root = Path(__file__).resolve().parents[1]
+    script = _read(root / "scripts" / "mutillidae_e2e.sh")
+    assert "refusing to check out ${url} without a pinned ref" in script

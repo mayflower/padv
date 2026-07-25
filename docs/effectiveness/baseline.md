@@ -230,5 +230,23 @@ Abgesichert durch [`tests/test_morcilla_extension_contract.py`](../../tests/test
 (Marker `integration`): baut die echte Extension, stellt echte Requests und prüft den
 Vertrag bis einschließlich V0. Vor der Änderung 7 von 9 Tests rot, danach 9 grün.
 
-Damit ist der Blocker aus Abschnitt 7 aufgehoben. Offen bleiben die übrigen Messlücken
-aus Abschnitt 6, insbesondere das fehlende Pinning des Benchmarktargets.
+Damit ist der Blocker aus Abschnitt 7 aufgehoben.
+
+## 9. Nachtrag — Messlücken aus Abschnitt 6
+
+- **Pinning (Lücke 2) behoben.** `scripts/mutillidae_e2e.sh` folgt keinem Branch-Tip
+  mehr, sondern holt einen festen Commit und macht `checkout --detach FETCH_HEAD`. Die
+  Refs stehen in `MUTILLIDAE_REF` (Default `84f2c00`, 2.12.7) und
+  `MUTILLIDAE_DOCKER_REF` (Default `b592011`) und sind überschreibbar, aber nicht
+  weglassbar. Nach dem Checkout wird verifiziert, dass der aufgelöste Commit dem
+  gepinnten entspricht, und `targets/targets.lock.json` hält fest, was tatsächlich
+  gemessen wurde — inklusive des Morcilla-Commits. Real gegen das Remote geprüft,
+  auch bei wiederholtem Lauf.
+- **Truncation (Lücke 4) behoben** durch `X-Morcilla-Arg-Truncated`, siehe Abschnitt 8.
+- **Korrelation (Lücke 3) behoben** durch `X-Morcilla-Correlation`, siehe Abschnitt 8.
+
+Weiter offen: `mysqli::query` statt `mysqli_query` in Fixtures und Konfiguration
+(Lücke 5), der Login-Vorlauf für die auth-pflichtige Fixture (Lücke 6) und die
+Umgebungsvariable `COMPOSER_AUTH` (Lücke 7). Ebenfalls offen bleibt ein echter
+Browser-Oracle für XSS; die Ausführungskontext-Prüfung entscheidet, *wo* der Canary
+landet, nicht ob ein Browser ihn ausgeführt hat.
