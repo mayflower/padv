@@ -207,7 +207,7 @@ def test_validate_runtime_executes_structured_steps_not_legacy_request_arrays(
     )
     monkeypatch.setattr(
         "padv.orchestrator.runtime.evaluate_candidate",
-        lambda **kwargs: GateResult("DROPPED", ["V0"], "V3", "test"),
+        lambda **kwargs: GateResult("REFUTED", ["V0"], "V3", "test"),
     )
 
     bundles, _decisions = validate_candidates_runtime(
@@ -329,7 +329,7 @@ def test_validate_runtime_forwards_auth_cookies(monkeypatch: pytest.MonkeyPatch,
     )
     monkeypatch.setattr(
         "padv.orchestrator.runtime.evaluate_candidate",
-        lambda **kwargs: GateResult("DROPPED", ["V0"], "V3", "test"),
+        lambda **kwargs: GateResult("REFUTED", ["V0"], "V3", "test"),
     )
 
     bundles, _decisions = validate_candidates_runtime(
@@ -416,7 +416,7 @@ def test_validate_runtime_uses_distinct_sessions_per_candidate(monkeypatch: pyte
     )
     monkeypatch.setattr(
         "padv.orchestrator.runtime.evaluate_candidate",
-        lambda **kwargs: GateResult("DROPPED", ["V0"], "V3", "test"),
+        lambda **kwargs: GateResult("REFUTED", ["V0"], "V3", "test"),
     )
 
     bundles, _decisions = validate_candidates_runtime(
@@ -544,7 +544,7 @@ def test_validate_runtime_executes_structured_csrf_flow(monkeypatch: pytest.Monk
     )
     monkeypatch.setattr(
         "padv.orchestrator.runtime.evaluate_candidate",
-        lambda **kwargs: GateResult("DROPPED", ["V0"], "V3", "test"),
+        lambda **kwargs: GateResult("REFUTED", ["V0"], "V3", "test"),
     )
 
     with _serve(_CsrfHandler) as base_url:
@@ -609,7 +609,7 @@ def test_validate_runtime_passes_shared_witness_contract_and_witness(monkeypatch
     def _fake_evaluate_candidate(**kwargs):
         seen["witness"] = kwargs.get("witness")
         seen["witness_contract"] = kwargs.get("witness_contract")
-        return GateResult("DROPPED", ["V0"], "V3", "test")
+        return GateResult("REFUTED", ["V0"], "V3", "test")
 
     monkeypatch.setattr("padv.orchestrator.runtime.evaluate_candidate", _fake_evaluate_candidate)
 
@@ -671,7 +671,7 @@ def test_validate_runtime_embeds_candidate_hypotheses(monkeypatch: pytest.Monkey
     )
     monkeypatch.setattr(
         "padv.orchestrator.runtime.evaluate_candidate",
-        lambda **kwargs: GateResult("DROPPED", ["V0"], "V3", "test"),
+        lambda **kwargs: GateResult("REFUTED", ["V0"], "V3", "test"),
     )
 
     bundles, _decisions = validate_candidates_runtime(
@@ -742,7 +742,7 @@ def test_validate_runtime_associates_static_evidence_via_evidence_refs(
 
     def _fake_evaluate_candidate(**kwargs):
         seen_query_ids.append([item.query_id for item in kwargs["static_evidence"]])
-        return GateResult("DROPPED", ["V0"], "V3", "test")
+        return GateResult("REFUTED", ["V0"], "V3", "test")
 
     monkeypatch.setattr("padv.orchestrator.runtime.evaluate_candidate", _fake_evaluate_candidate)
 
@@ -821,7 +821,7 @@ def test_validate_runtime_uses_oracle_functions_and_preserves_request_headers(mo
     )
     monkeypatch.setattr(
         "padv.orchestrator.runtime.evaluate_candidate",
-        lambda **kwargs: GateResult("DROPPED", ["V0"], "V3", "test"),
+        lambda **kwargs: GateResult("REFUTED", ["V0"], "V3", "test"),
     )
 
     validate_candidates_runtime(
@@ -879,7 +879,7 @@ def test_validate_runtime_populates_typed_runtime_evidence(monkeypatch: pytest.M
     )
     monkeypatch.setattr(
         "padv.orchestrator.runtime.evaluate_candidate",
-        lambda **kwargs: GateResult("DROPPED", ["V0"], "V3", "test"),
+        lambda **kwargs: GateResult("REFUTED", ["V0"], "V3", "test"),
     )
 
     bundles, _ = validate_candidates_runtime(
@@ -995,7 +995,7 @@ def test_validate_runtime_reuses_existing_bundle_without_replaying_requests(
         ],
         negative_runtime=[],
         repro_run_ids=[],
-        gate_result=GateResult("DROPPED", ["V0"], "V3", "cached"),
+        gate_result=GateResult("REFUTED", ["V0"], "V3", "cached"),
         limitations=[],
         differential_pairs=[],
         artifact_refs=[],
@@ -1027,7 +1027,7 @@ def test_validate_runtime_reuses_existing_bundle_without_replaying_requests(
 
     assert len(bundles) == 1
     assert bundles[0].bundle_id == bundle.bundle_id
-    assert decisions["DROPPED"] == 1
+    assert decisions["REFUTED"] == 1
 
 
 def test_validate_runtime_marks_tail_candidates_skipped_when_budget_exhausts(
@@ -1066,13 +1066,13 @@ def test_validate_runtime_marks_tail_candidates_skipped_when_budget_exhausts(
             positive_runtime=[],
             negative_runtime=[],
             repro_run_ids=[],
-            gate_result=GateResult("DROPPED", ["V0"], "V3", "test"),
+            gate_result=GateResult("REFUTED", ["V0"], "V3", "test"),
             limitations=["test"],
             differential_pairs=[],
             artifact_refs=[],
             discovery_trace={},
             planner_trace={},
-            bundle_type="dropped",
+            bundle_type="refuted",
         )
         ctx.store.save_bundle(bundle, run_id=ctx.run_id)
         return bundle, 1
@@ -1095,11 +1095,11 @@ def test_validate_runtime_marks_tail_candidates_skipped_when_budget_exhausts(
     )
 
     assert processed == ["cand-1"]
-    assert [bundle.gate_result.decision for bundle in bundles] == ["DROPPED", "SKIPPED_BUDGET"]
+    assert [bundle.gate_result.decision for bundle in bundles] == ["REFUTED", "SKIPPED_BUDGET"]
     assert [bundle.candidate_outcome for bundle in bundles] == ["REFUTED", "SKIPPED_BUDGET"]
     assert bundles[1].bundle_type == "skipped_budget"
     assert "budget exhausted" in bundles[1].gate_result.reason
-    assert decisions["DROPPED"] == 1
+    assert decisions["REFUTED"] == 1
     assert decisions["SKIPPED_BUDGET"] == 1
     persisted = store.load_bundle("bundle-run-budget-tail-cand-2", run_id="run-budget-tail")
     assert persisted is not None

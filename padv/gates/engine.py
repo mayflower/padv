@@ -8,6 +8,8 @@ from padv.validation.preconditions import GatePreconditions, coerce_gate_precond
 
 
 REQUIRED_GATES = ["V0", "V1", "V2", "V3", "V4", "V5", "V6"]
+# Analysis-only candidates run the static half of the contract instead.
+ANALYSIS_GATES = ["A0", "A1", "A2"]
 
 _RUNTIME_VALIDATABLE_CLASSES = runtime_validatable_classes()
 
@@ -38,14 +40,14 @@ def _evaluate_v0_scope(
     negative_runs: list[RuntimeEvidence],
 ) -> tuple[list[RuntimeEvidence], list[RuntimeEvidence], GateResult | None]:
     if any(run.status == "insufficient_evidence" for run in positive_runs + negative_runs):
-        return [], [], GateResult("INSUFFICIENT_EVIDENCE", [], "V0", "oracle output truncated")
+        return [], [], GateResult("INCONCLUSIVE", [], "V0", "oracle output truncated")
     hard_scope_failures = {"auth_failed", "missing_key", "missing_intercept", "inactive"}
     if any(run.status in hard_scope_failures for run in positive_runs):
-        return [], [], GateResult("DROPPED", [], "V0", "runtime not in valid scope")
+        return [], [], GateResult("INCONCLUSIVE", [], "V0", "runtime not in valid scope")
     in_scope_positive = [run for run in positive_runs if run.status != "request_failed"]
     in_scope_negative = [run for run in negative_runs if run.status != "request_failed"]
     if not in_scope_positive or not in_scope_negative:
-        return [], [], GateResult("DROPPED", [], "V0", "runtime not in valid scope")
+        return [], [], GateResult("INCONCLUSIVE", [], "V0", "runtime not in valid scope")
     return in_scope_positive, in_scope_negative, None
 
 
@@ -56,13 +58,17 @@ def _evaluate_v2_corroboration(
     passed: list[str],
 ) -> GateResult | None:
     if not static_evidence:
-        return GateResult("DROPPED", passed, "V2", "missing static evidence")
+        return GateResult("INCONCLUSIVE", passed, "V2", "missing static evidence")
     if not in_scope_positive_runs:
-        return GateResult("DROPPED", passed, "V2", "missing runtime evidence")
-    signal_set = {s.strip().casefold() for s in (evidence_signals or []) if isinstance(s, str) and s.strip()}
-    if len(signal_set) < 2:
-        return GateResult("DROPPED", passed, "V2", "insufficient multi-evidence corroboration")
+        return GateResult("INCONCLUSIVE", passed, "V2", "missing runtime evidence")
+    if not _has_multi_evidence_corroboration(evidence_signals):
+        return GateResult("INCONCLUSIVE", passed, "V2", "insufficient multi-evidence corroboration")
     return None
+
+
+def _has_multi_evidence_corroboration(evidence_signals: list[str] | None) -> bool:
+    signal_set = {s.strip().casefold() for s in (evidence_signals or []) if isinstance(s, str) and s.strip()}
+    return len(signal_set) >= 2
 
 
 def _evaluate_v3v4_runtime_class(
@@ -75,14 +81,17 @@ def _evaluate_v3v4_runtime_class(
     required_all = {str(x).strip().casefold() for x in contract.required_all if str(x).strip()}
     required_any = {str(x).strip().casefold() for x in contract.required_any if str(x).strip()}
     if required_all and not required_all.issubset(positive_flags):
-        return GateResult("DROPPED", passed, "V3", "runtime class witness missing")
+        return GateResult("REFUTED", passed, "V3", "runtime class witness missing")
     if required_any and not (positive_flags & required_any):
-        return GateResult("DROPPED", passed, "V3", "runtime class witness missing")
+        return GateResult("REFUTED", passed, "V3", "runtime class witness missing")
     passed.append("V3")
 
     forbidden_negative = {str(x).strip().casefold() for x in contract.negative_must_not_include if str(x).strip()}
     if contract.enforce_negative_clean and forbidden_negative and (negative_flags & forbidden_negative):
-        return GateResult("DROPPED", passed, "V4", "negative control matched class witness")
+        # The control fired without the payload, so the positive witness is not
+        # attributable to our input. That invalidates the experiment; it does
+        # not disprove the hypothesis.
+        return GateResult("INCONCLUSIVE", passed, "V4", "negative control matched class witness")
     passed.append("V4")
     return None
 
@@ -101,11 +110,11 @@ def _evaluate_v3v4_legacy(
     passed: list[str],
 ) -> GateResult | None:
     if not all(_run_has_canary_hit(run, intercept_set, canary, config) for run in in_scope_positive_runs):
-        return GateResult("DROPPED", passed, "V3", "canary boundary proof missing")
+        return GateResult("REFUTED", passed, "V3", "canary boundary proof missing")
     passed.append("V3")
 
     if any(_run_has_canary_hit(run, intercept_set, canary, config) for run in in_scope_negative_runs):
-        return GateResult("DROPPED", passed, "V4", "negative control hit canary")
+        return GateResult("INCONCLUSIVE", passed, "V4", "negative control hit canary")
     passed.append("V4")
     return None
 
@@ -134,10 +143,40 @@ def _evaluate_v5(
     passed: list[str],
 ) -> GateResult | None:
     if len(in_scope_positive_runs) < 2 or len(in_scope_negative_runs) < 1:
-        return GateResult("DROPPED", passed, "V5", "insufficient repro runs")
+        return GateResult("INCONCLUSIVE", passed, "V5", "insufficient repro runs")
     if any(run.overflow or run.arg_truncated or run.result_truncated for run in in_scope_positive_runs + in_scope_negative_runs):
-        return GateResult("DROPPED", passed, "V5", "runtime evidence truncated")
+        return GateResult("INCONCLUSIVE", passed, "V5", "runtime evidence truncated")
     return None
+
+
+def _evaluate_analysis_only(
+    typed_preconditions: GatePreconditions,
+    static_evidence: list[StaticEvidence],
+    evidence_signals: list[str] | None,
+) -> GateResult:
+    """Gate analysis-only candidates on the static half of the evidence contract.
+
+    These candidates carry no runtime proof, so the runtime gates cannot apply.
+    They still have to clear preconditions and multi-evidence corroboration, and
+    they are reported as ANALYSIS_FINDING rather than VALIDATED.
+    """
+    passed = ["A0"]
+    if typed_preconditions.has_unresolved():
+        return GateResult("NEEDS_HUMAN_SETUP", passed, "A1", typed_preconditions.reason())
+    passed.append("A1")
+
+    if not static_evidence:
+        return GateResult("INCONCLUSIVE", passed, "A2", "missing static evidence")
+    if not _has_multi_evidence_corroboration(evidence_signals):
+        return GateResult("INCONCLUSIVE", passed, "A2", "insufficient multi-evidence corroboration")
+    passed.append("A2")
+
+    return GateResult(
+        "CONFIRMED_ANALYSIS_FINDING",
+        passed,
+        None,
+        "analysis-only candidate corroborated by static multi-evidence; no runtime proof",
+    )
 
 
 def evaluate_candidate(
@@ -158,7 +197,7 @@ def evaluate_candidate(
     passed: list[str] = []
     typed_preconditions = coerce_gate_preconditions(preconditions)
     if candidate is not None and str(getattr(candidate, "validation_mode", "")).strip() == "analysis_only":
-        return GateResult("CONFIRMED_ANALYSIS_FINDING", ["A0"], None, "analysis-only candidate confirmed by static and research evidence")
+        return _evaluate_analysis_only(typed_preconditions, static_evidence, evidence_signals)
 
     in_scope_positive_runs, in_scope_negative_runs, v0_fail = _evaluate_v0_scope(positive_runs, negative_runs)
     if v0_fail is not None:

@@ -58,5 +58,5 @@ def test_runtime_validatable_class_without_witness_never_validates(
         evidence_signals=["joern", "scip"],
         vuln_class=vuln_class,
     )
-    assert result.decision == "DROPPED"
+    assert result.decision == "REFUTED"
     assert result.failed_gate == "V3"

@@ -322,17 +322,19 @@ def _bundle_type_for_decision(decision: str) -> str:
     mapping = {
         "VALIDATED": "validated_exploit",
         "CONFIRMED_ANALYSIS_FINDING": "confirmed_analysis_finding",
-        "DROPPED": "dropped",
+        "REFUTED": "refuted",
+        "INCONCLUSIVE": "inconclusive",
         "NEEDS_HUMAN_SETUP": "needs_human_setup",
         "SKIPPED_BUDGET": "skipped_budget",
         "ERROR": "error",
     }
-    return mapping.get(str(decision).strip(), "dropped")
+    return mapping.get(str(decision).strip(), "inconclusive")
 
 
 _RUNTIME_DECISION_KEYS = (
     "VALIDATED",
-    "DROPPED",
+    "REFUTED",
+    "INCONCLUSIVE",
     "NEEDS_HUMAN_SETUP",
     "CONFIRMED_ANALYSIS_FINDING",
     "SKIPPED_BUDGET",

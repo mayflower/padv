@@ -92,7 +92,7 @@ def test_nothing_validated_disambiguation_test():
             "stagnation_rounds": 0
         },
         "decisions": {
-            "DROPPED": 5
+            "REFUTED": 5
         }
     }
     

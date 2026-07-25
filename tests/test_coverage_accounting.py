@@ -15,7 +15,7 @@ def test_attempted_but_dropped_is_none():
     b2 = EvidenceBundle(
         bundle_id="2", created_at="", candidate=cand, static_evidence=[],
         positive_runtime=[], negative_runtime=[], repro_run_ids=[],
-        gate_result=GateResult("DROPPED", [], "V0", ""), limitations=[]
+        gate_result=GateResult("INCONCLUSIVE", [], "V0", ""), limitations=[]
     )
     b2.candidate_outcome = "REFUTED"
     
@@ -44,7 +44,7 @@ def test_refuted_with_strong_witness_is_partial():
     b = EvidenceBundle(
         bundle_id="1", created_at="", candidate=cand, static_evidence=[],
         positive_runtime=[pr], negative_runtime=[], repro_run_ids=[],
-        gate_result=GateResult("DROPPED", [], "V0", ""), limitations=[]
+        gate_result=GateResult("INCONCLUSIVE", [], "V0", ""), limitations=[]
     )
     b.candidate_outcome = "REFUTED"
     

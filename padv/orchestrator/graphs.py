@@ -62,7 +62,8 @@ from padv.validation.preconditions import merge_gate_preconditions
 
 _DECISION_KEYS = (
     "VALIDATED",
-    "DROPPED",
+    "REFUTED",
+    "INCONCLUSIVE",
     "NEEDS_HUMAN_SETUP",
     "CONFIRMED_ANALYSIS_FINDING",
     "SKIPPED_BUDGET",

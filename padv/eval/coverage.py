@@ -19,12 +19,15 @@ def evaluate_run_coverage(bundles: list[EvidenceBundle]) -> dict[str, str]:
         
         for b in class_bundles:
             outcome = b.candidate_outcome
-            
+
             if outcome == "VALIDATED":
                 status = "FULL"
                 break
-                
-            if outcome == "REFUTED":
+
+            if outcome == "ANALYSIS_FINDING" and status == "NONE":
+                status = "PARTIAL"
+
+            if outcome in {"REFUTED", "INCONCLUSIVE"}:
                 strong_witness = False
                 for pr in b.positive_runtime:
                     if pr.witness_evidence and pr.witness_evidence.witness_flags:

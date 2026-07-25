@@ -19,7 +19,7 @@ def test_truncation_prevents_validation():
     
     in_pos, in_neg, v0_fail = _evaluate_v0_scope([pos_run], [])
     assert v0_fail is not None
-    assert v0_fail.decision == "INSUFFICIENT_EVIDENCE"
+    assert v0_fail.decision == "INCONCLUSIVE"
     assert "truncated" in v0_fail.reason
 
 def test_exact_canary_match_positive_negative():

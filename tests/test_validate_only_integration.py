@@ -235,7 +235,7 @@ def test_validate_only_typed_oracle_is_reproducible_n3(
             assert summary["candidate_outcomes"]["VALIDATED"] == 1
             assert summary["candidate_outcomes"]["REFUTED"] == 1
             assert decisions["VALIDATED"] == 1
-            assert decisions["DROPPED"] == 1
+            assert decisions["REFUTED"] == 1
             snapshots.append([_bundle_snapshot(bundle) for bundle in bundles])
             summaries.append(
                 {
@@ -262,7 +262,7 @@ def test_validate_only_typed_oracle_is_reproducible_n3(
 
     assert negative_snapshot["candidate_id"] == "cand-negative"
     assert negative_snapshot["candidate_outcome"] == "REFUTED"
-    assert negative_snapshot["decision"] == "DROPPED"
+    assert negative_snapshot["decision"] == "REFUTED"
     assert negative_snapshot["failed_gate"] == "V3"
     assert negative_snapshot["positive_call_counts"] == [0, 0]
     assert negative_snapshot["negative_call_counts"] == [0]

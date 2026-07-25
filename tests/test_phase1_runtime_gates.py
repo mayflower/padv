@@ -74,7 +74,7 @@ def test_gate_xss_negative_control_fails_when_signal_repeats() -> None:
         evidence_signals=["source", "web"],
         vuln_class="xss_output_boundary",
     )
-    assert result.decision == "DROPPED"
+    assert result.decision == "INCONCLUSIVE"
     assert result.failed_gate == "V4"
 
 
@@ -95,7 +95,7 @@ def test_gate_access_control_requires_negative_control_cleanliness() -> None:
         evidence_signals=["source", "web"],
         vuln_class="broken_access_control",
     )
-    assert result.decision == "DROPPED"
+    assert result.decision == "INCONCLUSIVE"
     assert result.failed_gate == "V4"
 
 
@@ -116,5 +116,5 @@ def test_gate_access_control_requires_pair_observation() -> None:
         evidence_signals=["source", "web"],
         vuln_class="broken_access_control",
     )
-    assert result.decision == "DROPPED"
+    assert result.decision == "REFUTED"
     assert result.failed_gate == "V3"

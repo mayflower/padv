@@ -149,7 +149,7 @@ def test_gate_drops_without_multi_evidence_signals() -> None:
         preconditions=GatePreconditions(),
         evidence_signals=["joern"],
     )
-    assert result.decision == "DROPPED"
+    assert result.decision == "INCONCLUSIVE"
     assert result.failed_gate == "V2"
 
 
@@ -202,7 +202,7 @@ def test_gate_v0_drops_when_all_positive_requests_fail() -> None:
         preconditions=GatePreconditions(),
         evidence_signals=["joern", "web"],
     )
-    assert result.decision == "DROPPED"
+    assert result.decision == "INCONCLUSIVE"
     assert result.failed_gate == "V0"
 
 
@@ -341,7 +341,7 @@ def test_gate_drops_truncated_runtime_evidence() -> None:
         vuln_class="legacy_probe",
     )
 
-    assert result.decision == "INSUFFICIENT_EVIDENCE"
+    assert result.decision == "INCONCLUSIVE"
     assert result.failed_gate == "V0"
     assert "truncated" in result.reason
 
@@ -350,12 +350,23 @@ def test_gate_returns_confirmed_analysis_for_analysis_only_candidate() -> None:
     config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
     result = evaluate_candidate(
         config=config,
-        static_evidence=[],
+        static_evidence=[
+            StaticEvidence(
+                candidate_id="cand-a",
+                query_profile="default",
+                query_id="q1",
+                file_path="config.php",
+                line=1,
+                snippet="ini_set('display_errors', 1);",
+                hash="abc",
+            )
+        ],
         positive_runs=[],
         negative_runs=[],
         intercepts=[],
         canary="padv",
         preconditions=GatePreconditions(),
+        evidence_signals=["joern", "source"],
         candidate=Candidate(
             candidate_id="cand-a",
             vuln_class="security_misconfiguration",
@@ -369,3 +380,4 @@ def test_gate_returns_confirmed_analysis_for_analysis_only_candidate() -> None:
         ),
     )
     assert result.decision == "CONFIRMED_ANALYSIS_FINDING"
+    assert result.passed_gates == ["A0", "A1", "A2"]

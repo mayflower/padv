@@ -199,7 +199,7 @@ def test_gate_engine_ignores_differential_pairs_for_non_authz() -> None:
         vuln_class="xss_output_boundary",
         differential_pairs=differential,
     )
-    assert result.decision == "DROPPED"
+    assert result.decision == "REFUTED"
     assert result.failed_gate == "V3"
 
 
@@ -236,7 +236,7 @@ def test_differential_request_consumes_existing_budget(monkeypatch: pytest.Monke
     def _fake_gate(**kwargs):
         pairs = kwargs.get("differential_pairs") or []
         seen_pairs.extend(pairs)
-        return GateResult("DROPPED", ["V0"], "V3", "test")
+        return GateResult("REFUTED", ["V0"], "V3", "test")
 
     monkeypatch.setattr("padv.orchestrator.runtime.send_request", _fake_send_request)
     monkeypatch.setattr("padv.orchestrator.runtime.parse_response_headers", _fake_parse)
@@ -293,7 +293,7 @@ def test_runtime_differential_uses_configured_auth_levels(monkeypatch: pytest.Mo
     def _fake_gate(**kwargs):
         pairs = kwargs.get("differential_pairs") or []
         seen_pairs.extend(pairs)
-        return GateResult("DROPPED", ["V0"], "V3", "test")
+        return GateResult("REFUTED", ["V0"], "V3", "test")
 
     monkeypatch.setattr("padv.orchestrator.runtime.send_request", _fake_send_request)
     monkeypatch.setattr("padv.orchestrator.runtime.parse_response_headers", _fake_parse)

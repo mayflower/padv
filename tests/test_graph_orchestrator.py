@@ -419,16 +419,16 @@ def test_run_with_graph_uses_agentic_validation_nodes(monkeypatch: pytest.Monkey
             positive_runtime=[RuntimeEvidence("r1", "ok", 1, False, False, False, None, [], {})],
             negative_runtime=[RuntimeEvidence("r2", "ok", 0, False, False, False, None, [], {})],
             repro_run_ids=["r1"],
-            gate_result=GateResult("DROPPED", ["V0"], "V3", "missing"),
+            gate_result=GateResult("REFUTED", ["V0"], "V3", "missing"),
             limitations=["missing"],
         )
-        return [bundle], {"VALIDATED": 0, "DROPPED": 1, "NEEDS_HUMAN_SETUP": 0}
+        return [bundle], {"VALIDATED": 0, "REFUTED": 1, "NEEDS_HUMAN_SETUP": 0}
 
     monkeypatch.setattr("padv.orchestrator.graphs.validate_candidates_runtime", fake_validate)
 
     summary = run_with_graph(config, str(tmp_path), store, "variant")
     assert isinstance(summary, RunSummary)
-    assert summary.decisions["DROPPED"] == 1
+    assert summary.decisions["REFUTED"] == 1
     assert summary.candidate_outcomes["REFUTED"] == 1
     assert summary.candidate_outcomes["SKIPPED_BUDGET"] == 0
     assert summary.bundle_ids == ["bundle-1"]
@@ -743,7 +743,7 @@ def test_run_with_graph_stops_on_stagnation_without_root_continue(
             positive_runtime=[RuntimeEvidence("r1", "ok", 1, False, False, False, None, [], {})],
             negative_runtime=[RuntimeEvidence("r2", "ok", 0, False, False, False, None, [], {})],
             repro_run_ids=["r1"],
-            gate_result=GateResult("DROPPED", ["V0"], "V3", "missing"),
+            gate_result=GateResult("REFUTED", ["V0"], "V3", "missing"),
             limitations=["missing"],
             planner_trace={
                 "attempts": [
@@ -763,7 +763,7 @@ def test_run_with_graph_stops_on_stagnation_without_root_continue(
                 ]
             },
         )
-        return [bundle], {"VALIDATED": 0, "DROPPED": 1, "NEEDS_HUMAN_SETUP": 0}
+        return [bundle], {"VALIDATED": 0, "REFUTED": 1, "NEEDS_HUMAN_SETUP": 0}
 
     monkeypatch.setattr("padv.orchestrator.graphs.validate_candidates_runtime", _fake_validate)
 
@@ -1831,7 +1831,7 @@ def test_run_with_graph_persists_attempt_history_across_iterations(
             positive_runtime=[RuntimeEvidence("r1", "ok", 1, False, False, False, None, [], {})],
             negative_runtime=[RuntimeEvidence("r2", "ok", 0, False, False, False, None, [], {})],
             repro_run_ids=["r1"],
-            gate_result=GateResult("DROPPED", ["V0"], "V3", "missing"),
+            gate_result=GateResult("REFUTED", ["V0"], "V3", "missing"),
             limitations=["missing"],
             planner_trace={
                 "attempts": [
@@ -1851,7 +1851,7 @@ def test_run_with_graph_persists_attempt_history_across_iterations(
                 ]
             },
         )
-        return [bundle], {"VALIDATED": 0, "DROPPED": 1, "NEEDS_HUMAN_SETUP": 0}
+        return [bundle], {"VALIDATED": 0, "REFUTED": 1, "NEEDS_HUMAN_SETUP": 0}
 
     monkeypatch.setattr("padv.orchestrator.graphs.validate_candidates_runtime", _fake_validate)
 
@@ -1890,7 +1890,7 @@ def test_run_with_graph_fails_when_selected_candidates_produce_zero_bundles(
     monkeypatch.setattr("padv.orchestrator.graphs.discover_web_inventory", lambda *_args, **_kwargs: ({}, {}, None))
     monkeypatch.setattr(
         "padv.orchestrator.graphs.validate_candidates_runtime",
-        lambda *args, **kwargs: ([], {"VALIDATED": 0, "DROPPED": 0, "NEEDS_HUMAN_SETUP": 0}),
+        lambda *args, **kwargs: ([], {"VALIDATED": 0, "REFUTED": 0, "NEEDS_HUMAN_SETUP": 0}),
     )
 
     with pytest.raises(RuntimeError, match="selected candidates produced zero bundles"):
@@ -1934,10 +1934,10 @@ def test_agent_workspace_artifact_is_persisted(monkeypatch: pytest.MonkeyPatch, 
             positive_runtime=[RuntimeEvidence("r1", "ok", 1, False, False, False, None, [], {})],
             negative_runtime=[RuntimeEvidence("r2", "ok", 0, False, False, False, None, [], {})],
             repro_run_ids=["r1"],
-            gate_result=GateResult("DROPPED", ["V0"], "V3", "missing"),
+            gate_result=GateResult("REFUTED", ["V0"], "V3", "missing"),
             limitations=["missing"],
         )
-        return [bundle], {"VALIDATED": 0, "DROPPED": 1, "NEEDS_HUMAN_SETUP": 0}
+        return [bundle], {"VALIDATED": 0, "REFUTED": 1, "NEEDS_HUMAN_SETUP": 0}
 
     monkeypatch.setattr("padv.orchestrator.graphs.validate_candidates_runtime", _fake_validate)
 
@@ -1946,7 +1946,7 @@ def test_agent_workspace_artifact_is_persisted(monkeypatch: pytest.MonkeyPatch, 
     assert workspace is not None
     assert len(workspace["hypotheses"]) == 1
     assert len(workspace["witness_bundles"]) == 1
-    assert workspace["gate_history"][0]["decision"] == "DROPPED"
+    assert workspace["gate_history"][0]["decision"] == "REFUTED"
 
 
 def test_agent_runtime_shared_context_tracks_hypotheses_refutations_and_experiments(
@@ -1982,10 +1982,10 @@ def test_agent_runtime_shared_context_tracks_hypotheses_refutations_and_experime
             positive_runtime=[RuntimeEvidence("r1", "ok", 1, False, False, False, None, [], {})],
             negative_runtime=[RuntimeEvidence("r2", "ok", 0, False, False, False, None, [], {})],
             repro_run_ids=["r1"],
-            gate_result=GateResult("DROPPED", ["V0"], "V3", "missing"),
+            gate_result=GateResult("REFUTED", ["V0"], "V3", "missing"),
             limitations=["missing"],
         )
-        return [bundle], {"VALIDATED": 0, "DROPPED": 1, "NEEDS_HUMAN_SETUP": 0}
+        return [bundle], {"VALIDATED": 0, "REFUTED": 1, "NEEDS_HUMAN_SETUP": 0}
 
     monkeypatch.setattr("padv.orchestrator.graphs.validate_candidates_runtime", _fake_validate)
 
@@ -2008,7 +2008,7 @@ def test_agent_runtime_shared_context_tracks_hypotheses_refutations_and_experime
     assert runtime.shared_context["experiment_board"][0]["attempt_id"] == "attempt-0001"
     assert runtime.shared_context["candidate_seeds"][0]["candidate_id"] == "cand-00001"
     assert runtime.shared_context["static_evidence"][0]["candidate_id"] == "cand-00001"
-    assert result["gate_history"][0]["decision"] == "DROPPED"
+    assert result["gate_history"][0]["decision"] == "REFUTED"
 
 
 def test_state_runtime_rehydrates_shared_context_from_state_on_resume(
@@ -2622,10 +2622,10 @@ def test_runtime_execute_filters_resumed_candidates_to_planned_subset(
                 positive_runtime=[],
                 negative_runtime=[],
                 repro_run_ids=[],
-                gate_result=GateResult("DROPPED", ["V0"], "V3", "test"),
+                gate_result=GateResult("REFUTED", ["V0"], "V3", "test"),
                 limitations=[],
             )],
-            {"VALIDATED": 0, "DROPPED": 1, "NEEDS_HUMAN_SETUP": 0},
+            {"VALIDATED": 0, "REFUTED": 1, "NEEDS_HUMAN_SETUP": 0},
         )[2:],
     )
 
@@ -2729,10 +2729,10 @@ def test_runtime_execute_retains_static_evidence_matched_by_evidence_refs(
                 positive_runtime=[],
                 negative_runtime=[],
                 repro_run_ids=[],
-                gate_result=GateResult("DROPPED", ["V0"], "V3", "test"),
+                gate_result=GateResult("REFUTED", ["V0"], "V3", "test"),
                 limitations=[],
             )],
-            {"VALIDATED": 0, "DROPPED": 1, "NEEDS_HUMAN_SETUP": 0},
+            {"VALIDATED": 0, "REFUTED": 1, "NEEDS_HUMAN_SETUP": 0},
         )[2:],
     )
 
@@ -2789,10 +2789,10 @@ def test_runtime_execute_recovers_candidates_from_selected_pool(
                 positive_runtime=[],
                 negative_runtime=[],
                 repro_run_ids=[],
-                gate_result=GateResult("DROPPED", ["V0"], "V3", "test"),
+                gate_result=GateResult("REFUTED", ["V0"], "V3", "test"),
                 limitations=[],
             )],
-            {"VALIDATED": 0, "DROPPED": 1, "NEEDS_HUMAN_SETUP": 0},
+            {"VALIDATED": 0, "REFUTED": 1, "NEEDS_HUMAN_SETUP": 0},
         )[2:],
     )
 
@@ -2825,7 +2825,7 @@ def test_runtime_execute_recovers_candidates_from_selected_pool(
 
     assert seen["candidate_ids"] == ["cand-derived"]
     assert seen["static_ids"] == ["cand-source"]
-    assert result["decisions"]["DROPPED"] == 1
+    assert result["decisions"]["REFUTED"] == 1
     assert [item.candidate_id for item in result["static_evidence"]] == ["cand-source"]
 
 
@@ -2862,16 +2862,16 @@ def test_deterministic_gate_does_not_short_circuit_on_stale_gate_history(tmp_pat
         "repo_root": str(tmp_path),
         "store": EvidenceStore(tmp_path / ".padv"),
         "run_validation": True,
-        "gate_history": [{"bundle_id": "old", "decision": "DROPPED"}],
+        "gate_history": [{"bundle_id": "old", "decision": "REFUTED"}],
         "iteration_bundles": [],
-        "decisions": {"DROPPED": 1},
+        "decisions": {"REFUTED": 1},
         "agent_runtime": runtime,
     }
 
     result = graph_mod._node_deterministic_gate(state)
 
-    assert result["gate_history"] == [{"bundle_id": "old", "decision": "DROPPED"}]
-    assert result["gate_board"]["gate_history"] == [{"bundle_id": "old", "decision": "DROPPED"}]
+    assert result["gate_history"] == [{"bundle_id": "old", "decision": "REFUTED"}]
+    assert result["gate_board"]["gate_history"] == [{"bundle_id": "old", "decision": "REFUTED"}]
 
 
 def test_agent_runtime_uses_run_scoped_checkpoint_dir(
@@ -3336,7 +3336,7 @@ def test_validate_with_graph_bypasses_langgraph_objective_and_research_path(
 
     def _fake_validate_candidates_runtime(**kwargs):
         decisions = graph_mod._default_decisions()
-        decisions["DROPPED"] = 1
+        decisions["REFUTED"] = 1
         return (
             [
                 EvidenceBundle(
@@ -3347,7 +3347,7 @@ def test_validate_with_graph_bypasses_langgraph_objective_and_research_path(
                     positive_runtime=[],
                     negative_runtime=[],
                     repro_run_ids=[],
-                    gate_result=GateResult("DROPPED", ["V0"], "V3", "test"),
+                    gate_result=GateResult("REFUTED", ["V0"], "V3", "test"),
                     limitations=["test"],
                 )
             ],
@@ -3366,7 +3366,7 @@ def test_validate_with_graph_bypasses_langgraph_objective_and_research_path(
     )
 
     assert [item.bundle_id for item in bundles] == ["bundle-run-validate-direct-cand-00001"]
-    assert decisions["DROPPED"] == 1
+    assert decisions["REFUTED"] == 1
     assert [item.candidate_id for item in store.for_run("run-validate-direct").load_candidates()] == ["cand-00001"]
     assert [item.candidate_id for item in store.for_run("run-validate-direct").load_static_evidence()] == ["cand-00001"]
 

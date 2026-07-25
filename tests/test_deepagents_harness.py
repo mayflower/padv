@@ -1337,7 +1337,7 @@ def test_orient_root_agent_compacts_frontier_in_handoff(monkeypatch: pytest.Monk
             "sinks": [f"sink-{idx}" for idx in range(50)],
             "web_paths": [f"/path/{idx}" for idx in range(50)],
         },
-        "history": [{"candidate_id": f"cand-{idx:05d}", "iteration": idx, "decision": "DROPPED"} for idx in range(50)],
+        "history": [{"candidate_id": f"cand-{idx:05d}", "iteration": idx, "decision": "REFUTED"} for idx in range(50)],
         "attempt_history": [{"candidate_id": f"cand-{idx:05d}", "iteration": idx, "phase": "positive"} for idx in range(50)],
         "hypotheses": [{"candidate_id": f"cand-{idx:05d}", "iteration": idx, "score": 0.5} for idx in range(50)],
         "candidate_resume": {

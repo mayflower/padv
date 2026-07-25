@@ -79,7 +79,7 @@ def test_analyze_failures_extracts_patterns_and_distribution(tmp_path: Path) -> 
         store,
         bundle_id="b1",
         candidate=_candidate("cand-1", "xss_output_boundary", 0.40, ["source"]),
-        decision="DROPPED",
+        decision="REFUTED",
         failed_gate="V3",
         reason="runtime class signal missing",
     )
@@ -87,7 +87,7 @@ def test_analyze_failures_extracts_patterns_and_distribution(tmp_path: Path) -> 
         store,
         bundle_id="b2",
         candidate=_candidate("cand-2", "xss_output_boundary", 0.50, ["source", "joern"]),
-        decision="DROPPED",
+        decision="REFUTED",
         failed_gate="V3",
         reason="runtime class signal missing",
     )
@@ -103,7 +103,7 @@ def test_analyze_failures_extracts_patterns_and_distribution(tmp_path: Path) -> 
         store,
         bundle_id="b4",
         candidate=_candidate("cand-4", "sql_injection_boundary", 0.55, ["source"]),
-        decision="DROPPED",
+        decision="REFUTED",
         failed_gate="V2",
         reason="insufficient multi-evidence corroboration",
     )
@@ -139,7 +139,7 @@ def test_analyze_failures_respects_min_occurrences(tmp_path: Path) -> None:
         store,
         bundle_id="b1",
         candidate=_candidate("cand-1", "xss_output_boundary", 0.40, ["source"]),
-        decision="DROPPED",
+        decision="REFUTED",
         failed_gate="V3",
         reason="runtime class signal missing",
     )
@@ -175,7 +175,7 @@ def test_format_analysis_table_output(tmp_path: Path) -> None:
         store,
         bundle_id="b1",
         candidate=_candidate("cand-1", "xss_output_boundary", 0.40, ["source"]),
-        decision="DROPPED",
+        decision="REFUTED",
         failed_gate="V3",
         reason="runtime class signal missing",
     )
@@ -183,7 +183,7 @@ def test_format_analysis_table_output(tmp_path: Path) -> None:
         store,
         bundle_id="b2",
         candidate=_candidate("cand-2", "xss_output_boundary", 0.50, ["source"]),
-        decision="DROPPED",
+        decision="REFUTED",
         failed_gate="V3",
         reason="runtime class signal missing",
     )
@@ -191,7 +191,7 @@ def test_format_analysis_table_output(tmp_path: Path) -> None:
         store,
         bundle_id="b3",
         candidate=_candidate("cand-3", "xss_output_boundary", 0.45, ["source"]),
-        decision="DROPPED",
+        decision="REFUTED",
         failed_gate="V3",
         reason="runtime class signal missing",
     )

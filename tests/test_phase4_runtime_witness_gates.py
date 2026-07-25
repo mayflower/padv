@@ -89,7 +89,7 @@ def test_gate_sql_drops_without_differential_witness() -> None:
         evidence_signals=["joern", "scip"],
         vuln_class="sql_injection_boundary",
     )
-    assert result.decision == "DROPPED"
+    assert result.decision == "REFUTED"
     assert result.failed_gate == "V3"
 
 
@@ -113,7 +113,7 @@ def test_gate_sql_negative_control_rejects_oracle_hit() -> None:
         evidence_signals=["joern", "scip"],
         vuln_class="sql_injection_boundary",
     )
-    assert result.decision == "DROPPED"
+    assert result.decision == "INCONCLUSIVE"
     assert result.failed_gate == "V4"
 
 
@@ -152,7 +152,7 @@ def test_gate_uses_shared_witness_contract_provider(monkeypatch) -> None:
         vuln_class="ssrf",
     )
 
-    assert result.decision == "DROPPED"
+    assert result.decision == "REFUTED"
     assert result.failed_gate == "V3"
 
 
@@ -286,5 +286,5 @@ def test_gate_xss_raw_canary_without_dom_witness_is_rejected() -> None:
         evidence_signals=["joern", "scip"],
         vuln_class="xss_output_boundary",
     )
-    assert result.decision == "DROPPED"
+    assert result.decision == "REFUTED"
     assert result.failed_gate == "V3"

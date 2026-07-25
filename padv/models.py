@@ -11,30 +11,41 @@ from padv.validation.preconditions import GatePreconditions, coerce_gate_precond
 CandidateStatus = str
 GateDecision = str
 
-_EXPLICIT_CANDIDATE_OUTCOME_KEYS = (
+CANDIDATE_OUTCOMES = (
     "VALIDATED",
     "REFUTED",
-    "SKIPPED_BUDGET",
+    "ANALYSIS_FINDING",
+    "INCONCLUSIVE",
     "SKIPPED_PRECONDITION",
+    "SKIPPED_BUDGET",
     "ERROR",
 )
 
+# Gate decisions are the vocabulary the gate engine emits; candidate outcomes are
+# the vocabulary reports and metrics consume. The two differ only where a decision
+# name would overstate what was proven.
+_OUTCOME_BY_DECISION = {
+    "VALIDATED": "VALIDATED",
+    "REFUTED": "REFUTED",
+    "CONFIRMED_ANALYSIS_FINDING": "ANALYSIS_FINDING",
+    "INCONCLUSIVE": "INCONCLUSIVE",
+    "NEEDS_HUMAN_SETUP": "SKIPPED_PRECONDITION",
+    "SKIPPED_BUDGET": "SKIPPED_BUDGET",
+    "ERROR": "ERROR",
+    # Decisions retired in favour of the REFUTED/INCONCLUSIVE split. Artifacts
+    # written by older runs still carry them, and neither one proved absence,
+    # so both degrade to INCONCLUSIVE rather than claiming a refutation.
+    "DROPPED": "INCONCLUSIVE",
+    "INSUFFICIENT_EVIDENCE": "INCONCLUSIVE",
+}
+
 
 def explicit_candidate_outcome_for_decision(decision: str) -> str:
-    normalized = str(decision or "").strip()
-    if normalized in {"VALIDATED", "CONFIRMED_ANALYSIS_FINDING"}:
-        return "VALIDATED"
-    if normalized == "DROPPED":
-        return "REFUTED"
-    if normalized == "SKIPPED_BUDGET":
-        return "SKIPPED_BUDGET"
-    if normalized == "NEEDS_HUMAN_SETUP":
-        return "SKIPPED_PRECONDITION"
-    return "ERROR"
+    return _OUTCOME_BY_DECISION.get(str(decision or "").strip(), "ERROR")
 
 
 def default_candidate_outcomes() -> dict[str, int]:
-    return dict.fromkeys(_EXPLICIT_CANDIDATE_OUTCOME_KEYS, 0)
+    return dict.fromkeys(CANDIDATE_OUTCOMES, 0)
 
 
 def count_candidate_outcomes(bundles: list[Any]) -> dict[str, int]:
