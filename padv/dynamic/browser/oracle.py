@@ -13,6 +13,7 @@ rule that only structured runtime evidence may drive a gate decision.
 
 from __future__ import annotations
 
+import html
 import threading
 import urllib.parse
 from dataclasses import dataclass, field
@@ -20,6 +21,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from padv.validation.html_context import canary_execution_context
+
+
+def _attr(value: str) -> str:
+    """Escape a string for safe inclusion in an HTML attribute value."""
+    return html.escape(str(value), quote=True)
 
 
 class BrowserUnavailableError(RuntimeError):
@@ -169,14 +175,45 @@ class BrowserExecutionOracle:
     def _callback_url(self, token: str, variant: str) -> str:
         return f"http://{self._callback_host}:{self._callback_port}/cb/{token}/{variant}"
 
-    def _build_url(self, base_url: str, request_spec: dict[str, Any], injection_param: str, value: str) -> str:
+    @staticmethod
+    def _method(request_spec: dict[str, Any]) -> str:
+        return str(request_spec.get("method", "GET") or "GET").strip().upper()
+
+    def _action_url(self, base_url: str, request_spec: dict[str, Any], query: dict[str, Any]) -> str:
         path = str(request_spec.get("path", "") or "")
-        raw_query = request_spec.get("query")
-        query = dict(raw_query) if isinstance(raw_query, dict) else {}
-        query[injection_param] = value
         joined = urllib.parse.urljoin(base_url.rstrip("/") + "/", path.lstrip("/"))
         encoded = urllib.parse.urlencode({str(k): str(v) for k, v in query.items()})
         return f"{joined}?{encoded}" if encoded else joined
+
+    def _build_url(self, base_url: str, request_spec: dict[str, Any], injection_param: str, value: str) -> str:
+        raw_query = request_spec.get("query")
+        query = dict(raw_query) if isinstance(raw_query, dict) else {}
+        query[injection_param] = value
+        return self._action_url(base_url, request_spec, query)
+
+    def _execute_payload(
+        self,
+        base_url: str,
+        request_spec: dict[str, Any],
+        injection_param: str,
+        value: str,
+        cookie_jar: dict[str, str] | None,
+    ) -> str:
+        """Deliver the payload the way the plan does, GET query or POST form.
+
+        For POST the payload has to travel in the request body, so the browser
+        submits a form rather than navigating to a URL; otherwise a POST-only
+        reflected sink is never reached and looks like a clean negative.
+        """
+        if self._method(request_spec) == "POST":
+            raw_body = request_spec.get("body")
+            body = dict(raw_body) if isinstance(raw_body, dict) else {}
+            body[injection_param] = value
+            raw_query = request_spec.get("query")
+            query = dict(raw_query) if isinstance(raw_query, dict) else {}
+            action = self._action_url(base_url, request_spec, query)
+            return self._post_navigate(base_url, action, {str(k): str(v) for k, v in body.items()}, cookie_jar)
+        return self._navigate(base_url, self._build_url(base_url, request_spec, injection_param, value), cookie_jar)
 
     def _add_cookies(self, context: Any, base_url: str, cookie_jar: dict[str, str] | None) -> None:
         if not cookie_jar:
@@ -209,6 +246,43 @@ class BrowserExecutionOracle:
         finally:
             context.close()
 
+    def _post_navigate(
+        self,
+        base_url: str,
+        action_url: str,
+        fields: dict[str, str],
+        cookie_jar: dict[str, str] | None,
+    ) -> str:
+        assert self._browser is not None
+        context = self._browser.new_context()
+        try:
+            self._add_cookies(context, base_url, cookie_jar)
+            page = context.new_page()
+            # Values are HTML-escaped for transport in the attribute; the browser
+            # decodes them back to the raw payload before POSTing, so the server
+            # receives exactly what the plan would send.
+            inputs = "".join(
+                f'<input type="hidden" name="{_attr(name)}" value="{_attr(value)}">'
+                for name, value in fields.items()
+            )
+            form = (
+                f'<form id="padv-xss-form" method="POST" action="{_attr(action_url)}">'
+                f"{inputs}</form><script>document.getElementById('padv-xss-form').submit()</script>"
+            )
+            try:
+                # set_content runs the inline script, which submits the form and
+                # navigates to the target with the payload in the body.
+                page.set_content(form, wait_until="domcontentloaded", timeout=15000)
+                page.wait_for_load_state("networkidle", timeout=15000)
+            except Exception:
+                pass
+            try:
+                return page.content()
+            except Exception:
+                return ""
+        finally:
+            context.close()
+
     def probe(
         self,
         *,
@@ -227,8 +301,7 @@ class BrowserExecutionOracle:
 
         for variant, template in PAYLOAD_VARIANTS.items():
             payload = template.format(cb=self._callback_url(token, variant))
-            url = self._build_url(base_url, request_spec, injection_param, payload)
-            content = self._navigate(base_url, url, cookie_jar)
+            content = self._execute_payload(base_url, request_spec, injection_param, payload, cookie_jar)
 
             hits = {h for h in self._server.hits() if token in h}
             if hits:
@@ -246,8 +319,7 @@ class BrowserExecutionOracle:
         # Negative control: a benign value must not trigger the callback. Uses a
         # fresh token so it cannot inherit a positive hit.
         control_token = self._next_token(candidate_uid)
-        control_url = self._build_url(base_url, request_spec, injection_param, _BENIGN_VALUE)
-        self._navigate(base_url, control_url, cookie_jar)
+        self._execute_payload(base_url, request_spec, injection_param, _BENIGN_VALUE, cookie_jar)
         result.negative_control_clean = not any(control_token in h for h in self._server.hits())
 
         if not result.executed:

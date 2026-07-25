@@ -28,14 +28,10 @@ class _AppHandler(BaseHTTPRequestHandler):
     def log_message(self, *args) -> None:  # noqa: D401 - silence test server
         pass
 
-    def do_GET(self) -> None:  # noqa: N802
-        parsed = urlparse(self.path)
-        params = parse_qs(parsed.query)
-        value = params.get("q", [""])[0]
-
-        if parsed.path == "/reflect":
+    def _respond(self, parsed, value: str) -> None:
+        if parsed.path in ("/reflect", "/reflect-post"):
             body = f"<html><body><div>Results for {value}</div></body></html>"
-        elif parsed.path == "/escape":
+        elif parsed.path in ("/escape", "/escape-post"):
             body = f"<html><body><div>Results for {html.escape(value)}</div></body></html>"
         else:
             self.send_response(404)
@@ -48,6 +44,18 @@ class _AppHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(encoded)))
         self.end_headers()
         self.wfile.write(encoded)
+
+    def do_GET(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        value = parse_qs(parsed.query).get("q", [""])[0]
+        self._respond(parsed, value)
+
+    def do_POST(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        raw = self.rfile.read(length).decode("utf-8") if length else ""
+        value = parse_qs(raw).get("q", [""])[0]
+        self._respond(parsed, value)
 
 
 @pytest.fixture(scope="module")
@@ -83,6 +91,16 @@ def _probe(oracle: BrowserExecutionOracle, app_server: str, path: str):
     )
 
 
+def _probe_post(oracle: BrowserExecutionOracle, app_server: str, path: str):
+    return oracle.probe(
+        base_url=app_server,
+        request_spec={"path": path, "method": "POST", "body": {"q": "<PAYLOAD>"}},
+        injection_param="q",
+        candidate_uid="cand-xss-post",
+        cookie_jar={},
+    )
+
+
 def test_reflecting_endpoint_confirms_execution(oracle, app_server) -> None:
     result = _probe(oracle, app_server, "/reflect")
     assert result.executed is True
@@ -110,3 +128,17 @@ def test_dom_inspection_is_secondary_signal(oracle, app_server) -> None:
     result = _probe(oracle, app_server, "/reflect")
     # DOM position corroborates but the decisive signal is the callback.
     assert result.dom_execution_context in {"script_text", "event_handler", None}
+
+
+def test_post_reflecting_endpoint_confirms_execution(oracle, app_server) -> None:
+    """POST-body reflection must execute just like a GET query reflection."""
+    result = _probe_post(oracle, app_server, "/reflect-post")
+    assert result.executed is True
+    assert "xss_execution_witness" in result.positive_flags
+    assert any(result.callback_token in hit for hit in result.callback_hits)
+
+
+def test_post_escaping_endpoint_does_not_confirm_execution(oracle, app_server) -> None:
+    result = _probe_post(oracle, app_server, "/escape-post")
+    assert result.executed is False
+    assert "xss_execution_witness" not in result.positive_flags

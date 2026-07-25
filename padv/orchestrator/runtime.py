@@ -822,16 +822,25 @@ def _browser_oracle_for(
 
 
 def _xss_injection_param(plan: ValidationPlan) -> str:
-    """The query key the canary is placed into for the positive requests."""
+    """The parameter the canary is placed into for the positive requests.
+
+    Looks in both the query and the POST body so a POST-only reflected sink is
+    still probed; the canary-bearing key wins over an arbitrary first key.
+    """
+    fallback = ""
     for spec in _plan_steps(plan):
-        query = spec.get("query") if isinstance(spec, dict) else None
-        if isinstance(query, dict):
-            for key, value in query.items():
+        if not isinstance(spec, dict):
+            continue
+        for container_key in ("query", "body"):
+            container = spec.get(container_key)
+            if not isinstance(container, dict):
+                continue
+            for key, value in container.items():
                 if plan.canary and plan.canary in str(value):
                     return str(key)
-            for key in query:
-                return str(key)
-    return ""
+                if not fallback:
+                    fallback = str(key)
+    return fallback
 
 
 def _apply_xss_execution_oracle(

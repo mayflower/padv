@@ -83,6 +83,20 @@ def test_injection_param_is_the_key_carrying_the_canary() -> None:
     assert rt._xss_injection_param(_plan()) == "target_host"
 
 
+def test_injection_param_found_in_post_body() -> None:
+    plan = ValidationPlan(
+        candidate_id="cand-xss",
+        intercepts=["echo"],
+        positive_requests=[
+            {"path": "/index.php", "method": "POST", "query": {"page": "add-to-your-blog.php"}, "body": {"blog_entry": "padv-canary"}}
+        ],
+        negative_requests=[],
+        canary="padv-canary",
+        canonical_class="xss_output_boundary",
+    )
+    assert rt._xss_injection_param(plan) == "blog_entry"
+
+
 def test_missing_oracle_marks_requires_browser() -> None:
     target = _Target(_xss_candidate())
     runs = [_positive_run()]

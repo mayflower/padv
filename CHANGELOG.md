@@ -74,9 +74,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   `xss_execution_witness`, which only `padv.dynamic.browser.BrowserExecutionOracle`
   produces: it replays a fixed set of callback-bearing payloads (script tag,
   `img onerror`, `svg onload`) through real Chromium and treats a hit on a
-  run-specific local endpoint as proof of execution. DOM position via
-  `canary_execution_context` is recorded as a secondary signal, never the
-  decisive one. Enabled by `web.xss_execution_oracle`; when it cannot run, XSS
+  run-specific local endpoint as proof of execution. GET payloads are delivered
+  by URL navigation and POST payloads by an auto-submitting form, so a POST-only
+  reflected sink is reached rather than looking like a clean negative. DOM
+  position via `canary_execution_context` is recorded as a secondary signal,
+  never the decisive one. Enabled by `web.xss_execution_oracle`; when it cannot run, XSS
   candidates are `SKIPPED_PRECONDITION` (`requires_browser`) rather than
   validated on reflection — reflection is not execution. `GatePreconditions`
   gains `requires_browser`; `WebConfig` gains `xss_execution_oracle` and
