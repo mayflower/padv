@@ -1,0 +1,155 @@
+{
+  "benchmark_case_uid": "mut-sqli-user-info-getuseraccount",
+  "verified_at": "2026-07-25",
+  "verification_method": "read from the pinned checkout at targets/mutillidae; no value in this file was inferred or guessed",
+
+  "target": {
+    "repository": "https://github.com/webpwnized/mutillidae.git",
+    "target_commit": "84f2c00d9141dbb9e26a448c8288e651e0b5bb04",
+    "target_version": "2.12.7",
+    "commit_date": "2026-06-22T19:27:39-04:00",
+    "pinning_status": "NOT PINNED IN TOOLING",
+    "pinning_note": "scripts/mutillidae_e2e.sh:214-215 clones --depth 1 and resets hard to the moving default branch, so this commit is what HEAD happened to be on 2026-07-25, not a pin the tooling enforces."
+  },
+
+  "vulnerability": {
+    "class": "sql_injection_boundary",
+    "description": "Unparameterised string concatenation of a request parameter into a SELECT executed via mysqli::query."
+  },
+
+  "source": {
+    "file_path": "src/user-info.php",
+    "line_range": [46, 51],
+    "lines": {
+      "46": "$lUsername = $_POST[\"username\"];",
+      "50": "$lUsername = $_REQUEST[\"username\"];"
+    },
+    "superglobal": "_REQUEST",
+    "parameter": "username",
+    "note": "Line 46 ($_POST) applies at security levels 2-5; line 50 ($_REQUEST) applies at levels 0-1 because $lProtectAgainstMethodTampering is false there."
+  },
+
+  "propagation": [
+    {
+      "file_path": "src/user-info.php",
+      "line": 169,
+      "code": "$lQueryResult = $SQLQueryHandler->getUserAccount($lUsername, $lPassword);"
+    },
+    {
+      "file_path": "src/classes/SQLQueryHandler.php",
+      "line_range": [386, 403],
+      "concatenation_lines": [397, 400],
+      "code": "$lQueryString = \"SELECT * FROM accounts WHERE username='\".$pUsername.\"' AND password='\".$pPassword.\"'\";",
+      "guard": {
+        "line_range": [392, 395],
+        "condition": "$this->stopSQLInjection",
+        "effect": "escapeDangerousCharacters on both parameters",
+        "active_at_security_level": "false at level 0"
+      }
+    },
+    {
+      "file_path": "src/classes/SQLQueryHandler.php",
+      "line": 402,
+      "code": "return $this->mMySQLHandler->executeQuery($lQueryString);"
+    },
+    {
+      "file_path": "src/classes/MySQLHandler.php",
+      "line_range": [326, 328],
+      "code": "public function executeQuery($pQueryString){ return $this->doExecuteQuery($pQueryString); }"
+    }
+  ],
+
+  "sink": {
+    "file_path": "src/classes/MySQLHandler.php",
+    "line": 229,
+    "code": "$lResult = $this->mMySQLConnection->query($pQueryString);",
+    "receiver_type": "mysqli",
+    "receiver_assigned_at": "src/classes/MySQLHandler.php:135",
+    "expected_function": "mysqli::query",
+    "expected_argument_index": 0,
+    "expected_argument_role": "query_string",
+    "note": "The sink is the mysqli METHOD, not the procedural mysqli_query. padv/static/joern/query_sets.py already lists 'mysqli::query', so the intercept list can express it."
+  },
+
+  "route": {
+    "path": "/index.php",
+    "method": "GET",
+    "query_parameters": {
+      "page": "user-info.php",
+      "username": "<canary>",
+      "password": "",
+      "user-info-php-submit-button": "View Account Details"
+    },
+    "method_note": "At security level 0 user-info.php sets $lFormMethod=GET and reads $_REQUEST, so GET carries the payload. Levels 2-5 force POST and $_POST.",
+    "direct_access_note": "src/user-info.php cannot be requested directly: it depends on $SQLQueryHandler, which only index.php constructs (index.php:190)."
+  },
+
+  "preconditions": [
+    {
+      "kind": "requires_auth",
+      "evidence": "src/index.php:481-485 lists user-info.php in $lPagesRequiringAuthentication and redirects to login.php with 302 when $_SESSION['user_is_logged_in'] is false.",
+      "satisfy_with": {
+        "route": "/index.php?page=login.php",
+        "method": "POST",
+        "parameters": {
+          "username": "jeremy",
+          "password": "password",
+          "login-php-submit-button": "Login"
+        },
+        "credential_source": "src/set-up-database.php:213 seeds this account"
+      }
+    },
+    {
+      "kind": "security_level",
+      "required_value": "0",
+      "evidence": "src/index.php:26-27 defaults $_SESSION['security-level'] to 0; at that level SQLQueryHandler::stopSQLInjection is false, so no escaping is applied."
+    },
+    {
+      "kind": "database_seeded",
+      "evidence": "The accounts table must exist; src/set-up-database.php:209-213 creates and seeds it."
+    }
+  ],
+
+  "morcilla_contract": {
+    "extension_commit": "9cc8ec9",
+    "extension_source": "/data/src/ml/morcilla",
+    "request_headers": {
+      "Morcilla-Key": "test-key",
+      "Morcilla-Intercept": "mysqli::query"
+    },
+    "intercept_matching": {
+      "key_format": "<lowercased class>::<lowercased function>, or <lowercased function> for free functions",
+      "evidence": "morcilla.c:213-238 morcilla_function_matches"
+    },
+    "response_headers_actually_emitted": ["X-Morcilla-Result"],
+    "response_payload_format": "base64 of a JSON array of {function, file, line, args[]}",
+    "argument_encoding": "strings are emitted with surrounding double quotes, so the canary appears inside args[0] as part of a quoted string",
+    "max_calls": 4096,
+    "max_arg_len": 256,
+    "arg_truncation_signal": "in-band: strings longer than 251 bytes get a trailing '...' inside args[]; there is no truncation header",
+    "expected_query_length_note": "The SELECT is roughly 70 characters plus the canary, so it stays well under the 256-byte argument limit."
+  },
+
+  "positive_control_contract": {
+    "description": "A run-specific canary placed in the username parameter must appear verbatim inside argument 0 of mysqli::query at MySQLHandler.php:229.",
+    "required": {
+      "function": "mysqli::query",
+      "file_suffix": "classes/MySQLHandler.php",
+      "line": 229,
+      "argument_index": 0,
+      "argument_contains_canary": true
+    },
+    "repetitions": 2,
+    "distinct_request_ids": true
+  },
+
+  "negative_control_contract": {
+    "description": "The identical flow with a benign username must produce the same call with no canary in argument 0.",
+    "required": {
+      "function": "mysqli::query",
+      "argument_index": 0,
+      "argument_contains_canary": false
+    },
+    "repetitions": 1
+  }
+}
