@@ -3,6 +3,8 @@ from __future__ import annotations
 import html
 import urllib.parse
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from time import monotonic
 from typing import Any
 
@@ -51,6 +53,7 @@ from padv.validation.contracts import (
     profile_for_vuln_class,
     witness_contract_for_vuln_class,
 )
+from padv.dynamic.browser import BrowserExecutionOracle, BrowserUnavailableError
 from padv.validation.html_context import canary_execution_context
 from padv.validation.preconditions import (
     GatePreconditions,
@@ -782,6 +785,102 @@ def _try_anonymous_probe(
         return None, 0
 
 
+@contextmanager
+def _browser_oracle_for(
+    config: PadvConfig, targets: list[_PreparedValidationTarget]
+) -> Iterator[BrowserExecutionOracle | None]:
+    """Launch the XSS execution oracle once per run, if enabled and needed.
+
+    Yields None when the oracle is disabled, when no candidate needs it, or when
+    the browser cannot be launched. In every None case XSS candidates are marked
+    requires_browser downstream, so the absence is reported rather than guessed.
+    """
+    web = getattr(config, "web", None)
+    enabled = bool(getattr(web, "xss_execution_oracle", False))
+    needs_browser = any(
+        canonicalize_vuln_class(t.candidate.canonical_class or t.candidate.vuln_class) == "xss_output_boundary"
+        for t in targets
+    )
+    if not (enabled and needs_browser):
+        yield None
+        return
+
+    try:
+        oracle = BrowserExecutionOracle(
+            callback_host=str(getattr(web, "callback_host", "127.0.0.1")),
+            headless=bool(getattr(web, "headless", True)),
+        )
+    except BrowserUnavailableError:
+        yield None
+        return
+
+    try:
+        with oracle as active:
+            yield active
+    except BrowserUnavailableError:
+        yield None
+
+
+def _xss_injection_param(plan: ValidationPlan) -> str:
+    """The query key the canary is placed into for the positive requests."""
+    for spec in _plan_steps(plan):
+        query = spec.get("query") if isinstance(spec, dict) else None
+        if isinstance(query, dict):
+            for key, value in query.items():
+                if plan.canary and plan.canary in str(value):
+                    return str(key)
+            for key in query:
+                return str(key)
+    return ""
+
+
+def _apply_xss_execution_oracle(
+    ctx: _ValidationContext,
+    target: _PreparedValidationTarget,
+    candidate: Candidate,
+    plan: ValidationPlan,
+    positive_runs: list[RuntimeEvidence],
+) -> None:
+    """Confirm XSS by real browser execution, or mark it unprovable.
+
+    XSS is the one runtime class whose witness needs a browser: reflection is not
+    execution. When the oracle is unavailable the candidate cannot be proven, so
+    it is marked requires_browser and the gate reports SKIPPED_PRECONDITION —
+    never REFUTED, since without a browser the experiment did not run.
+    """
+    if canonicalize_vuln_class(candidate.canonical_class or candidate.vuln_class) != "xss_output_boundary":
+        return
+
+    oracle = ctx.browser_oracle
+    if oracle is None:
+        target.preconditions.requires_browser = True
+        return
+
+    injection_param = _xss_injection_param(plan)
+    steps = _plan_steps(plan)
+    if not injection_param or not steps:
+        target.preconditions.requires_browser = True
+        return
+
+    try:
+        result = oracle.probe(
+            base_url=ctx.config.target.base_url,
+            request_spec=steps[0],
+            injection_param=injection_param,
+            candidate_uid=candidate.candidate_uid,
+            cookie_jar=ctx.cookie_jar,
+        )
+    except BrowserUnavailableError:
+        target.preconditions.requires_browser = True
+        return
+
+    if result.executed:
+        # Feed the browser-confirmed flags into every positive run so the shared
+        # witness builder (_flag_set) picks up xss_execution_witness.
+        for run in positive_runs:
+            run.analysis_flags = sorted(set(run.analysis_flags) | result.positive_flags)
+
+
 def _run_positive_phase(
     ctx: _ValidationContext, candidate: Candidate, plan: ValidationPlan,
     request_budget_remaining: int, candidate_deadline: float,
@@ -1158,6 +1257,7 @@ class _ValidationContext:
     artifact_refs: list[str]
     auth_contract: AuthBoundaryContract | None = None
     shared_session: HttpSession | None = None
+    browser_oracle: Any = None
 
 
 @dataclass(frozen=True)
@@ -1203,6 +1303,8 @@ def _validate_single_candidate_runtime(
         ctx, candidate, plan, effective_request_budget - total_cost, candidate_deadline, attempts, seen_flags, session,
     )
     total_cost += neg_cost
+
+    _apply_xss_execution_oracle(ctx, target, candidate, plan, positive_runs)
 
     differential_pairs, diff_cost = _run_differential_phase(
         ctx, candidate, plan, positive_runs, effective_request_budget - total_cost, candidate_deadline, attempts, seen_flags,
@@ -1358,33 +1460,35 @@ def validate_candidates_runtime(
         for candidate in candidates
     ]
 
-    for idx, target in enumerate(targets):
-        if monotonic() >= run_deadline:
-            _append_skipped_targets(
-                ctx,
-                targets[idx:],
-                decisions=decisions,
-                bundles=bundles,
-                decision="SKIPPED_BUDGET",
-                reason="run deadline exhausted before candidate execution",
+    with _browser_oracle_for(config, targets) as browser_oracle:
+        ctx.browser_oracle = browser_oracle
+        for idx, target in enumerate(targets):
+            if monotonic() >= run_deadline:
+                _append_skipped_targets(
+                    ctx,
+                    targets[idx:],
+                    decisions=decisions,
+                    bundles=bundles,
+                    decision="SKIPPED_BUDGET",
+                    reason="run deadline exhausted before candidate execution",
+                )
+                break
+            if request_budget_remaining <= 0:
+                _append_skipped_targets(
+                    ctx,
+                    targets[idx:],
+                    decisions=decisions,
+                    bundles=bundles,
+                    decision="SKIPPED_BUDGET",
+                    reason="request budget exhausted before candidate execution",
+                )
+                break
+            bundle, cost = _process_candidate(
+                ctx, target,
+                request_budget_remaining, run_deadline,
             )
-            break
-        if request_budget_remaining <= 0:
-            _append_skipped_targets(
-                ctx,
-                targets[idx:],
-                decisions=decisions,
-                bundles=bundles,
-                decision="SKIPPED_BUDGET",
-                reason="request budget exhausted before candidate execution",
-            )
-            break
-        bundle, cost = _process_candidate(
-            ctx, target,
-            request_budget_remaining, run_deadline,
-        )
-        request_budget_remaining -= cost
-        decisions[bundle.gate_result.decision] = decisions.get(bundle.gate_result.decision, 0) + 1
-        bundles.append(bundle)
+            request_budget_remaining -= cost
+            decisions[bundle.gate_result.decision] = decisions.get(bundle.gate_result.decision, 0) + 1
+            bundles.append(bundle)
 
     return bundles, decisions

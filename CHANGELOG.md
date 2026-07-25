@@ -70,6 +70,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
   never counts as coverage.
 
 ### Added
+- **Browser execution oracle for XSS.** `xss_output_boundary` now requires
+  `xss_execution_witness`, which only `padv.dynamic.browser.BrowserExecutionOracle`
+  produces: it replays a fixed set of callback-bearing payloads (script tag,
+  `img onerror`, `svg onload`) through real Chromium and treats a hit on a
+  run-specific local endpoint as proof of execution. DOM position via
+  `canary_execution_context` is recorded as a secondary signal, never the
+  decisive one. Enabled by `web.xss_execution_oracle`; when it cannot run, XSS
+  candidates are `SKIPPED_PRECONDITION` (`requires_browser`) rather than
+  validated on reflection — reflection is not execution. `GatePreconditions`
+  gains `requires_browser`; `WebConfig` gains `xss_execution_oracle` and
+  `callback_host`.
+- **Corrected benchmark ground truth.** `mut-002` (XSS) pointed at `index.php`,
+  the router, which reflects no input; it now points at `dns-lookup.php`
+  (`target_host` reflected at line 151). Verified sinks filled in for
+  `mut-001` (`mysqli::query`), `mut-002` (`echo`) and `mut-003` (`shell_exec`).
+  `route` is left empty on purpose: web discovery normalizes away the `?page=`
+  query, so every Mutillidae route collapses to `index.php` and cannot match an
+  instance.
 - `padv.eval.metrics`: instance-level `confusion_from_matches`,
   `precision_recall_f1`, and `macro_recall`, plus `summarize_outcomes` over the
   new vocabulary. Phase B of the Mutillidae assessment now emits a `metrics`

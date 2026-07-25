@@ -88,6 +88,10 @@ headless = true
 max_pages = 24
 max_actions = 96
 request_timeout_seconds = 15
+# XSS is only validated by real browser execution: a run-specific callback must
+# fire. callback_host is how the containerized target reaches the scanner host.
+xss_execution_oracle = true
+callback_host = "host.docker.internal"
 
 [differential]
 enabled = true

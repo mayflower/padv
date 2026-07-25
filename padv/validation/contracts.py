@@ -61,7 +61,10 @@ _WITNESS_CONTRACT_OVERRIDES: dict[str, dict[str, object]] = {
     "xpath_injection_boundary": {"required_all": ["xpath_sink_oracle_witness"], "required_any": []},
     "file_boundary_influence": {"required_all": ["file_sink_oracle_witness"], "required_any": []},
     "file_upload_influence": {"required_all": ["upload_sink_oracle_witness"], "required_any": []},
-    "xss_output_boundary": {"required_all": ["xss_dom_witness"], "required_any": []},
+    # Execution, not reflection: only the browser oracle's run-specific callback
+    # sets xss_execution_witness. xss_dom_witness (canary in an executable DOM
+    # position) is supportive but no longer sufficient on its own.
+    "xss_output_boundary": {"required_all": ["xss_execution_witness"], "required_any": []},
     "debug_output_leak": {"required_all": [], "required_any": ["diagnostic_debug_leak", "diagnostic_verbose_error_leak", "diagnostic_phpinfo_marker"]},
     "information_disclosure": {"required_all": [], "required_any": ["info_disclosure_header", "diagnostic_verbose_error_leak", "diagnostic_phpinfo_marker"]},
     "outbound_request_influence": {"required_all": ["ssrf_sink_oracle_witness", "ssrf_url_arg_witness"], "required_any": []},

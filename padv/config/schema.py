@@ -132,6 +132,14 @@ class WebConfig:
     max_pages: int
     max_actions: int
     request_timeout_seconds: int
+    # XSS execution oracle: replays callback-bearing payloads in a real browser
+    # and requires the run-specific callback to fire. Off by default so existing
+    # configs are unaffected; when on and the browser cannot start, XSS
+    # candidates are SKIPPED_PRECONDITION rather than validated on weaker signals.
+    xss_execution_oracle: bool = False
+    # Host the injected payload calls back to, as reachable from inside the
+    # target (e.g. host.docker.internal when the app runs in a container).
+    callback_host: str = "127.0.0.1"
 
 
 @dataclass(slots=True)
@@ -181,6 +189,13 @@ def _get_int(section: dict[str, Any], key: str, min_value: int = 0) -> int:
 
 def _get_bool(section: dict[str, Any], key: str) -> bool:
     value = section.get(key)
+    if not isinstance(value, bool):
+        raise ConfigError(f"missing or invalid bool: {key}")
+    return value
+
+
+def _get_optional_bool(section: dict[str, Any], key: str, default: bool) -> bool:
+    value = section.get(key, default)
     if not isinstance(value, bool):
         raise ConfigError(f"missing or invalid bool: {key}")
     return value
@@ -362,7 +377,16 @@ def load_config(path: str | Path) -> PadvConfig:
     _reject_unknown_keys(
         "web",
         web,
-        {"enabled", "use_browser_use", "headless", "max_pages", "max_actions", "request_timeout_seconds"},
+        {
+            "enabled",
+            "use_browser_use",
+            "headless",
+            "max_pages",
+            "max_actions",
+            "request_timeout_seconds",
+            "xss_execution_oracle",
+            "callback_host",
+        },
     )
     _reject_unknown_keys("differential", differential, {"enabled", "auth_levels", "body_length_tolerance"})
 
@@ -506,6 +530,8 @@ def load_config(path: str | Path) -> PadvConfig:
             max_pages=_get_int(web, "max_pages", min_value=1),
             max_actions=_get_int(web, "max_actions", min_value=1),
             request_timeout_seconds=_get_int(web, "request_timeout_seconds", min_value=1),
+            xss_execution_oracle=_get_optional_bool(web, "xss_execution_oracle", False),
+            callback_host=_get_optional_str(web, "callback_host", "127.0.0.1"),
         ),
         differential=DifferentialConfig(
             enabled=_get_bool(differential, "enabled"),

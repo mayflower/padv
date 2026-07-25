@@ -30,6 +30,7 @@ class GatePreconditions:
     requires_csrf_token: bool = False
     requires_upload: bool = False
     requires_seed: bool = False
+    requires_browser: bool = False
     requires_specific_header: list[str] = field(default_factory=list)
     unknown_blockers: list[str] = field(default_factory=list)
 
@@ -45,6 +46,7 @@ class GatePreconditions:
                 self.requires_csrf_token,
                 self.requires_upload,
                 self.requires_seed,
+                self.requires_browser,
                 bool(self.requires_specific_header),
                 bool(self.unknown_blockers),
             ]
@@ -65,6 +67,8 @@ class GatePreconditions:
             parts.append("requires_upload")
         if self.requires_seed:
             parts.append("requires_seed")
+        if self.requires_browser:
+            parts.append("requires_browser")
         if self.requires_specific_header:
             parts.append(f"requires_specific_header={','.join(self.requires_specific_header)}")
         if self.unknown_blockers:
@@ -80,6 +84,7 @@ class GatePreconditions:
             "requires_csrf_token": self.requires_csrf_token,
             "requires_upload": self.requires_upload,
             "requires_seed": self.requires_seed,
+            "requires_browser": self.requires_browser,
             "requires_specific_header": list(self.requires_specific_header),
             "unknown_blockers": list(self.unknown_blockers),
         }
@@ -129,6 +134,7 @@ def coerce_gate_preconditions(
             requires_csrf_token=bool(value.requires_csrf_token),
             requires_upload=bool(value.requires_upload),
             requires_seed=bool(value.requires_seed),
+            requires_browser=bool(value.requires_browser),
             requires_specific_header=list(value.requires_specific_header),
             unknown_blockers=list(value.unknown_blockers),
         )
@@ -141,6 +147,7 @@ def coerce_gate_preconditions(
             requires_csrf_token=_mapping_bool(value, key="requires_csrf_token", aliases=("requires_csrf",)),
             requires_upload=_mapping_bool(value, key="requires_upload"),
             requires_seed=_mapping_bool(value, key="requires_seed"),
+            requires_browser=_mapping_bool(value, key="requires_browser"),
             requires_specific_header=_mapping_string_list(
                 value,
                 key="requires_specific_header",
@@ -164,6 +171,7 @@ def merge_gate_preconditions(
         merged.requires_csrf_token = merged.requires_csrf_token or item.requires_csrf_token
         merged.requires_upload = merged.requires_upload or item.requires_upload
         merged.requires_seed = merged.requires_seed or item.requires_seed
+        merged.requires_browser = merged.requires_browser or item.requires_browser
         merged.requires_specific_header = _normalized_strings(
             [*merged.requires_specific_header, *item.requires_specific_header]
         )

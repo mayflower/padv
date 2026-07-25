@@ -89,6 +89,11 @@ headless = true
 max_pages = 8
 max_actions = 30
 request_timeout_seconds = 15
+# When true, XSS candidates are only VALIDATED if a payload actually executes in
+# a real browser and calls back to callback_host; without a usable browser they
+# are SKIPPED_PRECONDITION rather than validated on reflection alone. Default off.
+xss_execution_oracle = false
+callback_host = "127.0.0.1"
 
 [differential]
 enabled = true

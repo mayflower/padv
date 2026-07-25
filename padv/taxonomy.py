@@ -85,6 +85,8 @@ KNOWN_WITNESS_FLAGS: frozenset[str] = frozenset(
         "body_canary",
         "xss_raw_canary",
         "xss_dom_witness",
+        # browser-confirmed XSS execution (run-specific callback fired)
+        "xss_execution_witness",
         # authz, session and auth invariants
         "auth_bypass",
         "authz_bypass_status",

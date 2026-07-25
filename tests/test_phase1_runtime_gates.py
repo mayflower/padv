@@ -37,7 +37,28 @@ def _static() -> list[StaticEvidence]:
     ]
 
 
-def test_gate_xss_runtime_signal_validates() -> None:
+def test_gate_xss_validates_on_browser_execution_witness() -> None:
+    config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
+    result = evaluate_candidate(
+        config=config,
+        static_evidence=_static(),
+        positive_runs=[
+            _runtime_with_flags("p1", "xss_execution_witness", "xss_dom_witness"),
+            _runtime_with_flags("p2", "xss_execution_witness", "xss_dom_witness"),
+            _runtime_with_flags("p3", "xss_execution_witness", "xss_dom_witness"),
+        ],
+        negative_runs=[_runtime_with_flags("n1")],
+        intercepts=[],
+        canary="padv-canary",
+        preconditions=GatePreconditions(),
+        evidence_signals=["source", "web"],
+        vuln_class="xss_output_boundary",
+    )
+    assert result.decision == "VALIDATED"
+
+
+def test_gate_xss_dom_position_without_execution_is_refuted() -> None:
+    """DOM position is not execution: the browser callback never fired."""
     config = load_config(Path(__file__).resolve().parents[1] / "padv.toml")
     result = evaluate_candidate(
         config=config,
@@ -54,7 +75,8 @@ def test_gate_xss_runtime_signal_validates() -> None:
         evidence_signals=["source", "web"],
         vuln_class="xss_output_boundary",
     )
-    assert result.decision == "VALIDATED"
+    assert result.decision == "REFUTED"
+    assert result.failed_gate == "V3"
 
 
 def test_gate_xss_negative_control_fails_when_signal_repeats() -> None:
@@ -63,11 +85,11 @@ def test_gate_xss_negative_control_fails_when_signal_repeats() -> None:
         config=config,
         static_evidence=_static(),
         positive_runs=[
-            _runtime_with_flags("p1", "xss_dom_witness"),
-            _runtime_with_flags("p2", "xss_dom_witness"),
-            _runtime_with_flags("p3", "xss_dom_witness"),
+            _runtime_with_flags("p1", "xss_execution_witness"),
+            _runtime_with_flags("p2", "xss_execution_witness"),
+            _runtime_with_flags("p3", "xss_execution_witness"),
         ],
-        negative_runs=[_runtime_with_flags("n1", "xss_dom_witness")],
+        negative_runs=[_runtime_with_flags("n1", "xss_execution_witness")],
         intercepts=[],
         canary="padv-canary",
         preconditions=GatePreconditions(),

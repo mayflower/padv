@@ -19,7 +19,7 @@
       {
         "instance_id": "mut-001-i01",
         "file": "targets/mutillidae/src/user-poll.php",
-        "sink": "",
+        "sink": "mysqli::query",
         "route": "",
         "expected_outcome": "VALIDATED"
       }
@@ -31,7 +31,7 @@
     "category": "cross_site_scripting",
     "documented_source": [
       "targets/mutillidae/src/set-up-database.php",
-      "targets/mutillidae/src/index.php"
+      "targets/mutillidae/src/dns-lookup.php"
     ],
     "expected_channels": [
       "source",
@@ -45,8 +45,8 @@
     "instances": [
       {
         "instance_id": "mut-002-i01",
-        "file": "targets/mutillidae/src/index.php",
-        "sink": "",
+        "file": "targets/mutillidae/src/dns-lookup.php",
+        "sink": "echo",
         "route": "",
         "expected_outcome": "VALIDATED"
       }
@@ -73,14 +73,7 @@
       {
         "instance_id": "mut-003-i01",
         "file": "targets/mutillidae/src/dns-lookup.php",
-        "sink": "",
-        "route": "",
-        "expected_outcome": "VALIDATED"
-      },
-      {
-        "instance_id": "mut-003-i02",
-        "file": "targets/mutillidae/src/echo.php",
-        "sink": "",
+        "sink": "shell_exec",
         "route": "",
         "expected_outcome": "VALIDATED"
       }
