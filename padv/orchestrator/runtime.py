@@ -51,6 +51,7 @@ from padv.validation.contracts import (
     profile_for_vuln_class,
     witness_contract_for_vuln_class,
 )
+from padv.validation.html_context import canary_execution_context
 from padv.validation.preconditions import (
     GatePreconditions,
     ensure_no_legacy_preconditions,
@@ -505,9 +506,13 @@ def _derive_body_canary_flags(body: str, canary: str) -> tuple[set[str], bool]:
         flags.add("body_canary")
     if has_raw_canary and not has_escaped_canary:
         flags.add("xss_raw_canary")
-        body_lower = body.casefold()
-        if "<script" in body_lower or "onerror=" in body_lower or "onload=" in body_lower:
+        # Where the canary landed, decided by parsing the document. Testing the
+        # body for "<script" would be true for any page that loads a script,
+        # which turns every reflection into a witness.
+        context = canary_execution_context(body, canary)
+        if context is not None:
             flags.add("xss_dom_witness")
+            flags.add(f"xss_context_{context}")
     return flags, has_raw_canary
 
 
