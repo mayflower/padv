@@ -26,6 +26,7 @@ from padv.models import (
 )
 from padv.orchestrator.graphs import analyze_with_graph, run_with_graph
 from padv.store.evidence_store import EvidenceStore
+from support import refuted_gate_result
 
 
 def _mk_candidate(candidate_id: str, provenance: list[str]) -> Candidate:
@@ -419,7 +420,7 @@ def test_run_with_graph_uses_agentic_validation_nodes(monkeypatch: pytest.Monkey
             positive_runtime=[RuntimeEvidence("r1", "ok", 1, False, False, False, None, [], {})],
             negative_runtime=[RuntimeEvidence("r2", "ok", 0, False, False, False, None, [], {})],
             repro_run_ids=["r1"],
-            gate_result=GateResult("REFUTED", ["V0"], "V3", "missing"),
+            gate_result=refuted_gate_result("missing"),
             limitations=["missing"],
         )
         return [bundle], {"VALIDATED": 0, "REFUTED": 1, "NEEDS_HUMAN_SETUP": 0}
@@ -743,7 +744,7 @@ def test_run_with_graph_stops_on_stagnation_without_root_continue(
             positive_runtime=[RuntimeEvidence("r1", "ok", 1, False, False, False, None, [], {})],
             negative_runtime=[RuntimeEvidence("r2", "ok", 0, False, False, False, None, [], {})],
             repro_run_ids=["r1"],
-            gate_result=GateResult("REFUTED", ["V0"], "V3", "missing"),
+            gate_result=refuted_gate_result("missing"),
             limitations=["missing"],
             planner_trace={
                 "attempts": [
@@ -1831,7 +1832,7 @@ def test_run_with_graph_persists_attempt_history_across_iterations(
             positive_runtime=[RuntimeEvidence("r1", "ok", 1, False, False, False, None, [], {})],
             negative_runtime=[RuntimeEvidence("r2", "ok", 0, False, False, False, None, [], {})],
             repro_run_ids=["r1"],
-            gate_result=GateResult("REFUTED", ["V0"], "V3", "missing"),
+            gate_result=refuted_gate_result("missing"),
             limitations=["missing"],
             planner_trace={
                 "attempts": [
@@ -1934,7 +1935,7 @@ def test_agent_workspace_artifact_is_persisted(monkeypatch: pytest.MonkeyPatch, 
             positive_runtime=[RuntimeEvidence("r1", "ok", 1, False, False, False, None, [], {})],
             negative_runtime=[RuntimeEvidence("r2", "ok", 0, False, False, False, None, [], {})],
             repro_run_ids=["r1"],
-            gate_result=GateResult("REFUTED", ["V0"], "V3", "missing"),
+            gate_result=refuted_gate_result("missing"),
             limitations=["missing"],
         )
         return [bundle], {"VALIDATED": 0, "REFUTED": 1, "NEEDS_HUMAN_SETUP": 0}
@@ -1982,7 +1983,7 @@ def test_agent_runtime_shared_context_tracks_hypotheses_refutations_and_experime
             positive_runtime=[RuntimeEvidence("r1", "ok", 1, False, False, False, None, [], {})],
             negative_runtime=[RuntimeEvidence("r2", "ok", 0, False, False, False, None, [], {})],
             repro_run_ids=["r1"],
-            gate_result=GateResult("REFUTED", ["V0"], "V3", "missing"),
+            gate_result=refuted_gate_result("missing"),
             limitations=["missing"],
         )
         return [bundle], {"VALIDATED": 0, "REFUTED": 1, "NEEDS_HUMAN_SETUP": 0}
@@ -2622,7 +2623,7 @@ def test_runtime_execute_filters_resumed_candidates_to_planned_subset(
                 positive_runtime=[],
                 negative_runtime=[],
                 repro_run_ids=[],
-                gate_result=GateResult("REFUTED", ["V0"], "V3", "test"),
+                gate_result=refuted_gate_result("test"),
                 limitations=[],
             )],
             {"VALIDATED": 0, "REFUTED": 1, "NEEDS_HUMAN_SETUP": 0},
@@ -2729,7 +2730,7 @@ def test_runtime_execute_retains_static_evidence_matched_by_evidence_refs(
                 positive_runtime=[],
                 negative_runtime=[],
                 repro_run_ids=[],
-                gate_result=GateResult("REFUTED", ["V0"], "V3", "test"),
+                gate_result=refuted_gate_result("test"),
                 limitations=[],
             )],
             {"VALIDATED": 0, "REFUTED": 1, "NEEDS_HUMAN_SETUP": 0},
@@ -2789,7 +2790,7 @@ def test_runtime_execute_recovers_candidates_from_selected_pool(
                 positive_runtime=[],
                 negative_runtime=[],
                 repro_run_ids=[],
-                gate_result=GateResult("REFUTED", ["V0"], "V3", "test"),
+                gate_result=refuted_gate_result("test"),
                 limitations=[],
             )],
             {"VALIDATED": 0, "REFUTED": 1, "NEEDS_HUMAN_SETUP": 0},
@@ -3347,7 +3348,7 @@ def test_validate_with_graph_bypasses_langgraph_objective_and_research_path(
                     positive_runtime=[],
                     negative_runtime=[],
                     repro_run_ids=[],
-                    gate_result=GateResult("REFUTED", ["V0"], "V3", "test"),
+                    gate_result=refuted_gate_result("test"),
                     limitations=["test"],
                 )
             ],

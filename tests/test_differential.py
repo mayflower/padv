@@ -12,6 +12,7 @@ from padv.orchestrator.differential import build_unprivileged_request, compare_r
 from padv.orchestrator.runtime import validate_candidates_runtime
 from padv.store.evidence_store import EvidenceStore
 from padv.validation.preconditions import GatePreconditions
+from support import refuted_gate_result
 
 
 def _runtime(request_id: str, *, http_status: int = 200, call_count: int = 3, body: str = "ok") -> RuntimeEvidence:
@@ -236,7 +237,7 @@ def test_differential_request_consumes_existing_budget(monkeypatch: pytest.Monke
     def _fake_gate(**kwargs):
         pairs = kwargs.get("differential_pairs") or []
         seen_pairs.extend(pairs)
-        return GateResult("REFUTED", ["V0"], "V3", "test")
+        return refuted_gate_result("test")
 
     monkeypatch.setattr("padv.orchestrator.runtime.send_request", _fake_send_request)
     monkeypatch.setattr("padv.orchestrator.runtime.parse_response_headers", _fake_parse)
@@ -293,7 +294,7 @@ def test_runtime_differential_uses_configured_auth_levels(monkeypatch: pytest.Mo
     def _fake_gate(**kwargs):
         pairs = kwargs.get("differential_pairs") or []
         seen_pairs.extend(pairs)
-        return GateResult("REFUTED", ["V0"], "V3", "test")
+        return refuted_gate_result("test")
 
     monkeypatch.setattr("padv.orchestrator.runtime.send_request", _fake_send_request)
     monkeypatch.setattr("padv.orchestrator.runtime.parse_response_headers", _fake_parse)

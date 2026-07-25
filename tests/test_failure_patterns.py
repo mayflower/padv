@@ -7,6 +7,7 @@ import pytest
 from padv.analytics.failure_patterns import analyze_failures, failure_penalty, format_analysis_table
 from padv.models import Candidate, EvidenceBundle, FailurePattern, GateResult, RuntimeEvidence, StaticEvidence
 from padv.store.evidence_store import EvidenceStore
+from support import refuted_gate_result
 
 
 def _runtime(request_id: str) -> RuntimeEvidence:
@@ -67,7 +68,11 @@ def _save_bundle(
         positive_runtime=[_runtime(f"{bundle_id}-p")],
         negative_runtime=[_runtime(f"{bundle_id}-n")],
         repro_run_ids=[f"{bundle_id}-p"],
-        gate_result=GateResult(decision, ["V0"], failed_gate, reason),
+        gate_result=(
+            refuted_gate_result(reason, vuln_class=candidate.vuln_class, failed_gate=failed_gate or "V3")
+            if decision == "REFUTED"
+            else GateResult(decision, ["V0"], failed_gate, reason)
+        ),
         limitations=[reason],
     )
     store.save_bundle(bundle)

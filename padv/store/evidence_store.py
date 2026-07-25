@@ -7,9 +7,46 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from padv.models import Candidate, EvidenceBundle, RunSummary, StaticEvidence
+from padv.models import (
+    STORE_SCHEMA_VERSION,
+    Candidate,
+    EvidenceBundle,
+    RunSummary,
+    StaticEvidence,
+    explicit_candidate_outcome_for_decision,
+)
 
 _JSON_GLOB = "*.json"
+
+# Gate decisions retired in schema version 2. Neither proved absence, so both
+# degrade to INCONCLUSIVE; upgrading one of them to REFUTED would invent a
+# refutation that the recorded evidence never established.
+_RETIRED_DECISIONS = {"DROPPED": "INCONCLUSIVE", "INSUFFICIENT_EVIDENCE": "INCONCLUSIVE"}
+
+
+def migrate_bundle_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Bring a persisted bundle up to STORE_SCHEMA_VERSION on read.
+
+    Migration is read-only and conservative: it never turns an old record into a
+    stronger claim than it already was.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    if int(payload.get("schema_version", 0) or 0) >= STORE_SCHEMA_VERSION:
+        return payload
+
+    gate_result = payload.get("gate_result")
+    if isinstance(gate_result, dict):
+        decision = str(gate_result.get("decision", "")).strip()
+        replacement = _RETIRED_DECISIONS.get(decision)
+        if replacement:
+            gate_result["decision"] = replacement
+        payload["candidate_outcome"] = explicit_candidate_outcome_for_decision(
+            str(gate_result.get("decision", ""))
+        )
+
+    payload["schema_version"] = STORE_SCHEMA_VERSION
+    return payload
 
 
 class CorruptStoreArtifactError(RuntimeError):
@@ -260,9 +297,7 @@ class EvidenceStore:
             return None
         payload = self._load_json(path, artifact_kind="bundle", raise_on_corrupt=True)
         if isinstance(payload, dict):
-            return payload
-        if payload is None:
-            return None
+            return migrate_bundle_payload(payload)
         return None
 
     def load_bundle_legacy_lookup(self, bundle_id: str) -> dict[str, Any] | None:
@@ -273,7 +308,7 @@ class EvidenceStore:
             raise AmbiguousLegacyBundleLookupError(bundle_id, paths)
         payload = self._load_json(paths[0], artifact_kind="bundle", raise_on_corrupt=True)
         if isinstance(payload, dict):
-            return payload
+            return migrate_bundle_payload(payload)
         return None
 
     def list_bundle_ids(self, *, run_id: str | None = None) -> list[str]:
@@ -292,7 +327,7 @@ class EvidenceStore:
         for path in self._bundle_paths_legacy_lookup():
             payload = self._load_json(path, artifact_kind="bundle", raise_on_corrupt=True)
             if isinstance(payload, dict):
-                bundles.append(payload)
+                bundles.append(migrate_bundle_payload(payload))
         return bundles
 
     def save_run_summary(self, summary: RunSummary) -> Path:

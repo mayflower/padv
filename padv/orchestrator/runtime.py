@@ -977,13 +977,24 @@ def _collect_evidence_signals(candidate_static: list[StaticEvidence], candidate:
 
 
 def _build_analysis_only_bundle(
+    *, config: PadvConfig,
     run_id: str, candidate: Candidate, candidate_static: list[StaticEvidence],
     evidence_signals: list[str], artifact_refs: list[str], discovery_trace: dict[str, Any],
     auth_state: dict[str, Any], profile: Any,
 ) -> EvidenceBundle:
-    gate_result = GateResult(
-        "CONFIRMED_ANALYSIS_FINDING", ["A0"], None,
-        "analysis-only candidate confirmed by static and research evidence",
+    # Routed through the gate engine rather than asserted here: this path used
+    # to confirm every non-runtime-validatable candidate unconditionally, which
+    # made the A-gates unreachable in production.
+    gate_result = evaluate_candidate(
+        config=config,
+        static_evidence=candidate_static,
+        positive_runs=[],
+        negative_runs=[],
+        intercepts=[],
+        canary="",
+        preconditions=candidate.gate_preconditions,
+        evidence_signals=evidence_signals,
+        candidate=candidate,
     )
     return EvidenceBundle(
         bundle_id=f"bundle-{run_id}-{candidate.candidate_id}",
@@ -1279,8 +1290,15 @@ def _process_candidate(
 
     if not is_runtime_validatable(candidate):
         bundle = _build_analysis_only_bundle(
-            ctx.run_id, candidate, target.static_evidence, target.evidence_signals,
-            ctx.artifact_refs, ctx.discovery_trace, ctx.auth_state, target.profile,
+            config=ctx.config,
+            run_id=ctx.run_id,
+            candidate=candidate,
+            candidate_static=target.static_evidence,
+            evidence_signals=target.evidence_signals,
+            artifact_refs=ctx.artifact_refs,
+            discovery_trace=ctx.discovery_trace,
+            auth_state=ctx.auth_state,
+            profile=target.profile,
         )
         ctx.store.save_bundle(bundle, run_id=ctx.run_id)
         return bundle, 0

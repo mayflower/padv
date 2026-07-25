@@ -28,6 +28,7 @@ from padv.models import (
 from padv.orchestrator.runtime import _normalize_gate_preconditions, _oracle_evidence, validate_candidates_runtime
 from padv.store.evidence_store import EvidenceStore
 from padv.validation.preconditions import GatePreconditions, InvalidGatePreconditionsError
+from support import refuted_gate_result
 
 
 @contextmanager
@@ -207,7 +208,7 @@ def test_validate_runtime_executes_structured_steps_not_legacy_request_arrays(
     )
     monkeypatch.setattr(
         "padv.orchestrator.runtime.evaluate_candidate",
-        lambda **kwargs: GateResult("REFUTED", ["V0"], "V3", "test"),
+        lambda **kwargs: refuted_gate_result("test"),
     )
 
     bundles, _decisions = validate_candidates_runtime(
@@ -329,7 +330,7 @@ def test_validate_runtime_forwards_auth_cookies(monkeypatch: pytest.MonkeyPatch,
     )
     monkeypatch.setattr(
         "padv.orchestrator.runtime.evaluate_candidate",
-        lambda **kwargs: GateResult("REFUTED", ["V0"], "V3", "test"),
+        lambda **kwargs: refuted_gate_result("test"),
     )
 
     bundles, _decisions = validate_candidates_runtime(
@@ -416,7 +417,7 @@ def test_validate_runtime_uses_distinct_sessions_per_candidate(monkeypatch: pyte
     )
     monkeypatch.setattr(
         "padv.orchestrator.runtime.evaluate_candidate",
-        lambda **kwargs: GateResult("REFUTED", ["V0"], "V3", "test"),
+        lambda **kwargs: refuted_gate_result("test"),
     )
 
     bundles, _decisions = validate_candidates_runtime(
@@ -544,7 +545,7 @@ def test_validate_runtime_executes_structured_csrf_flow(monkeypatch: pytest.Monk
     )
     monkeypatch.setattr(
         "padv.orchestrator.runtime.evaluate_candidate",
-        lambda **kwargs: GateResult("REFUTED", ["V0"], "V3", "test"),
+        lambda **kwargs: refuted_gate_result("test"),
     )
 
     with _serve(_CsrfHandler) as base_url:
@@ -609,7 +610,7 @@ def test_validate_runtime_passes_shared_witness_contract_and_witness(monkeypatch
     def _fake_evaluate_candidate(**kwargs):
         seen["witness"] = kwargs.get("witness")
         seen["witness_contract"] = kwargs.get("witness_contract")
-        return GateResult("REFUTED", ["V0"], "V3", "test")
+        return refuted_gate_result("test")
 
     monkeypatch.setattr("padv.orchestrator.runtime.evaluate_candidate", _fake_evaluate_candidate)
 
@@ -671,7 +672,7 @@ def test_validate_runtime_embeds_candidate_hypotheses(monkeypatch: pytest.Monkey
     )
     monkeypatch.setattr(
         "padv.orchestrator.runtime.evaluate_candidate",
-        lambda **kwargs: GateResult("REFUTED", ["V0"], "V3", "test"),
+        lambda **kwargs: refuted_gate_result("test"),
     )
 
     bundles, _decisions = validate_candidates_runtime(
@@ -742,7 +743,7 @@ def test_validate_runtime_associates_static_evidence_via_evidence_refs(
 
     def _fake_evaluate_candidate(**kwargs):
         seen_query_ids.append([item.query_id for item in kwargs["static_evidence"]])
-        return GateResult("REFUTED", ["V0"], "V3", "test")
+        return refuted_gate_result("test")
 
     monkeypatch.setattr("padv.orchestrator.runtime.evaluate_candidate", _fake_evaluate_candidate)
 
@@ -821,7 +822,7 @@ def test_validate_runtime_uses_oracle_functions_and_preserves_request_headers(mo
     )
     monkeypatch.setattr(
         "padv.orchestrator.runtime.evaluate_candidate",
-        lambda **kwargs: GateResult("REFUTED", ["V0"], "V3", "test"),
+        lambda **kwargs: refuted_gate_result("test"),
     )
 
     validate_candidates_runtime(
@@ -879,7 +880,7 @@ def test_validate_runtime_populates_typed_runtime_evidence(monkeypatch: pytest.M
     )
     monkeypatch.setattr(
         "padv.orchestrator.runtime.evaluate_candidate",
-        lambda **kwargs: GateResult("REFUTED", ["V0"], "V3", "test"),
+        lambda **kwargs: refuted_gate_result("test"),
     )
 
     bundles, _ = validate_candidates_runtime(
@@ -995,7 +996,7 @@ def test_validate_runtime_reuses_existing_bundle_without_replaying_requests(
         ],
         negative_runtime=[],
         repro_run_ids=[],
-        gate_result=GateResult("REFUTED", ["V0"], "V3", "cached"),
+        gate_result=refuted_gate_result("cached"),
         limitations=[],
         differential_pairs=[],
         artifact_refs=[],
@@ -1066,7 +1067,7 @@ def test_validate_runtime_marks_tail_candidates_skipped_when_budget_exhausts(
             positive_runtime=[],
             negative_runtime=[],
             repro_run_ids=[],
-            gate_result=GateResult("REFUTED", ["V0"], "V3", "test"),
+            gate_result=refuted_gate_result("test"),
             limitations=["test"],
             differential_pairs=[],
             artifact_refs=[],

@@ -52,5 +52,5 @@ Tests that require these are marked with `@pytest.mark.integration`.
 
 - Agents propose and plan; gates decide deterministically
 - The Morcilla oracle is the single source of runtime truth
-- A candidate is only VALIDATED if it passes all six gates (V0-V6)
+- A candidate is only VALIDATED if it passes all six gates (V0-V5)
 - Non-semantic candidates are dropped during fusion

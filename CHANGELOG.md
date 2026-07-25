@@ -7,6 +7,20 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 ## [Unreleased]
 
 ### Changed
+- **`REFUTED` requires typed `RefutationEvidence`.** Constructing a refuting
+  `GateResult` without evidence now raises `MissingRefutationEvidenceError`. The
+  evidence names the failed gate, the contracted witnesses, the flags actually
+  observed, and the request ids on both sides of the experiment.
+- **V6 is gone.** It was appended unconditionally immediately before returning
+  `VALIDATED`, so it asserted nothing. The gate set is V0-V5.
+- **Analysis-only candidates no longer bypass the gate engine at runtime.**
+  `_process_candidate` built a `CONFIRMED_ANALYSIS_FINDING` bundle directly for
+  every non-runtime-validatable candidate, which made the A-gates unreachable in
+  production regardless of what the engine enforced.
+- Persisted bundles carry a `schema_version`, and reading an older one migrates
+  it conservatively (`migrate_bundle_payload`): retired decisions degrade to
+  `INCONCLUSIVE` rather than being promoted to a refutation the recorded
+  evidence never established.
 - **Outcome algebra separates ignorance from refutation.** The gate engine no
   longer emits the ambiguous `DROPPED`. A failed V3 (the payload was delivered
   and the class witness never appeared) is now `REFUTED`; every other gate

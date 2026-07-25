@@ -21,10 +21,10 @@ CLI (padv analyze | run | validate)
 Discovery:        SCIP + Joern (semantic static analysis) + Playwright (web)
 Agent stack:      DeepAgents (proposer, skeptic, scheduler, experiment)
 Runtime oracle:   Morcilla instrumentation headers
-Validation:       Deterministic gates V0-V6 (no LLM in the decision path)
+Validation:       Deterministic gates V0-V5 (no LLM in the decision path)
 ```
 
-A candidate is only **VALIDATED** if it passes all six gates (V0-V6). There are no exceptions or overrides.
+A candidate is only **VALIDATED** if it passes all six gates (V0-V5). There are no exceptions or overrides.
 
 ## Requirements
 

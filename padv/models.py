@@ -11,6 +11,42 @@ from padv.validation.preconditions import GatePreconditions, coerce_gate_precond
 CandidateStatus = str
 GateDecision = str
 
+# Bumped whenever persisted artifacts need migrating on read. Version 2
+# introduced the REFUTED/INCONCLUSIVE split; see migrate_bundle_payload.
+STORE_SCHEMA_VERSION = 2
+
+
+class MissingRefutationEvidenceError(ValueError):
+    """Raised when a REFUTED decision carries no evidence for the refutation."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(
+            "REFUTED requires typed RefutationEvidence; refusing to record an "
+            f"unevidenced refutation (reason: {reason!r})"
+        )
+
+
+@dataclass(slots=True)
+class RefutationEvidence:
+    """Why a hypothesis is considered disproven rather than merely unproven.
+
+    Only produced where the experiment was valid and its expected observation
+    did not occur; anything weaker is INCONCLUSIVE.
+    """
+
+    kind: str
+    failed_gate: str
+    vuln_class: str
+    required_all: list[str] = field(default_factory=list)
+    required_any: list[str] = field(default_factory=list)
+    observed_positive_flags: list[str] = field(default_factory=list)
+    positive_request_ids: list[str] = field(default_factory=list)
+    negative_request_ids: list[str] = field(default_factory=list)
+    detail: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
 CANDIDATE_OUTCOMES = (
     "VALIDATED",
     "REFUTED",
@@ -322,6 +358,13 @@ class GateResult:
     passed_gates: list[str]
     failed_gate: str | None
     reason: str
+    refutation: RefutationEvidence | None = None
+
+    def __post_init__(self) -> None:
+        if isinstance(self.refutation, dict):
+            self.refutation = RefutationEvidence(**self.refutation)
+        if str(self.decision).strip() == "REFUTED" and self.refutation is None:
+            raise MissingRefutationEvidenceError(self.reason)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -356,6 +399,7 @@ class EvidenceBundle:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "schema_version": STORE_SCHEMA_VERSION,
             "bundle_id": self.bundle_id,
             "created_at": self.created_at,
             "candidate_uid": self.candidate_uid,

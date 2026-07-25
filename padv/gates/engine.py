@@ -1,13 +1,24 @@
 from __future__ import annotations
 
 from padv.config.schema import PadvConfig
-from padv.models import Candidate, DifferentialPair, GateResult, RuntimeEvidence, StaticEvidence, Witness, WitnessContract
+from padv.models import (
+    Candidate,
+    DifferentialPair,
+    GateResult,
+    RefutationEvidence,
+    RuntimeEvidence,
+    StaticEvidence,
+    Witness,
+    WitnessContract,
+)
 from padv.taxonomy import contains_canary, runtime_validatable_classes
 from padv.validation.contracts import build_runtime_witness, witness_contract_for_vuln_class
 from padv.validation.preconditions import GatePreconditions, coerce_gate_preconditions
 
 
-REQUIRED_GATES = ["V0", "V1", "V2", "V3", "V4", "V5", "V6"]
+# V6 used to be appended unconditionally right before returning VALIDATED, so it
+# asserted nothing; it is gone rather than left as a label that looks like a check.
+REQUIRED_GATES = ["V0", "V1", "V2", "V3", "V4", "V5"]
 # Analysis-only candidates run the static half of the contract instead.
 ANALYSIS_GATES = ["A0", "A1", "A2"]
 
@@ -33,6 +44,10 @@ def _has_oracle_hit(
             ):
                 return True
     return False
+
+
+def _request_ids(runs: list[RuntimeEvidence]) -> list[str]:
+    return [str(run.request_id) for run in runs if str(run.request_id).strip()]
 
 
 def _evaluate_v0_scope(
@@ -75,15 +90,34 @@ def _evaluate_v3v4_runtime_class(
     contract: WitnessContract,
     witness: Witness,
     passed: list[str],
+    positive_runs: list[RuntimeEvidence],
+    negative_runs: list[RuntimeEvidence],
 ) -> GateResult | None:
     positive_flags = {str(x).strip().casefold() for x in witness.positive_flags if str(x).strip()}
     negative_flags = {str(x).strip().casefold() for x in witness.negative_flags if str(x).strip()}
     required_all = {str(x).strip().casefold() for x in contract.required_all if str(x).strip()}
     required_any = {str(x).strip().casefold() for x in contract.required_any if str(x).strip()}
-    if required_all and not required_all.issubset(positive_flags):
-        return GateResult("REFUTED", passed, "V3", "runtime class witness missing")
-    if required_any and not (positive_flags & required_any):
-        return GateResult("REFUTED", passed, "V3", "runtime class witness missing")
+
+    if (required_all and not required_all.issubset(positive_flags)) or (
+        required_any and not (positive_flags & required_any)
+    ):
+        return GateResult(
+            "REFUTED",
+            passed,
+            "V3",
+            "runtime class witness missing",
+            refutation=RefutationEvidence(
+                kind="class_witness_absent",
+                failed_gate="V3",
+                vuln_class=contract.canonical_class,
+                required_all=sorted(required_all),
+                required_any=sorted(required_any),
+                observed_positive_flags=sorted(positive_flags),
+                positive_request_ids=_request_ids(positive_runs),
+                negative_request_ids=_request_ids(negative_runs),
+                detail="the payload was delivered but the contracted class witness never appeared",
+            ),
+        )
     passed.append("V3")
 
     forbidden_negative = {str(x).strip().casefold() for x in contract.negative_must_not_include if str(x).strip()}
@@ -110,7 +144,24 @@ def _evaluate_v3v4_legacy(
     passed: list[str],
 ) -> GateResult | None:
     if not all(_run_has_canary_hit(run, intercept_set, canary, config) for run in in_scope_positive_runs):
-        return GateResult("REFUTED", passed, "V3", "canary boundary proof missing")
+        return GateResult(
+            "REFUTED",
+            passed,
+            "V3",
+            "canary boundary proof missing",
+            refutation=RefutationEvidence(
+                kind="canary_boundary_absent",
+                failed_gate="V3",
+                vuln_class="",
+                observed_positive_flags=[],
+                positive_request_ids=_request_ids(in_scope_positive_runs),
+                negative_request_ids=_request_ids(in_scope_negative_runs),
+                detail=(
+                    "the canary was delivered but did not reach an intercepted "
+                    f"call argument in every positive run (intercepts: {sorted(intercept_set)})"
+                ),
+            ),
+        )
     passed.append("V3")
 
     if any(_run_has_canary_hit(run, intercept_set, canary, config) for run in in_scope_negative_runs):
@@ -131,7 +182,9 @@ def _evaluate_v3v4(
     witness_contract: WitnessContract,
 ) -> GateResult | None:
     if class_key in _RUNTIME_VALIDATABLE_CLASSES:
-        return _evaluate_v3v4_runtime_class(witness_contract, witness, passed)
+        return _evaluate_v3v4_runtime_class(
+            witness_contract, witness, passed, in_scope_positive_runs, in_scope_negative_runs
+        )
     return _evaluate_v3v4_legacy(
         in_scope_positive_runs, in_scope_negative_runs, intercept_set, canary, config, passed,
     )
@@ -245,5 +298,4 @@ def evaluate_candidate(
         return v5_fail
     passed.append("V5")
 
-    passed.append("V6")
     return GateResult("VALIDATED", passed, None, "all required gates passed")
