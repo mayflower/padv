@@ -50,7 +50,7 @@ def test_run_strict_run_stabilization_recovers_partial_timeout_state(monkeypatch
             "static_evidence": 0,
             "bundle_count": 14,
             "counts": {"all_bundles": 14},
-            "decisions": {"DROPPED": 2},
+            "decisions": {"REFUTED": 2},
             "frontier": {"iteration": 10},
         }
         if run_id == "run-mutillidae-01"
@@ -230,6 +230,16 @@ def test_run_phase_b_reads_only_requested_run_artifacts(monkeypatch, tmp_path: P
                     "gap_id": "GAP-SQL",
                     "category": "sql_injection",
                     "runtime_validatable": True,
+                    "target_expectation": "must_find",
+                    "instances": [
+                        {
+                            "instance_id": "GAP-SQL-i01",
+                            "file": "src/a.php",
+                            "sink": "",
+                            "route": "",
+                            "expected_outcome": "VALIDATED",
+                        }
+                    ],
                 }
             ]
         ),
@@ -274,7 +284,8 @@ def test_main_phase_b_requires_run_id_argument(monkeypatch, tmp_path: Path) -> N
     assert exc_info.value.code == 2
 
 
-def test_run_phase_b_dropped_runtime_bundle_does_not_count_as_full(monkeypatch, tmp_path: Path) -> None:
+def test_run_phase_b_legacy_dropped_bundle_is_inconclusive_not_full(monkeypatch, tmp_path: Path) -> None:
+    """Bundles written before the REFUTED/INCONCLUSIVE split proved nothing either way."""
     assess = _load_assess_module()
     padv_store = tmp_path / ".padv"
     gap_catalog = tmp_path / "gap-catalog.json"
@@ -325,6 +336,16 @@ def test_run_phase_b_dropped_runtime_bundle_does_not_count_as_full(monkeypatch, 
                     "gap_id": "GAP-SQL",
                     "category": "sql_injection",
                     "runtime_validatable": True,
+                    "target_expectation": "must_find",
+                    "instances": [
+                        {
+                            "instance_id": "GAP-SQL-i01",
+                            "file": "src/a.php",
+                            "sink": "",
+                            "route": "",
+                            "expected_outcome": "VALIDATED",
+                        }
+                    ],
                 }
             ]
         ),
@@ -339,8 +360,8 @@ def test_run_phase_b_dropped_runtime_bundle_does_not_count_as_full(monkeypatch, 
     observed = json.loads(sql_row["observed_result"])
 
     assert sql_row["status"] == "PARTIAL"
-    assert observed["runtime_outcomes"] == ["REFUTED"]
-    assert observed["strong_refutation_count"] == 0
+    assert observed["instances"][0]["outcomes"] == ["INCONCLUSIVE"]
+    assert observed["instances_proven"] == 0
 
 
 def test_run_phase_b_skipped_runtime_bundle_does_not_count_as_full(monkeypatch, tmp_path: Path) -> None:
@@ -394,6 +415,16 @@ def test_run_phase_b_skipped_runtime_bundle_does_not_count_as_full(monkeypatch, 
                     "gap_id": "GAP-SQL",
                     "category": "sql_injection",
                     "runtime_validatable": True,
+                    "target_expectation": "must_find",
+                    "instances": [
+                        {
+                            "instance_id": "GAP-SQL-i01",
+                            "file": "src/a.php",
+                            "sink": "",
+                            "route": "",
+                            "expected_outcome": "VALIDATED",
+                        }
+                    ],
                 }
             ]
         ),
@@ -408,91 +439,8 @@ def test_run_phase_b_skipped_runtime_bundle_does_not_count_as_full(monkeypatch, 
     observed = json.loads(sql_row["observed_result"])
 
     assert sql_row["status"] == "PARTIAL"
-    assert observed["runtime_outcomes"] == ["SKIPPED"]
+    assert observed["instances"][0]["outcomes"] == ["SKIPPED_BUDGET"]
     assert observed["runtime_attempted"] is True
-
-
-def test_run_phase_b_strong_refutation_counts_as_full(monkeypatch, tmp_path: Path) -> None:
-    assess = _load_assess_module()
-    padv_store = tmp_path / ".padv"
-    gap_catalog = tmp_path / "gap-catalog.json"
-    output_dir = tmp_path / "assessment"
-
-    monkeypatch.setattr(assess, "PADV_STORE", padv_store)
-    monkeypatch.setattr(assess, "GAP_CATALOG_PATH", gap_catalog)
-
-    run_root = padv_store / "runs" / "run-a"
-    (run_root / "bundles").mkdir(parents=True)
-
-    (run_root / "candidates.json").write_text(
-        json.dumps(
-            [
-                {
-                    "candidate_id": "cand-a",
-                    "vuln_class": "sql_injection_boundary",
-                    "title": "SQL injection in run A",
-                    "file_path": "src/a.php",
-                    "sink": "mysqli_query",
-                    "provenance": ["scip"],
-                }
-            ]
-        ),
-        encoding="utf-8",
-    )
-    (run_root / "bundles" / "bundle-run-a-cand-a.json").write_text(
-        json.dumps(
-            {
-                "bundle_id": "bundle-run-a-cand-a",
-                "candidate_outcome": "REFUTED",
-                "candidate": {
-                    "candidate_id": "cand-a",
-                    "vuln_class": "sql_injection_boundary",
-                    "title": "SQL injection in run A",
-                    "file_path": "src/a.php",
-                    "sink": "mysqli_query",
-                },
-                "gate_result": {"decision": "DROPPED"},
-                "validation_contract": {
-                    "witness_contract": {
-                        "canonical_class": "sql_injection_boundary",
-                        "required_all": ["sql_sink_oracle_witness"],
-                        "required_any": ["sql_body_diff_witness"],
-                        "negative_must_not_include": [],
-                        "enforce_negative_clean": True,
-                    },
-                    "witness": {
-                        "canonical_class": "sql_injection_boundary",
-                        "positive_flags": ["sql_sink_oracle_witness", "sql_body_diff_witness"],
-                        "negative_flags": [],
-                    },
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-    gap_catalog.write_text(
-        json.dumps(
-            [
-                {
-                    "gap_id": "GAP-SQL",
-                    "category": "sql_injection",
-                    "runtime_validatable": True,
-                }
-            ]
-        ),
-        encoding="utf-8",
-    )
-
-    phase_a = {"a1": {"summary": {"all_passed": True}}, "a2": {"success": True}, "a3": {"success": True}}
-
-    output = assess.run_phase_b(output_dir, run_id="run-a", phase_a=phase_a)
-
-    sql_row = next(item for item in output["matrix"] if item["requirement_id"] == "GAP-SQL")
-    observed = json.loads(sql_row["observed_result"])
-
-    assert sql_row["status"] == "FULL"
-    assert observed["runtime_outcomes"] == ["REFUTED"]
-    assert observed["strong_refutation_count"] == 1
 
 
 def test_run_phase_b_reports_none_when_requested_run_has_no_attempt_for_category(monkeypatch, tmp_path: Path) -> None:
@@ -546,6 +494,16 @@ def test_run_phase_b_reports_none_when_requested_run_has_no_attempt_for_category
                     "gap_id": "GAP-SQL",
                     "category": "sql_injection",
                     "runtime_validatable": True,
+                    "target_expectation": "must_find",
+                    "instances": [
+                        {
+                            "instance_id": "GAP-SQL-i01",
+                            "file": "src/a.php",
+                            "sink": "",
+                            "route": "",
+                            "expected_outcome": "VALIDATED",
+                        }
+                    ],
                 }
             ]
         ),
@@ -560,5 +518,5 @@ def test_run_phase_b_reports_none_when_requested_run_has_no_attempt_for_category
     observed = json.loads(sql_row["observed_result"])
 
     assert sql_row["status"] == "NONE"
-    assert observed["runtime_outcomes"] == []
+    assert observed["instances"][0]["outcomes"] == []
     assert observed["runtime_attempted"] is False

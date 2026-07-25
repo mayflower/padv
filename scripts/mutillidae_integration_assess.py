@@ -17,6 +17,7 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from padv.eval.integration_assessment import RequirementResult, classify_failure, matrix_to_gap_list
+from padv.eval.metrics import confusion_from_matches, macro_recall, precision_recall_f1
 from padv.models import default_candidate_outcomes, explicit_candidate_outcome_for_decision
 from padv.store.evidence_store import EvidenceStore
 from padv.taxonomy import canonicalize_vuln_class
@@ -541,57 +542,58 @@ def _bundle_candidate_outcome(bundle: dict[str, Any]) -> str:
     return explicit_candidate_outcome_for_decision(decision)
 
 
-def _bundle_refutation_has_strong_witness(bundle: dict[str, Any]) -> bool:
-    contract = (bundle.get("validation_contract") or {}).get("witness_contract", {})
-    witness = (bundle.get("validation_contract") or {}).get("witness", {})
-    if not isinstance(contract, dict) or not isinstance(witness, dict):
-        return False
-    positive_flags = {
-        str(item).strip().casefold()
-        for item in witness.get("positive_flags", [])
-        if str(item).strip()
-    }
-    negative_flags = {
-        str(item).strip().casefold()
-        for item in witness.get("negative_flags", [])
-        if str(item).strip()
-    }
-    required_all = {
-        str(item).strip().casefold()
-        for item in contract.get("required_all", [])
-        if str(item).strip()
-    }
-    required_any = {
-        str(item).strip().casefold()
-        for item in contract.get("required_any", [])
-        if str(item).strip()
-    }
-    forbidden_negative = {
-        str(item).strip().casefold()
-        for item in contract.get("negative_must_not_include", [])
-        if str(item).strip()
-    }
-    enforce_negative_clean = bool(contract.get("enforce_negative_clean", True))
-    if required_all and not required_all.issubset(positive_flags):
-        return False
-    if required_any and not (positive_flags & required_any):
-        return False
-    if enforce_negative_clean and forbidden_negative and (negative_flags & forbidden_negative):
-        return False
-    return bool(required_all or required_any)
+def _normalize_path(value: Any) -> str:
+    return str(value or "").strip().replace("\\", "/").strip("/").casefold()
 
 
-def _bundle_coverage_outcome(bundle: dict[str, Any]) -> str:
-    outcome = _bundle_candidate_outcome(bundle)
-    if outcome == "VALIDATED":
-        return "VALIDATED"
-    if outcome == "REFUTED":
-        return "REFUTED"
-    if outcome in {"SKIPPED_BUDGET", "SKIPPED_PRECONDITION"}:
-        return "SKIPPED"
-    if outcome == "ERROR":
-        return "ERROR"
-    return "ERROR"
+def _path_matches(expected_file: str, observed_file: str) -> bool:
+    """Match ground-truth paths against candidate paths on a path-suffix basis.
+
+    The catalog records repo-relative paths (``targets/mutillidae/src/x.php``)
+    while a run records paths relative to whatever repo root it was given, so
+    neither string is authoritative on its own; one must be a path suffix of
+    the other.
+    """
+    expected = _normalize_path(expected_file)
+    observed = _normalize_path(observed_file)
+    if not expected or not observed:
+        return False
+    if expected == observed:
+        return True
+    return expected.endswith("/" + observed) or observed.endswith("/" + expected)
+
+
+def _instance_matches(category: str, instance: dict[str, Any], candidate: dict[str, Any]) -> bool:
+    """Structural match of one ground-truth instance against one candidate.
+
+    Class alone is not enough: two different SQL injections in two different
+    files are two different findings, and proving one says nothing about the
+    other. ``sink`` and ``route`` are enforced only where the catalog states
+    them, so tightening the catalog tightens the benchmark.
+    """
+    vuln_class = str(candidate.get("canonical_class", "") or candidate.get("vuln_class", ""))
+    if not _category_match(category, vuln_class):
+        return False
+    if not _path_matches(str(instance.get("file", "")), str(candidate.get("file_path", ""))):
+        return False
+
+    expected_sink = str(instance.get("sink", "")).strip().casefold()
+    if expected_sink and expected_sink != str(candidate.get("sink", "")).strip().casefold():
+        return False
+
+    expected_route = _normalize_path(instance.get("route", ""))
+    if expected_route:
+        hints = {_normalize_path(hint) for hint in candidate.get("web_path_hints", []) or []}
+        if expected_route not in hints:
+            return False
+    return True
+
+
+def _required_instance_outcome(instance: dict[str, Any], runtime_validatable: bool) -> str:
+    declared = str(instance.get("expected_outcome", "")).strip().upper()
+    if declared:
+        return declared
+    return "VALIDATED" if runtime_validatable else "ANALYSIS_FINDING"
 
 
 def _normalize_reason_token(value: str, default: str) -> str:
@@ -658,58 +660,110 @@ def run_phase_b(output_dir: Path, run_id: str, phase_a: dict[str, Any]) -> dict[
     candidate_outcomes = _count_bundle_outcomes(bundles)
     outcome_reasons = _count_bundle_outcome_reasons(bundles)
     run_summary = _store().load_run_summary(run_id)
+
+    proven_instance_ids: set[str] = set()
+    expected_instance_ids: set[str] = set()
+    control_instance_ids: set[str] = set()
+    violated_control_ids: set[str] = set()
+    matched_bundle_ids: set[str] = set()
+    recall_by_category: dict[str, tuple[int, int]] = {}
+
     for gap in _load_gap_rows():
         category = str(gap.get("category", ""))
-        matched_candidates = [
-            item
-            for item in candidates
-            if _category_match(category, str(item.get("canonical_class", "") or item.get("vuln_class", "")))
-        ]
-        matched_bundles = [
-            item
-            for item in bundles
-            if _category_match(category, str(((item.get("candidate") or {}).get("canonical_class", "") or (item.get("candidate") or {}).get("vuln_class", ""))))
-        ]
-        found_by_static = any(set(item.get("provenance", [])) & {"source", "joern", "scip"} for item in matched_candidates)
-        found_by_web = any("web" in item.get("provenance", []) or item.get("web_path_hints") for item in matched_candidates)
-        runtime_attempted = bool(matched_bundles)
-        runtime_outcomes = [_bundle_coverage_outcome(item) for item in matched_bundles]
-        matched_outcome_counts = _count_bundle_outcomes(matched_bundles)
-        matched_outcome_reasons = _count_bundle_outcome_reasons(matched_bundles)
-        strong_refutation_count = sum(
-            1
-            for item, outcome in zip(matched_bundles, runtime_outcomes, strict=False)
-            if outcome == "REFUTED" and _bundle_refutation_has_strong_witness(item)
-        )
-        runtime_full = any(outcome == "VALIDATED" for outcome in runtime_outcomes) or strong_refutation_count > 0
+        runtime_validatable = bool(gap.get("runtime_validatable"))
+        instances = [item for item in gap.get("instances", []) if isinstance(item, dict)]
+        must_find = str(gap.get("target_expectation", "")).strip() == "must_find"
 
-        if not gap.get("runtime_validatable"):
-            status = "FULL" if matched_candidates else "NONE"
-        elif runtime_full:
+        instance_reports: list[dict[str, Any]] = []
+        for instance in instances:
+            instance_id = str(instance.get("instance_id", "")).strip()
+            required = _required_instance_outcome(instance, runtime_validatable)
+            inst_candidates = [c for c in candidates if _instance_matches(category, instance, c)]
+            inst_bundles = [b for b in bundles if _instance_matches(category, instance, b.get("candidate") or {})]
+            matched_bundle_ids.update(str(b.get("bundle_id", "")) for b in inst_bundles)
+            outcomes = [_bundle_candidate_outcome(b) for b in inst_bundles]
+            proven = required in outcomes
+
+            if must_find:
+                expected_instance_ids.add(instance_id)
+            if proven:
+                proven_instance_ids.add(instance_id)
+
+            instance_reports.append(
+                {
+                    "instance_id": instance_id,
+                    "file": instance.get("file", ""),
+                    "required_outcome": required,
+                    "proven": proven,
+                    "candidates_matched": len(inst_candidates),
+                    "outcomes": outcomes,
+                    "found_by_static": any(set(c.get("provenance", [])) & {"source", "joern", "scip"} for c in inst_candidates),
+                    "found_by_web": any("web" in c.get("provenance", []) or c.get("web_path_hints") for c in inst_candidates),
+                }
+            )
+
+        # Patched or benign near-misses. Proving one is a false positive, so
+        # they are tracked separately from the instances that must be found.
+        for control in gap.get("negative_controls", []) or []:
+            if not isinstance(control, dict):
+                continue
+            control_id = str(control.get("instance_id", "")).strip()
+            control_instance_ids.add(control_id)
+            control_bundles = [b for b in bundles if _instance_matches(category, control, b.get("candidate") or {})]
+            matched_bundle_ids.update(str(b.get("bundle_id", "")) for b in control_bundles)
+            if any(_bundle_candidate_outcome(b) == "VALIDATED" for b in control_bundles):
+                violated_control_ids.add(control_id)
+
+        proven_count = sum(1 for item in instance_reports if item["proven"])
+        attempted = any(item["outcomes"] for item in instance_reports)
+        if must_find:
+            recall_by_category[category] = (proven_count, len(instance_reports))
+
+        if instance_reports and proven_count == len(instance_reports):
             status = "FULL"
-        elif runtime_attempted:
+        elif proven_count > 0 or attempted:
             status = "PARTIAL"
         else:
             status = "NONE"
 
-        evidence_path = str(_store().for_run(run_id).root / "candidates.json") if matched_candidates else str(GAP_CATALOG_PATH)
+        evidence_path = (
+            str(_store().for_run(run_id).root / "candidates.json")
+            if any(item["candidates_matched"] for item in instance_reports)
+            else str(GAP_CATALOG_PATH)
+        )
+        gap_bundles = [
+            b for b in bundles if any(_instance_matches(category, i, b.get("candidate") or {}) for i in instances)
+        ]
         observed = json.dumps(
             {
-                "found_by_static": found_by_static,
-                "found_by_web": found_by_web,
-                "runtime_attempted": runtime_attempted,
-                "runtime_outcomes": runtime_outcomes,
-                "outcome_counts": matched_outcome_counts,
-                "outcome_reasons": matched_outcome_reasons,
-                "strong_refutation_count": strong_refutation_count,
+                "instances": instance_reports,
+                "instances_proven": proven_count,
+                "instances_expected": len(instance_reports),
+                "runtime_attempted": attempted,
+                "outcome_counts": _count_bundle_outcomes(gap_bundles),
+                "outcome_reasons": _count_bundle_outcome_reasons(gap_bundles),
             },
             ensure_ascii=True,
         )
-        root_cause = "" if status == "FULL" else "category not fully exercised by current Mutillidae run"
-        next_fix = "improve discovery/runtime coverage for this documented Mutillidae category" if status != "FULL" else ""
+        root_cause = "" if status == "FULL" else "documented instances not proven by current Mutillidae run"
+        next_fix = "improve discovery/runtime coverage for the unproven instances" if status != "FULL" else ""
         matrix.append(
             RequirementResult(gap["gap_id"], f"Mutillidae documented gap: {category}", observed, evidence_path, status, root_cause, next_fix).to_dict()
         )
+
+    # Anything a run validated that matches no ground-truth instance is an
+    # unproven claim as far as this benchmark is concerned, so it has to land
+    # on the false-positive side rather than vanish.
+    unmatched_validated = [
+        f"unmatched:{b.get('bundle_id', '')}"
+        for b in bundles
+        if _bundle_candidate_outcome(b) == "VALIDATED" and str(b.get("bundle_id", "")) not in matched_bundle_ids
+    ]
+    confusion = confusion_from_matches(
+        expected_ids=expected_instance_ids,
+        validated_ids=list((proven_instance_ids & expected_instance_ids) | violated_control_ids) + unmatched_validated,
+        negative_control_ids=control_instance_ids,
+    )
 
     gaps = matrix_to_gap_list(matrix)
     output = {
@@ -720,6 +774,17 @@ def run_phase_b(output_dir: Path, run_id: str, phase_a: dict[str, Any]) -> dict[
         "gaps": gaps,
         "candidate_outcomes": candidate_outcomes,
         "outcome_reasons": outcome_reasons,
+        "metrics": {
+            **confusion,
+            **precision_recall_f1(
+                true_positives=confusion["true_positives"],
+                false_positives=confusion["false_positives"],
+                false_negatives=confusion["false_negatives"],
+            ),
+            "macro_recall": macro_recall(recall_by_category),
+            "recall_by_category": {k: list(v) for k, v in recall_by_category.items()},
+            "unmatched_validated": unmatched_validated,
+        },
         "stop_rule": str((run_summary or {}).get("stop_rule", "")),
         "stop_reason": str((run_summary or {}).get("stop_reason", "")),
     }

@@ -89,6 +89,7 @@ def test_mutillidae_gap_catalog_covers_documented_categories() -> None:
     data = json.loads(_read(Path(__file__).resolve().parent / "fixtures" / "mutillidae-gap-catalog.json"))
     categories = {item["category"] for item in data}
     assert categories == REQUIRED_CATEGORIES
+    instance_ids: set[str] = set()
     for item in data:
         assert set(item) == {
             "gap_id",
@@ -98,9 +99,23 @@ def test_mutillidae_gap_catalog_covers_documented_categories() -> None:
             "runtime_validatable",
             "minimum_evidence_expectation",
             "target_expectation",
+            "instances",
+            "negative_controls",
         }
         assert item["target_expectation"] in {"must_find", "should_find", "static_only_ok"}
         assert set(item["expected_channels"]) == {"source", "joern/scip", "web", "runtime"}
+
+        # Every gap must name the concrete instances a run has to prove; a bare
+        # category would let one finding stand in for an unrelated one.
+        assert item["instances"], f"{item['gap_id']} has no ground-truth instances"
+        for instance in item["instances"] + item["negative_controls"]:
+            assert set(instance) >= {"instance_id", "file", "sink", "route"}
+            assert instance["instance_id"] not in instance_ids, "instance ids must be unique"
+            instance_ids.add(instance["instance_id"])
+            assert instance["file"].startswith("targets/mutillidae/")
+        for instance in item["instances"]:
+            expected = instance["expected_outcome"]
+            assert expected == ("VALIDATED" if item["runtime_validatable"] else "ANALYSIS_FINDING")
 
 
 
