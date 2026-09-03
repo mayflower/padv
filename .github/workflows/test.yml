@@ -18,6 +18,8 @@ concurrency:
 jobs:
   test:
     name: Python Tests
+    # Skipped for fork pull requests -- see the note on the sonarqube job below.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     runs-on: mayflower-k8s-runners
     strategy:
       fail-fast: false
@@ -69,10 +71,17 @@ jobs:
   sonarqube:
     name: SonarQube
     needs: test
+    # The trailing clause skips this job for fork pull requests: it runs on
+    # mayflower-k8s-runners, a self-hosted pool inside the Mayflower data
+    # cluster, and the workflow triggers on pull_request -- which GitHub also
+    # fires for forks. always() is kept so the job still reports when the test
+    # job fails.
     if: >-
       ${{
         always() &&
-        (needs.test.result == 'success' || needs.test.result == 'failure')
+        (needs.test.result == 'success' || needs.test.result == 'failure') &&
+        (github.event_name != 'pull_request' ||
+         github.event.pull_request.head.repo.full_name == github.repository)
       }}
     runs-on: mayflower-k8s-runners
     steps:
